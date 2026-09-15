@@ -7,7 +7,7 @@
   "description": "L3-туннель CSQTT (TURN/RTP поверх VK Calls): SOCKS5 → gVisor → rust-движок. Хеши VK: Авто API (calls.start, 1–6 звонков), Авто ВК (один звонок в rust) или вручную. Вход в VK — webview AntiNet.",
   "homepage": "https://github.com/amurcanov/csqtt",
   "updateUrl": "https://raw.githubusercontent.com/MaxPain99/csqtt-antinet-module/main/antinet-module.json",
-  "version": "1.2.4",
+  "version": "1.2.5",
   "license": "PolyForm-Noncommercial-1.0.0",
   "handoverMode": "signal",
   "hostEvents": ["handover", "netlost", "netback", "stall"],

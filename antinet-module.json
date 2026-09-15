@@ -1,15 +1,15 @@
 {
-  "version": "1.2.4",
+  "version": "1.2.5",
   "android": {
-    "arm64-v8a": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.4/csqtt-android-arm64-v8a.zip",
-    "armeabi-v7a": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.4/csqtt-android-armeabi-v7a.zip",
-    "x86": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.4/csqtt-android-x86.zip",
-    "x86_64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.4/csqtt-android-x86_64.zip"
+    "arm64-v8a": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.5/csqtt-android-arm64-v8a.zip",
+    "armeabi-v7a": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.5/csqtt-android-armeabi-v7a.zip",
+    "x86": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.5/csqtt-android-x86.zip",
+    "x86_64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.5/csqtt-android-x86_64.zip"
   },
   "desktop": {
     "windows_amd64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.0.0/csqtt-windows_amd64.zip",
     "linux_amd64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.0.0/csqtt-linux_amd64.zip",
     "darwin_amd64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.0.0/csqtt-darwin_amd64.zip"
   },
-  "changelog": "1.2.4: CSQTT IPv4-only — Google 1e100 in-xHH (без A) переписывается в in-fDD; dns.google IPv6 → 8.8.8.8; неудачный IPv6 кэш на 30с, чтобы Happy Eyeballs сразу брал IPv4. 1.2.3: маппинг IPv6→IPv4. Desktop-бандлы пока 1.0.0."
+  "changelog": "1.2.5: DNS через туннель больше не отдаёт AAAA — CSQTT строго IPv4, yandex.ru и остальные не уходят в IPv6. Microsoft/Azure IPv6 не ждут PTR. 1.2.4: Google 1e100 in-x→in-f. Desktop-бандлы пока 1.0.0."
 }

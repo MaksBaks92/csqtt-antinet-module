@@ -68,6 +68,9 @@ func deriveIPv4(ip netip.Addr, resolver *protectedResolver) (netip.Addr, error) 
 	if v4, ok := googlePublicDNS(ip); ok {
 		return v4, nil
 	}
+	if skipSlowPTR(ip) {
+		return netip.Addr{}, fmt.Errorf("IPv6 target %v: tunnel is IPv4-only", ip)
+	}
 	name, err := lookupPTRName(resolver, ip)
 	if err != nil || name == "" {
 		return netip.Addr{}, fmt.Errorf("IPv6 target %v: tunnel is IPv4-only", ip)
@@ -150,6 +153,22 @@ func cloudflareEmbedded(ip netip.Addr) (netip.Addr, bool) {
 		}
 	}
 	return netip.Addr{}, false
+}
+
+// Microsoft / Azure / Hetzner IPv6 almost never has a useful A sibling. Skip PTR
+// so Happy Eyeballs can fall back to IPv4 immediately instead of waiting ~1s.
+func skipSlowPTR(ip netip.Addr) bool {
+	b := ip.As16()
+	if b[0] == 0x26 && b[1] == 0x20 && b[2] == 0x01 && b[3] == 0xec {
+		return true // 2620:1ec::/32 Microsoft 365
+	}
+	if b[0] == 0x26 && b[1] == 0x03 {
+		return true // 2603::/16 Azure
+	}
+	if b[0] == 0x2a && b[1] == 0x01 && b[2] == 0x4f && b[3] == 0xf8 {
+		return true // 2a01:4f8::/32 Hetzner
+	}
+	return false
 }
 
 func googlePublicDNS(ip netip.Addr) (netip.Addr, bool) {

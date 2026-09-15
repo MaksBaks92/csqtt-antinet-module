@@ -580,7 +580,14 @@ func (t csqttUDPTransport) DialUDPTarget(dst netip.AddrPort) (net.Conn, error) {
 		}
 		dst = netip.AddrPortFrom(mapped, dst.Port())
 	}
-	return t.tun.DialUDP(dst)
+	c, err := t.tun.DialUDP(dst)
+	if err != nil {
+		return nil, err
+	}
+	if dst.Port() == 53 {
+		return &dnsAAAAFilterConn{Conn: c}, nil
+	}
+	return c, nil
 }
 
 func settingDuration(cfg map[string]string, key string, defSec int) time.Duration {
