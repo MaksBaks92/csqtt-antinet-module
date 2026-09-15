@@ -17,9 +17,28 @@ use tokio::net::{TcpStream, UdpSocket};
 pub type ProtectCb = extern "C" fn(i64) -> i32;
 
 static CALLBACK: OnceLock<ProtectCb> = OnceLock::new();
+static HTTP_PROXY: OnceLock<String> = OnceLock::new();
 
 pub fn set_protect(cb: ProtectCb) {
     let _ = CALLBACK.set(cb);
+}
+
+pub fn set_http_proxy(url: impl Into<String>) {
+    let url = url.into();
+    if url.is_empty() {
+        return;
+    }
+    let _ = HTTP_PROXY.set(url);
+}
+
+pub fn with_http_proxy(builder: primp::ClientBuilder) -> primp::ClientBuilder {
+    let Some(url) = HTTP_PROXY.get() else {
+        return builder;
+    };
+    match primp::Proxy::all(url) {
+        Ok(proxy) => builder.proxy(proxy),
+        Err(_) => builder,
+    }
 }
 
 fn call(fd: i64) {

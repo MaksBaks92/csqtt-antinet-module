@@ -7,7 +7,7 @@
   "description": "L3-туннель CSQTT (TURN/RTP поверх VK Calls): SOCKS5 → gVisor → rust-движок. Хеши VK: Авто API (calls.start, 1–6 звонков), Авто ВК (один звонок в rust) или вручную. Вход в VK — webview AntiNet.",
   "homepage": "https://github.com/amurcanov/csqtt",
   "updateUrl": "https://raw.githubusercontent.com/MaxPain99/csqtt-antinet-module/main/antinet-module.json",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "license": "PolyForm-Noncommercial-1.0.0",
   "handoverMode": "signal",
   "hostEvents": ["handover", "netlost", "netback", "stall"],
@@ -39,7 +39,7 @@
       "key": "hashMode",
       "type": "enum",
       "label": "VK-хеши",
-      "default": "auto_api",
+      "default": "manual",
       "description": "Авто API — как в клиенте CSQTT: helper создаёт 1–6 звонков через calls.start и закрывает их при отключении. Авто ВК — rust создаёт один звонок (vchat.startConversation). В обоих нужен вход в VK (webview AntiNet); cookie остаются в хранилище AntiNet. Ручной — хеши из ссылки или поля ниже.",
       "options": [
         { "value": "auto_api", "label": "Авто API (calls.start, 1–6 звонков)" },

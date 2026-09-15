@@ -132,6 +132,8 @@ pub struct Arguments {
     tun_uds: String,
     #[arg(long, default_value_t = false)]
     validate_vk_hashes: bool,
+    #[arg(long, default_value = "")]
+    http_proxy: String,
 }
 
 pub fn cli_main() {
@@ -180,6 +182,7 @@ pub(crate) fn runtime_worker_threads(requested_workers: usize) -> usize {
 }
 
 pub async fn run(arguments: Arguments) -> Result<()> {
+    crate::protect::set_http_proxy(arguments.http_proxy.clone());
     if arguments.validate_vk_hashes {
         return run_vk_hash_validation(&arguments).await;
     }

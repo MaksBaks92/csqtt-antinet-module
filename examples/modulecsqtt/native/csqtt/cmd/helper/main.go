@@ -60,6 +60,7 @@ type csqttStrings struct {
 	vkLoginProgress      string
 	vkLoginFailedFmt     string
 	vkLoginFallbackFmt   string
+	vkUsingLinkHashes    string
 	vkAutoAPIProgress    string
 	vkAutoAPIFailedFmt   string
 	handoverLog          string
@@ -81,6 +82,7 @@ var csqttStringsRU = csqttStrings{
 	vkLoginProgress:      "CSQTT: войдите в VK и подтвердите доступ; окно закроется само",
 	vkLoginFailedFmt:     "CSQTT: не удалось получить VK-токен: %v",
 	vkLoginFallbackFmt:   "CSQTT: вход в VK не удался (%v), беру хеши из ссылки/настроек",
+	vkUsingLinkHashes:    "CSQTT: в ссылке уже есть хеши — вход в VK пропускаю",
 	vkAutoAPIProgress:    "CSQTT: создаю звонки VK через API",
 	vkAutoAPIFailedFmt:   "CSQTT: не удалось создать звонки VK: %v",
 	handoverLog:          "хендовер: сменилась сеть — TURN-воркеры переподключатся сами",
@@ -102,6 +104,7 @@ var csqttStringsEN = csqttStrings{
 	vkLoginProgress:      "CSQTT: sign in to VK and allow access; the window closes itself",
 	vkLoginFailedFmt:     "CSQTT: failed to get VK token: %v",
 	vkLoginFallbackFmt:   "CSQTT: VK login failed (%v), using hashes from link/settings",
+	vkUsingLinkHashes:    "CSQTT: link already has hashes, skipping VK login",
 	vkAutoAPIProgress:    "CSQTT: creating VK calls via API",
 	vkAutoAPIFailedFmt:   "CSQTT: failed to create VK calls: %v",
 	handoverLog:          "handover: network changed, TURN workers will reconnect",
@@ -334,6 +337,10 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	hashMode := normalizeHashMode(cfg["SETTING_hashMode"], len(hashes) > 0)
 	vkToken := ""
 	allowRedistrib := false
+	if len(hashes) > 0 && (hashMode == "auto_api" || hashMode == "auto_js") {
+		emitLog(s.vkUsingLinkHashes)
+		hashMode = "manual"
+	}
 	if hashMode == "auto_api" || hashMode == "auto_js" {
 		tok, terr := ensureVkToken(cfg["MODULE_STATE"], profileDir, s)
 		if terr != nil {
@@ -405,6 +412,13 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	turnTransport := strings.TrimSpace(cfg["SETTING_turnTransport"])
 
 	resolver := newProtectedResolver(cfg["DNS_SERVERS"], protectPath)
+	proxyURL, stopProxy, perr := startProtectHTTPProxy(protectPath, resolver)
+	if perr != nil {
+		emitLog("CSQTT: off-TUN HTTP proxy: %v", perr)
+		stopProxy = func() {}
+	} else {
+		defer stopProxy()
+	}
 
 	search := []string{profileDir}
 	if profileDir != "" {
@@ -436,6 +450,9 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 		"obfs":           obfs,
 		"turn_transport": turnTransport,
 		"fingerprint":    "firefox",
+	}
+	if proxyURL != "" {
+		engineJSON["http_proxy"] = proxyURL
 	}
 	if hashMode == "auto_js" && vkToken != "" {
 		engineJSON["vk_hash_mode"] = "auto_js"

@@ -45,6 +45,8 @@ struct EngineJson {
     generation: u64,
     #[serde(default)]
     salt: String,
+    #[serde(default)]
+    http_proxy: String,
 }
 
 fn arguments_from_json(raw: &str) -> Result<Arguments, String> {
@@ -114,6 +116,7 @@ fn arguments_from_json(raw: &str) -> Result<Arguments, String> {
         salt: cfg.salt,
         tun_uds: String::new(),
         validate_vk_hashes: false,
+        http_proxy: cfg.http_proxy,
     })
 }
 
