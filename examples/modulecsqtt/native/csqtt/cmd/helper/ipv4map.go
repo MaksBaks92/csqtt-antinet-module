@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 //
 // CSQTT TUN is IPv4-only. Android 16 / Chrome still send IPv6 literals through
-// SOCKS (Happy Eyeballs). Map them to IPv4: 4in6, NAT64 64:ff9b::/96, 6to4, or
-// PTR then A via the same protected DNS the helper already uses.
+// SOCKS (Happy Eyeballs). Map them to IPv4 instantly when the address encodes
+// one (NAT64 / 6to4 / Cloudflare / Google Public DNS), otherwise PTR then A.
+// Google 1e100 names use in-xHH (IPv6-only) — rewrite to in-fDD which has A.
 
 package main
 
@@ -11,6 +12,7 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,7 +20,13 @@ import (
 	"golang.org/x/net/dns/dnsmessage"
 )
 
-var ipv4Mapped sync.Map // netip.Addr → netip.Addr (v4)
+type ipv4MapEntry struct {
+	v4  netip.Addr
+	err error
+	exp time.Time
+}
+
+var ipv4Mapped sync.Map // netip.Addr → ipv4MapEntry
 
 func mapIPv6To4(ip netip.Addr, resolver *protectedResolver) (netip.Addr, error) {
 	ip = ip.Unmap()
@@ -29,13 +37,20 @@ func mapIPv6To4(ip netip.Addr, resolver *protectedResolver) (netip.Addr, error) 
 		return netip.Addr{}, fmt.Errorf("not an IP")
 	}
 	if v, ok := ipv4Mapped.Load(ip); ok {
-		return v.(netip.Addr), nil
+		e := v.(ipv4MapEntry)
+		if time.Now().Before(e.exp) {
+			return e.v4, e.err
+		}
 	}
 	v4, err := deriveIPv4(ip, resolver)
+	ttl := 10 * time.Minute
+	if err != nil {
+		ttl = 30 * time.Second
+	}
+	ipv4Mapped.Store(ip, ipv4MapEntry{v4: v4, err: err, exp: time.Now().Add(ttl)})
 	if err != nil {
 		return netip.Addr{}, err
 	}
-	ipv4Mapped.Store(ip, v4)
 	log.Printf("[SOCKS] IPv6 %s → IPv4 %s", ip, v4)
 	return v4, nil
 }
@@ -50,25 +65,66 @@ func deriveIPv4(ip netip.Addr, resolver *protectedResolver) (netip.Addr, error) 
 	if v4, ok := cloudflareEmbedded(ip); ok {
 		return v4, nil
 	}
+	if v4, ok := googlePublicDNS(ip); ok {
+		return v4, nil
+	}
 	name, err := lookupPTRName(resolver, ip)
 	if err != nil || name == "" {
 		return netip.Addr{}, fmt.Errorf("IPv6 target %v: tunnel is IPv4-only", ip)
 	}
-	ips, err := resolver.LookupHost(strings.TrimSuffix(name, "."))
+	if v4, aerr := ipv4FromHost(resolver, name); aerr == nil {
+		return v4, nil
+	}
+	if alt := google1e100IPv4Name(name); alt != "" && !strings.EqualFold(alt, name) {
+		if v4, aerr := ipv4FromHost(resolver, alt); aerr == nil {
+			return v4, nil
+		}
+	}
+	return netip.Addr{}, fmt.Errorf("IPv6 target %v: PTR %s has no A record", ip, name)
+}
+
+func ipv4FromHost(resolver *protectedResolver, host string) (netip.Addr, error) {
+	if resolver == nil {
+		return netip.Addr{}, fmt.Errorf("no resolver")
+	}
+	ips, err := resolver.LookupHost(strings.TrimSuffix(host, "."))
 	if err != nil {
-		return netip.Addr{}, fmt.Errorf("IPv6 target %v: no IPv4 via PTR %s: %w", ip, name, err)
+		return netip.Addr{}, err
 	}
 	for _, s := range ips {
 		if a, err := netip.ParseAddr(s); err == nil && a.Is4() {
 			return a, nil
 		}
 	}
-	return netip.Addr{}, fmt.Errorf("IPv6 target %v: PTR %s has no A record", ip, name)
+	return netip.Addr{}, fmt.Errorf("no A for %s", host)
+}
+
+// google1e100IPv4Name turns lcarnb-ag-in-x0e.1e100.net into lcarnb-ag-in-f14.1e100.net.
+// The in-xHH form is IPv6-only; in-fDD is the matching IPv4 frontend.
+func google1e100IPv4Name(name string) string {
+	lower := strings.ToLower(strings.TrimSuffix(name, "."))
+	if !strings.HasSuffix(lower, ".1e100.net") {
+		return ""
+	}
+	const tag = "-in-x"
+	i := strings.LastIndex(lower, tag)
+	if i < 0 {
+		return ""
+	}
+	rest := lower[i+len(tag):]
+	dot := strings.IndexByte(rest, '.')
+	if dot <= 0 {
+		return ""
+	}
+	n, err := strconv.ParseUint(rest[:dot], 16, 32)
+	if err != nil {
+		return ""
+	}
+	return lower[:i] + "-in-f" + strconv.FormatUint(n, 10) + rest[dot:]
 }
 
 func nat64Embedded(ip netip.Addr) (netip.Addr, bool) {
 	b := ip.As16()
-	// RFC 6052 well-known prefix 64:ff9b::/96
 	if b[0] == 0x00 && b[1] == 0x64 && b[2] == 0xff && b[3] == 0x9b &&
 		b[4] == 0 && b[5] == 0 && b[6] == 0 && b[7] == 0 &&
 		b[8] == 0 && b[9] == 0 && b[10] == 0 && b[11] == 0 {
@@ -85,7 +141,6 @@ func sixToFour(ip netip.Addr) (netip.Addr, bool) {
 	return netip.Addr{}, false
 }
 
-// Cloudflare 2606:4700::/32 stores the matching IPv4 in the last 32 bits.
 func cloudflareEmbedded(ip netip.Addr) (netip.Addr, bool) {
 	b := ip.As16()
 	if b[0] == 0x26 && b[1] == 0x06 && b[2] == 0x47 && b[3] == 0x00 {
@@ -93,6 +148,27 @@ func cloudflareEmbedded(ip netip.Addr) (netip.Addr, bool) {
 		if v4.IsGlobalUnicast() && !v4.IsPrivate() {
 			return v4, true
 		}
+	}
+	return netip.Addr{}, false
+}
+
+func googlePublicDNS(ip netip.Addr) (netip.Addr, bool) {
+	b := ip.As16()
+	if b[0] != 0x20 || b[1] != 0x01 || b[2] != 0x48 || b[3] != 0x60 {
+		return netip.Addr{}, false
+	}
+	dns8888 := netip.MustParseAddr("8.8.8.8")
+	dns8844 := netip.MustParseAddr("8.8.4.4")
+	if b[4] == 0x48 && b[5] == 0x60 {
+		if b[14] == 0x88 && b[15] == 0x88 {
+			return dns8888, true
+		}
+		if b[14] == 0x88 && b[15] == 0x44 {
+			return dns8844, true
+		}
+	}
+	if b[6] == 0x77 && b[7] == 0x00 {
+		return dns8888, true
 	}
 	return netip.Addr{}, false
 }
@@ -140,13 +216,13 @@ func queryPTR(server, protectPath, fqdn string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	d := net.Dialer{Timeout: 2 * time.Second, Control: dialControl(protectPath, nil)}
+	d := net.Dialer{Timeout: 800 * time.Millisecond, Control: dialControl(protectPath, nil)}
 	conn, err := d.Dial("udp", server)
 	if err != nil {
 		return "", err
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(800 * time.Millisecond))
 	id := uint16(time.Now().UnixNano())
 	msg := dnsmessage.Message{
 		Header:    dnsmessage.Header{ID: id, RecursionDesired: true},
