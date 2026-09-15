@@ -1,15 +1,15 @@
 {
-  "version": "1.2.2",
+  "version": "1.2.3",
   "android": {
-    "arm64-v8a": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.2/csqtt-android-arm64-v8a.zip",
-    "armeabi-v7a": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.2/csqtt-android-armeabi-v7a.zip",
-    "x86": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.2/csqtt-android-x86.zip",
-    "x86_64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.2/csqtt-android-x86_64.zip"
+    "arm64-v8a": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.3/csqtt-android-arm64-v8a.zip",
+    "armeabi-v7a": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.3/csqtt-android-armeabi-v7a.zip",
+    "x86": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.3/csqtt-android-x86.zip",
+    "x86_64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.3/csqtt-android-x86_64.zip"
   },
   "desktop": {
     "windows_amd64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.0.0/csqtt-windows_amd64.zip",
     "linux_amd64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.0.0/csqtt-linux_amd64.zip",
     "darwin_amd64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.0.0/csqtt-darwin_amd64.zip"
   },
-  "changelog": "1.2.2: HTTPS к VK (api.vk.me / login.vk.ru) идёт через off-TUN CONNECT-прокси helper'а — иначе сокеты rust попадают в VPN и соединение висит с 0 трафика. OAuth webview не открывается, если хеши уже есть в ссылке. 1.2.1: capture access_token из fragment. Desktop-бандлы пока 1.0.0."
+  "changelog": "1.2.3: Android 16 шлёт в SOCKS IPv6 (Happy Eyeballs) — туннель IPv4-only, CONNECT/UDP отклонялись, сайты не открывались при STATUS|ok. Теперь IPv6 мапится в IPv4 (NAT64/6to4/Cloudflare/PTR). MTU gVisor 1300 как у CSQTT. 1.2.2: HTTPS к VK через off-TUN CONNECT-прокси. Desktop-бандлы пока 1.0.0."
 }

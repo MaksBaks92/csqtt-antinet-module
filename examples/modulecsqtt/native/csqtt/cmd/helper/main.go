@@ -560,12 +560,25 @@ type csqttUDPTransport struct {
 }
 
 func (t csqttUDPTransport) LookupHost(host string) ([]string, error) {
-	return t.resolver.LookupHost(host)
+	ips, err := t.resolver.LookupHost(host)
+	if err != nil {
+		return nil, err
+	}
+	v4 := onlyIPv4(ips)
+	if len(v4) == 0 {
+		return nil, fmt.Errorf("no IPv4 address for %s (got %v)", host, ips)
+	}
+	return v4, nil
 }
 
 func (t csqttUDPTransport) DialUDPTarget(dst netip.AddrPort) (net.Conn, error) {
-	if !dst.Addr().Is4() && !dst.Addr().Is4In6() {
-		return nil, errSocksTargetUnreachable
+	ip := dst.Addr()
+	if !ip.Is4() && !ip.Is4In6() {
+		mapped, err := mapIPv6To4(ip, t.resolver)
+		if err != nil {
+			return nil, errSocksTargetUnreachable
+		}
+		dst = netip.AddrPortFrom(mapped, dst.Port())
 	}
 	return t.tun.DialUDP(dst)
 }
@@ -615,21 +628,25 @@ func handleConn(c net.Conn, user, pass string, tun *tunnel.IPTunnel, resolver *p
 
 func resolveV4(req socksRequest, resolver *protectedResolver) (string, error) {
 	if req.IsIP() {
-		if !req.IP.Is4() && !req.IP.Is4In6() {
-			return "", fmt.Errorf("IPv6 target %v: tunnel is IPv4-only", req.IP)
+		ip := req.IP.Unmap()
+		if ip.Is4() {
+			return ip.String(), nil
 		}
-		return req.IP.Unmap().String(), nil
+		mapped, err := mapIPv6To4(ip, resolver)
+		if err != nil {
+			return "", err
+		}
+		return mapped.String(), nil
 	}
 	ips, err := resolver.LookupHost(req.Host)
 	if err != nil {
 		return "", err
 	}
-	for _, s := range ips {
-		if a := net.ParseIP(s); a != nil && a.To4() != nil {
-			return a.To4().String(), nil
-		}
+	v4 := onlyIPv4(ips)
+	if len(v4) == 0 {
+		return "", fmt.Errorf("no IPv4 address for %s (got %v)", req.Host, ips)
 	}
-	return "", fmt.Errorf("no IPv4 address for %s (got %v)", req.Host, ips)
+	return v4[0], nil
 }
 
 type savedState struct {

@@ -36,6 +36,8 @@ func NewIPTunnel(clientIP net.IP, onOutgoing func([]byte)) (*IPTunnel, error) {
 		&tcpip.TCPReceiveBufferSizeRangeOption{Min: 65536, Default: 262144, Max: 1048576})
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber,
 		&tcpip.TCPSendBufferSizeRangeOption{Min: 65536, Default: 262144, Max: 1048576})
+	sack := tcpip.TCPSACKEnabled(true)
+	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sack)
 
 	ep := NewLinkEndpoint()
 	ep.SetOutgoingPacketHandler(onOutgoing)

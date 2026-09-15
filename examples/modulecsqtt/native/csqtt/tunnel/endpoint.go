@@ -60,7 +60,7 @@ func (e *LinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Err
 	return n, nil
 }
 
-func (e *LinkEndpoint) MTU() uint32                    { return 1500 }
+func (e *LinkEndpoint) MTU() uint32 { return 1300 }
 func (e *LinkEndpoint) MaxHeaderLength() uint16         { return 0 }
 func (e *LinkEndpoint) LinkAddress() tcpip.LinkAddress  { return "\x02\x00\x00\x00\x00\x01" }
 func (e *LinkEndpoint) Capabilities() stack.LinkEndpointCapabilities {
