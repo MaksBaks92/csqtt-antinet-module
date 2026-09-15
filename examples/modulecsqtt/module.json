@@ -1,0 +1,76 @@
+{
+  "apiVersion": 1,
+  "schemes": [
+    "csqtt"
+  ],
+  "name": "CSQTT",
+  "description": "L3-туннель CSQTT (TURN/RTP поверх VK Calls): SOCKS5 → gVisor → сырые IPv4-пакеты в rust-движок. Нужен свой CSQTT-сервер и VK-хеши.",
+  "homepage": "https://github.com/amurcanov/csqtt",
+  "updateUrl": "https://raw.githubusercontent.com/MaxPain99/csqtt-antinet-module/main/antinet-module.json",
+  "version": "1.0.0",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "handoverMode": "signal",
+  "hostEvents": ["handover", "netlost", "netback", "stall"],
+  "parallelPing": false,
+  "pingTimeoutSec": 90,
+  "socks5": true,
+  "dnsResolver": true,
+  "settings": [
+    {
+      "key": "dialTimeoutSec",
+      "type": "int",
+      "label": "Таймаут дозвона до цели (сек)",
+      "default": 20,
+      "min": 1,
+      "max": 120,
+      "description": "Сколько ждать TCP-соединения ВНУТРИ туннеля CSQTT, прежде чем отказать."
+    },
+    {
+      "key": "workers",
+      "type": "int",
+      "label": "Число TURN-воркеров",
+      "default": 18,
+      "min": 3,
+      "max": 126,
+      "description": "Сколько параллельных TURN-путей держать. Больше — запас по обрывам, выше нагрузка на VK/TURN."
+    },
+    {
+      "key": "vkHashes",
+      "type": "string",
+      "label": "VK-хеши (если их нет в ссылке)",
+      "default": "",
+      "description": "Список хешей через запятую. Нужен, если ссылка без hashes=. Иначе берётся из csqtt://."
+    },
+    {
+      "key": "obfs",
+      "type": "string",
+      "label": "Обфускация RTP",
+      "default": "video",
+      "description": "video или audio — как маскировать туннель под медиапоток VK Calls."
+    },
+    {
+      "key": "turnTransport",
+      "type": "string",
+      "label": "Транспорт TURN",
+      "default": "udp",
+      "description": "udp или tcp."
+    },
+    {
+      "key": "debugLog",
+      "type": "bool",
+      "label": "Подробный лог",
+      "default": false,
+      "description": "Диагностика gVisor и пакетного моста в журнале модуля."
+    }
+  ],
+  "helperBinary": {
+    "android": "libcsqtthelper.so",
+    "desktop": "csqtt-helper"
+  },
+  "build": {
+    "goDir": "native/csqtt",
+    "goPkg": "./cmd/helper",
+    "ldflags": "-checklinkname=0",
+    "rustDir": "native/csqtt-engine"
+  }
+}
