@@ -35,8 +35,13 @@ const (
 	linkHostConnect = "connect"
 	defaultDialSec  = 20
 	readyWaitBudget = 90 * time.Second
-	vkOAuthURL      = "https://oauth.vk.ru/authorize?client_id=7793118&scope=1073737727&redirect_uri=https%3A%2F%2Foauth.vk.ru%2Fblank.html&display=page&response_type=token&revoke=1&v=5.199"
 	vkOAuthTimeout  = 5 * time.Minute
+	vkOAuthURL      = "https://oauth.vk.ru/authorize?client_id=7793118&scope=1073737727&redirect_uri=https%3A%2F%2Foauth.vk.ru%2Fblank.html&display=mobile&response_type=token&revoke=1&v=5.199"
+	vkOAuthURLCom   = "https://oauth.vk.com/authorize?client_id=7793118&scope=1073737727&redirect_uri=https%3A%2F%2Foauth.vk.ru%2Fblank.html&display=mobile&response_type=token&revoke=1&v=5.199"
+	// VK отдаёт implicit-токен в location.hash. Android WebView часто не включает fragment
+	// в URL колбэка хоста — param=access_token тогда пустой, юзер видит blank.html и закрывает
+	// окно → CANCELLED. JS читает hash и переписывает его в query, который хост уже умеет.
+	vkOAuthHoistJS = `(function(){if(window.__csqttOauthHoist)return;window.__csqttOauthHoist=1;function hoist(){try{var h=String(location.hash||'');if(h.indexOf('access_token=')<0)return;var q=h.replace(/^#/,'');if(String(location.search||'').indexOf('access_token=')>=0)return;location.replace(location.protocol+'//'+location.host+location.pathname+'?'+q);}catch(e){}}hoist();setInterval(hoist,250);})();`
 )
 
 type csqttStrings struct {
@@ -54,6 +59,7 @@ type csqttStrings struct {
 	openingEngine        string
 	vkLoginProgress      string
 	vkLoginFailedFmt     string
+	vkLoginFallbackFmt   string
 	vkAutoAPIProgress    string
 	vkAutoAPIFailedFmt   string
 	handoverLog          string
@@ -72,8 +78,9 @@ var csqttStringsRU = csqttStrings{
 	writeReadyFailedFmt:  "CSQTT: не удалось записать маркер готовности: %v",
 	socksUpFmt:           "CSQTT: SOCKS5 поднят на 127.0.0.1:%d",
 	openingEngine:        "CSQTT: поднимаю TURN-туннель",
-	vkLoginProgress:      "CSQTT: войдите в VK, чтобы создать звонок",
+	vkLoginProgress:      "CSQTT: войдите в VK и подтвердите доступ; окно закроется само",
 	vkLoginFailedFmt:     "CSQTT: не удалось получить VK-токен: %v",
+	vkLoginFallbackFmt:   "CSQTT: вход в VK не удался (%v), беру хеши из ссылки/настроек",
 	vkAutoAPIProgress:    "CSQTT: создаю звонки VK через API",
 	vkAutoAPIFailedFmt:   "CSQTT: не удалось создать звонки VK: %v",
 	handoverLog:          "хендовер: сменилась сеть — TURN-воркеры переподключатся сами",
@@ -92,8 +99,9 @@ var csqttStringsEN = csqttStrings{
 	writeReadyFailedFmt:  "CSQTT: failed to mark readiness: %v",
 	socksUpFmt:           "CSQTT: SOCKS5 up on 127.0.0.1:%d",
 	openingEngine:        "CSQTT: starting TURN tunnel",
-	vkLoginProgress:      "CSQTT: sign in to VK to create a call",
+	vkLoginProgress:      "CSQTT: sign in to VK and allow access; the window closes itself",
 	vkLoginFailedFmt:     "CSQTT: failed to get VK token: %v",
+	vkLoginFallbackFmt:   "CSQTT: VK login failed (%v), using hashes from link/settings",
 	vkAutoAPIProgress:    "CSQTT: creating VK calls via API",
 	vkAutoAPIFailedFmt:   "CSQTT: failed to create VK calls: %v",
 	handoverLog:          "handover: network changed, TURN workers will reconnect",
@@ -326,15 +334,23 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	hashMode := normalizeHashMode(cfg["SETTING_hashMode"], len(hashes) > 0)
 	vkToken := ""
 	allowRedistrib := false
-	switch hashMode {
-	case "auto_api":
+	if hashMode == "auto_api" || hashMode == "auto_js" {
 		tok, terr := ensureVkToken(cfg["MODULE_STATE"], profileDir, s)
 		if terr != nil {
-			emitLog(s.vkLoginFailedFmt, terr)
-			emitStatus(statusFatal, "vk login failed")
-			log.Fatalf("vk token: %v", terr)
+			if len(hashes) > 0 {
+				emitLog(s.vkLoginFallbackFmt, terr)
+				hashMode = "manual"
+			} else {
+				emitLog(s.vkLoginFailedFmt, terr)
+				emitStatus(statusFatal, "vk login failed")
+				log.Fatalf("vk token: %v", terr)
+			}
+		} else {
+			vkToken = tok
 		}
-		vkToken = tok
+	}
+	switch hashMode {
+	case "auto_api":
 		emitProgress("%s", s.vkAutoAPIProgress)
 		started, aerr := startVkAutoCalls(vkToken, workers)
 		if errors.Is(aerr, errVkTokenInvalid) {
@@ -342,6 +358,11 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 			emitProgress("%s", s.vkLoginProgress)
 			fresh, ferr := requestVkAccessToken(profileDir)
 			if ferr != nil {
+				if len(hashes) > 0 {
+					emitLog(s.vkLoginFallbackFmt, ferr)
+					hashMode = "manual"
+					break
+				}
 				emitLog(s.vkLoginFailedFmt, ferr)
 				emitStatus(statusFatal, "vk login failed")
 				log.Fatalf("vk token: %v", ferr)
@@ -350,9 +371,17 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 			saveVkToken(vkToken)
 			started, aerr = startVkAutoCalls(vkToken, workers)
 		}
+		if hashMode != "auto_api" {
+			break
+		}
 		if aerr != nil || len(started.Hashes) == 0 {
 			if aerr == nil {
 				aerr = fmt.Errorf("empty hash list")
+			}
+			if len(hashes) > 0 {
+				emitLog(s.vkLoginFallbackFmt, aerr)
+				hashMode = "manual"
+				break
 			}
 			emitLog(s.vkAutoAPIFailedFmt, aerr)
 			emitStatus(statusFatal, "vk auto api failed")
@@ -362,13 +391,7 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 		allowRedistrib = started.needsRedistribution()
 		defer finishVkAutoCalls(vkToken, started.Calls)
 	case "auto_js":
-		tok, terr := ensureVkToken(cfg["MODULE_STATE"], profileDir, s)
-		if terr != nil {
-			emitLog(s.vkLoginFailedFmt, terr)
-			emitStatus(statusFatal, "vk login failed")
-			log.Fatalf("vk token: %v", terr)
-		}
-		vkToken = tok
+		// токен уже в vkToken — rust создаёт звонок сам
 	default:
 		if len(hashes) == 0 {
 			emitLog(s.missingHashes)
@@ -703,32 +726,90 @@ func requestVkAccessToken(profileDir string) (string, error) {
 		return "", fmt.Errorf("profileDir not set")
 	}
 	id := fmt.Sprintf("vk-oauth-%d", time.Now().UnixNano())
-	rule, _ := json.Marshal(map[string]any{
+	res, cancelled := runAction(profileDir, id, map[string]any{
 		"type":          "webview",
 		"mode":          "navigation",
-		"url":           vkOAuthURL,
+		"url":           []string{vkOAuthURL, vkOAuthURLCom},
 		"urlPattern":    "blank.html",
 		"param":         "access_token",
-		"urlTimeoutSec": 300,
+		"urlTimeoutSec": int(vkOAuthTimeout / time.Second),
+		"injectJs":      vkOAuthHoistJS,
 	})
-	fmt.Printf("ACTION_REQUIRED|%s|%s\n", id, base64.StdEncoding.EncodeToString(rule))
-	_ = os.Stdout.Sync()
-	res, gaveUp := awaitActionResult(context.Background(), profileDir, id, vkOAuthTimeout)
-	if gaveUp {
-		return "", fmt.Errorf("VK login timed out")
+	if cancelled {
+		return "", fmt.Errorf("VK login cancelled")
 	}
-	if res == "" || res == "CANCELLED" {
+	tok, err := parseVkAccessToken(res)
+	if err != nil {
+		return "", err
+	}
+	return tok, nil
+}
+
+func parseVkAccessToken(res string) (string, error) {
+	res = strings.TrimSpace(res)
+	if res == "" || strings.EqualFold(res, "CANCELLED") {
 		return "", fmt.Errorf("VK login cancelled")
 	}
 	if strings.HasPrefix(strings.ToLower(res), "error:") {
 		return "", fmt.Errorf("VK login failed: %s", res)
 	}
-	if dec, err := base64.StdEncoding.DecodeString(res); err == nil && len(strings.TrimSpace(string(dec))) > 0 {
-		res = strings.TrimSpace(string(dec))
+	if tok := extractAccessToken(res); tok != "" {
+		return tok, nil
 	}
-	res = strings.TrimSpace(res)
-	if res == "" {
-		return "", fmt.Errorf("empty access_token")
+	var payload map[string]any
+	if json.Unmarshal([]byte(res), &payload) == nil {
+		if tok := extractAccessToken(fmt.Sprint(payload["access_token"])); tok != "" {
+			return tok, nil
+		}
+		if t, ok := payload["access_token"].(string); ok {
+			if tok := strings.TrimSpace(t); looksLikeVkToken(tok) {
+				return tok, nil
+			}
+		}
 	}
-	return res, nil
+	if looksLikeVkToken(res) {
+		return res, nil
+	}
+	if dec, err := base64.StdEncoding.DecodeString(res); err == nil {
+		s := strings.TrimSpace(string(dec))
+		if tok := extractAccessToken(s); tok != "" {
+			return tok, nil
+		}
+		if looksLikeVkToken(s) {
+			return s, nil
+		}
+	}
+	return "", fmt.Errorf("empty access_token")
+}
+
+func extractAccessToken(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" || s == "<nil>" {
+		return ""
+	}
+	if i := strings.Index(s, "access_token="); i >= 0 {
+		rest := s[i+len("access_token="):]
+		if j := strings.IndexAny(rest, "&?#"); j >= 0 {
+			rest = rest[:j]
+		}
+		if u, err := url.QueryUnescape(rest); err == nil && strings.TrimSpace(u) != "" {
+			rest = u
+		}
+		rest = strings.TrimSpace(rest)
+		if looksLikeVkToken(rest) {
+			return rest
+		}
+	}
+	return ""
+}
+
+func looksLikeVkToken(s string) bool {
+	if len(s) < 20 || strings.ContainsAny(s, " \t\r\n<>\"'") {
+		return false
+	}
+	low := strings.ToLower(s)
+	if strings.HasPrefix(low, "http://") || strings.HasPrefix(low, "https://") {
+		return false
+	}
+	return true
 }
