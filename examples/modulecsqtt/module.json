@@ -4,14 +4,15 @@
     "csqtt"
   ],
   "name": "CSQTT",
-  "description": "L3-туннель CSQTT (TURN/RTP поверх VK Calls): SOCKS5 → gVisor → сырые IPv4-пакеты в rust-движок. Нужен свой CSQTT-сервер и VK-хеши.",
+  "description": "L3-туннель CSQTT (TURN/RTP поверх VK Calls): SOCKS5 → gVisor → rust-движок. Хеши VK: Авто API (calls.start, 1–6 звонков), Авто ВК (один звонок в rust) или вручную. Вход в VK — webview AntiNet.",
   "homepage": "https://github.com/amurcanov/csqtt",
   "updateUrl": "https://raw.githubusercontent.com/MaxPain99/csqtt-antinet-module/main/antinet-module.json",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "license": "PolyForm-Noncommercial-1.0.0",
   "handoverMode": "signal",
   "hostEvents": ["handover", "netlost", "netback", "stall"],
   "parallelPing": false,
+  "pingNeedsConsent": true,
   "pingTimeoutSec": 90,
   "socks5": true,
   "dnsResolver": true,
@@ -35,11 +36,23 @@
       "description": "Сколько параллельных TURN-путей держать. Больше — запас по обрывам, выше нагрузка на VK/TURN."
     },
     {
+      "key": "hashMode",
+      "type": "enum",
+      "label": "VK-хеши",
+      "default": "auto_api",
+      "description": "Авто API — как в клиенте CSQTT: helper создаёт 1–6 звонков через calls.start и закрывает их при отключении. Авто ВК — rust создаёт один звонок (vchat.startConversation). В обоих нужен вход в VK (webview AntiNet); cookie остаются в хранилище AntiNet. Ручной — хеши из ссылки или поля ниже.",
+      "options": [
+        { "value": "auto_api", "label": "Авто API (calls.start, 1–6 звонков)" },
+        { "value": "auto_js", "label": "Авто ВК (один звонок в rust)" },
+        { "value": "manual", "label": "Ручной (хеши из ссылки / поля)" }
+      ]
+    },
+    {
       "key": "vkHashes",
       "type": "string",
-      "label": "VK-хеши (если их нет в ссылке)",
+      "label": "VK-хеши (ручной режим)",
       "default": "",
-      "description": "Список хешей через запятую. Нужен, если ссылка без hashes=. Иначе берётся из csqtt://."
+      "description": "Список хешей через запятую. Нужен только если режим «Ручной» и в ссылке нет hashes=."
     },
     {
       "key": "obfs",

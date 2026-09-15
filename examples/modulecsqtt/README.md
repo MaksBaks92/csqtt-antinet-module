@@ -10,7 +10,15 @@ Companion-модуль AntiNet для протокола [CSQTT](https://github.
 csqtt://connect?v=2&host=<host>&peer=<port>&password=<password>&hashes=<hash>+<hash>
 ```
 
-`hashes` можно не класть в ссылку, а задать настройкой модуля `vkHashes`.
+VK-хеши можно не класть в ссылку. Три режима, как в клиенте CSQTT:
+
+- **Авто API** (по умолчанию) — helper вызывает `calls.start`, создаёт 1–6 звонков
+  по числу воркеров и при остановке закрывает их через `calls.forceFinish`.
+- **Авто ВК** — rust-движок создаёт один звонок (`vchat.startConversation`).
+- **Ручной** — `hashes=` в ссылке или настройка «VK-хеши».
+
+В авто-режимах helper открывает вход в VK через webview хоста AntiNet. Cookie сессии
+остаются в хранилище AntiNet.
 
 ## Раскладка
 
@@ -21,5 +29,7 @@ csqtt://connect?v=2&host=<host>&peer=<port>&password=<password>&hashes=<hash>+<h
 | `native/csqtt/tunnel/` | gVisor netstack (сырые IPv4) |
 | `native/csqtt-engine/` | rust-движок (форк rust-client CSQTT + C FFI + protect-hook) |
 
-На Android рядом с `libcsqtthelper.so` должен лежать `libcsqtt_engine.so`.
+На Android рядом с `libcsqtthelper.so` должен лежать `libcsqtt_engine.so`
+(хост распаковывает весь плоский ZIP ABI-каталога). Helper ищет движок рядом с собой
+и по `/proc/self/maps` — `os.Executable()` в слот-процессе указывает на бинарь AntiNet, не на модуль.
 На Windows рядом с `csqtt-helper.exe` — `csqtt_engine.dll`.

@@ -101,6 +101,8 @@ pub struct Arguments {
     #[arg(long, default_value = "manual")]
     vk_hash_mode: String,
     #[arg(long, default_value = "")]
+    vk_js_token: String,
+    #[arg(long, default_value = "")]
     peer: String,
     #[arg(short = 'n', long, default_value_t = 18)]
     workers: usize,
@@ -200,7 +202,13 @@ pub async fn run(arguments: Arguments) -> Result<()> {
     let mut js_calls = None;
     let mut js_credential_broker = None;
     let hash_source = if js_hash_mode {
-        let bootstrap = read_vk_js_bootstrap().await?;
+        let bootstrap = if !arguments.vk_js_token.trim().is_empty() {
+            vk_js_calls::Bootstrap {
+                token: arguments.vk_js_token.trim().to_string(),
+            }
+        } else {
+            read_vk_js_bootstrap().await?
+        };
         let started = vk_js_calls::start(
             bootstrap,
             &arguments.device_id,

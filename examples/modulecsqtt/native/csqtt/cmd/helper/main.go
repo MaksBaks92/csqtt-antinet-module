@@ -8,12 +8,18 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/netip"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -29,6 +35,8 @@ const (
 	linkHostConnect = "connect"
 	defaultDialSec  = 20
 	readyWaitBudget = 90 * time.Second
+	vkOAuthURL      = "https://oauth.vk.ru/authorize?client_id=7793118&scope=1073737727&redirect_uri=https%3A%2F%2Foauth.vk.ru%2Fblank.html&display=page&response_type=token&revoke=1&v=5.199"
+	vkOAuthTimeout  = 5 * time.Minute
 )
 
 type csqttStrings struct {
@@ -44,12 +52,16 @@ type csqttStrings struct {
 	writeReadyFailedFmt  string
 	socksUpFmt           string
 	openingEngine        string
+	vkLoginProgress      string
+	vkLoginFailedFmt     string
+	vkAutoAPIProgress    string
+	vkAutoAPIFailedFmt   string
 	handoverLog          string
 }
 
 var csqttStringsRU = csqttStrings{
 	badLinkFmt:           "CSQTT: неверная ссылка: %v",
-	missingHashes:        "CSQTT: в ссылке нет hashes=, укажите VK-хеши в настройках модуля",
+	missingHashes:        "CSQTT: в ссылке нет hashes=, укажите VK-хеши в настройках или включите авто-режим",
 	engineLoadFailedFmt:  "CSQTT: не удалось загрузить движок: %v",
 	engineStartFailedFmt: "CSQTT: движок не стартовал: %v",
 	engineNotReadyFmt:    "CSQTT: туннель не поднялся за %s",
@@ -60,12 +72,16 @@ var csqttStringsRU = csqttStrings{
 	writeReadyFailedFmt:  "CSQTT: не удалось записать маркер готовности: %v",
 	socksUpFmt:           "CSQTT: SOCKS5 поднят на 127.0.0.1:%d",
 	openingEngine:        "CSQTT: поднимаю TURN-туннель",
+	vkLoginProgress:      "CSQTT: войдите в VK, чтобы создать звонок",
+	vkLoginFailedFmt:     "CSQTT: не удалось получить VK-токен: %v",
+	vkAutoAPIProgress:    "CSQTT: создаю звонки VK через API",
+	vkAutoAPIFailedFmt:   "CSQTT: не удалось создать звонки VK: %v",
 	handoverLog:          "хендовер: сменилась сеть — TURN-воркеры переподключатся сами",
 }
 
 var csqttStringsEN = csqttStrings{
 	badLinkFmt:           "CSQTT: bad link: %v",
-	missingHashes:        "CSQTT: link has no hashes=; set VK hashes in module settings",
+	missingHashes:        "CSQTT: link has no hashes=; set VK hashes in settings or enable auto mode",
 	engineLoadFailedFmt:  "CSQTT: failed to load engine: %v",
 	engineStartFailedFmt: "CSQTT: engine failed to start: %v",
 	engineNotReadyFmt:    "CSQTT: tunnel did not come up within %s",
@@ -76,6 +92,10 @@ var csqttStringsEN = csqttStrings{
 	writeReadyFailedFmt:  "CSQTT: failed to mark readiness: %v",
 	socksUpFmt:           "CSQTT: SOCKS5 up on 127.0.0.1:%d",
 	openingEngine:        "CSQTT: starting TURN tunnel",
+	vkLoginProgress:      "CSQTT: sign in to VK to create a call",
+	vkLoginFailedFmt:     "CSQTT: failed to get VK token: %v",
+	vkAutoAPIProgress:    "CSQTT: creating VK calls via API",
+	vkAutoAPIFailedFmt:   "CSQTT: failed to create VK calls: %v",
 	handoverLog:          "handover: network changed, TURN workers will reconnect",
 }
 
@@ -246,8 +266,29 @@ func moduleCall(verb, arg string) string {
 		return l.displayName() + "\n" + l.server()
 	case "normalize":
 		return normalizeCsqtt(arg)
+	case "canping":
+		return canPingCSQTT(arg)
 	}
 	return ""
+}
+
+func canPingCSQTT(arg string) string {
+	lines := strings.SplitN(arg, "\n", 3)
+	link := ""
+	blob := ""
+	if len(lines) > 0 {
+		link = strings.TrimSpace(lines[0])
+	}
+	if len(lines) > 2 {
+		blob = lines[2]
+	}
+	if l, err := parseCsqttLink(link); err == nil && len(l.Hashes) > 0 {
+		return "ok"
+	}
+	if restoreSavedState(blob).VKToken != "" {
+		return "ok"
+	}
+	return "no"
 }
 
 func realMain(configContent, resolversPath, profileDir, protectPath string, listenFd int) int {
@@ -259,6 +300,10 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 
 	cfg := parseConfig(configContent)
 	s := csqttStringsFor(cfg["APP_LANG"])
+	configureVkHTTP(protectPath)
+	persisted = restoreSavedState(cfg["MODULE_STATE"])
+	deviceID, generation, sessionSalt := nextEngineIdentity(cfg, &persisted)
+	persistState()
 	port, _ := strconv.Atoi(cfg["LISTEN_PORT"])
 	user := cfg["SOCKS_USER"]
 	pass := cfg["SOCKS_PASS"]
@@ -274,14 +319,65 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	if len(hashes) == 0 {
 		hashes = splitHashes(cfg["SETTING_vkHashes"])
 	}
-	if len(hashes) == 0 {
-		emitLog(s.missingHashes)
-		emitStatus(statusFatal, "missing vk hashes")
-		log.Fatalf("missing vk hashes")
+	workers, _ := strconv.Atoi(strings.TrimSpace(cfg["SETTING_workers"]))
+	if workers <= 0 {
+		workers = 18
+	}
+	hashMode := normalizeHashMode(cfg["SETTING_hashMode"], len(hashes) > 0)
+	vkToken := ""
+	allowRedistrib := false
+	switch hashMode {
+	case "auto_api":
+		tok, terr := ensureVkToken(cfg["MODULE_STATE"], profileDir, s)
+		if terr != nil {
+			emitLog(s.vkLoginFailedFmt, terr)
+			emitStatus(statusFatal, "vk login failed")
+			log.Fatalf("vk token: %v", terr)
+		}
+		vkToken = tok
+		emitProgress("%s", s.vkAutoAPIProgress)
+		started, aerr := startVkAutoCalls(vkToken, workers)
+		if errors.Is(aerr, errVkTokenInvalid) {
+			saveVkToken("")
+			emitProgress("%s", s.vkLoginProgress)
+			fresh, ferr := requestVkAccessToken(profileDir)
+			if ferr != nil {
+				emitLog(s.vkLoginFailedFmt, ferr)
+				emitStatus(statusFatal, "vk login failed")
+				log.Fatalf("vk token: %v", ferr)
+			}
+			vkToken = fresh
+			saveVkToken(vkToken)
+			started, aerr = startVkAutoCalls(vkToken, workers)
+		}
+		if aerr != nil || len(started.Hashes) == 0 {
+			if aerr == nil {
+				aerr = fmt.Errorf("empty hash list")
+			}
+			emitLog(s.vkAutoAPIFailedFmt, aerr)
+			emitStatus(statusFatal, "vk auto api failed")
+			log.Fatalf("vk auto api: %v", aerr)
+		}
+		hashes = started.Hashes
+		allowRedistrib = started.needsRedistribution()
+		defer finishVkAutoCalls(vkToken, started.Calls)
+	case "auto_js":
+		tok, terr := ensureVkToken(cfg["MODULE_STATE"], profileDir, s)
+		if terr != nil {
+			emitLog(s.vkLoginFailedFmt, terr)
+			emitStatus(statusFatal, "vk login failed")
+			log.Fatalf("vk token: %v", terr)
+		}
+		vkToken = tok
+	default:
+		if len(hashes) == 0 {
+			emitLog(s.missingHashes)
+			emitStatus(statusFatal, "missing vk hashes")
+			log.Fatalf("missing vk hashes")
+		}
 	}
 
 	dialTimeout := settingDuration(cfg, "SETTING_dialTimeoutSec", defaultDialSec)
-	workers, _ := strconv.Atoi(strings.TrimSpace(cfg["SETTING_workers"]))
 	obfs := strings.TrimSpace(cfg["SETTING_obfs"])
 	turnTransport := strings.TrimSpace(cfg["SETTING_turnTransport"])
 
@@ -305,17 +401,27 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 		return protectFn(int32(fd))
 	})
 
-	engineCfg, _ := json.Marshal(map[string]any{
+	engineJSON := map[string]any{
 		"peer":           link.peerAddr(),
 		"password":       link.Password,
 		"hashes":         strings.Join(hashes, ","),
 		"workers":        workers,
-		"device_id":      "antinet",
+		"device_id":      deviceID,
+		"generation":     generation,
+		"salt":           sessionSalt,
 		"captcha_mode":   "auto",
 		"obfs":           obfs,
 		"turn_transport": turnTransport,
 		"fingerprint":    "firefox",
-	})
+	}
+	if hashMode == "auto_js" && vkToken != "" {
+		engineJSON["vk_hash_mode"] = "auto_js"
+		engineJSON["vk_js_token"] = vkToken
+	}
+	if allowRedistrib {
+		engineJSON["allow_hash_redistribution"] = true
+	}
+	engineCfg, _ := json.Marshal(engineJSON)
 
 	emitProgress(s.openingEngine)
 	if err := engineStart(string(engineCfg)); err != nil {
@@ -484,4 +590,145 @@ func resolveV4(req socksRequest, resolver *protectedResolver) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no IPv4 address for %s (got %v)", req.Host, ips)
+}
+
+type savedState struct {
+	VKToken    string `json:"vk_token"`
+	DeviceID   string `json:"device_id"`
+	Generation uint64 `json:"generation"`
+}
+
+var persisted savedState
+
+func restoreSavedState(blob string) savedState {
+	var st savedState
+	blob = strings.TrimSpace(blob)
+	if blob == "" {
+		return st
+	}
+	raw := []byte(blob)
+	if dec, err := base64.StdEncoding.DecodeString(blob); err == nil && len(dec) > 0 {
+		raw = dec
+	}
+	_ = json.Unmarshal(raw, &st)
+	st.VKToken = strings.TrimSpace(st.VKToken)
+	st.DeviceID = strings.TrimSpace(st.DeviceID)
+	return st
+}
+
+func restoredVkToken(blob string) string {
+	return restoreSavedState(blob).VKToken
+}
+
+func persistState() {
+	body, err := json.Marshal(persisted)
+	if err != nil {
+		return
+	}
+	fmt.Printf("STATE_SAVE|%s\n", base64.StdEncoding.EncodeToString(body))
+	_ = os.Stdout.Sync()
+}
+
+func nextEngineIdentity(cfg map[string]string, st *savedState) (deviceID string, generation uint64, salt string) {
+	deviceID = strings.TrimSpace(cfg["DEVICE_ID"])
+	if deviceID == "" {
+		deviceID = strings.TrimSpace(st.DeviceID)
+	}
+	if deviceID == "" {
+		deviceID = randomHex(16)
+	}
+	if len(deviceID) > 128 {
+		deviceID = deviceID[:128]
+	}
+	st.DeviceID = deviceID
+	if st.Generation < ^uint64(0) {
+		st.Generation++
+	}
+	if st.Generation == 0 {
+		st.Generation = 1
+	}
+	return deviceID, st.Generation, randomHex(16)
+}
+
+func randomHex(n int) string {
+	b := make([]byte, n)
+	if _, err := io.ReadFull(rand.Reader, b); err != nil {
+		return fmt.Sprintf("%x", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
+
+func normalizeHashMode(raw string, hasHashes bool) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "auto", "auto_api":
+		return "auto_api"
+	case "auto_js":
+		return "auto_js"
+	case "manual":
+		return "manual"
+	case "":
+		if hasHashes {
+			return "manual"
+		}
+		return "auto_api"
+	default:
+		return "manual"
+	}
+}
+
+func ensureVkToken(stateBlob, profileDir string, s csqttStrings) (string, error) {
+	if tok := strings.TrimSpace(persisted.VKToken); tok != "" {
+		return tok, nil
+	}
+	if tok := restoredVkToken(stateBlob); tok != "" {
+		persisted.VKToken = tok
+		return tok, nil
+	}
+	emitProgress("%s", s.vkLoginProgress)
+	tok, err := requestVkAccessToken(profileDir)
+	if err != nil {
+		return "", err
+	}
+	saveVkToken(tok)
+	return tok, nil
+}
+
+func saveVkToken(token string) {
+	persisted.VKToken = strings.TrimSpace(token)
+	persistState()
+}
+
+func requestVkAccessToken(profileDir string) (string, error) {
+	if profileDir == "" {
+		return "", fmt.Errorf("profileDir not set")
+	}
+	id := fmt.Sprintf("vk-oauth-%d", time.Now().UnixNano())
+	rule, _ := json.Marshal(map[string]any{
+		"type":          "webview",
+		"mode":          "navigation",
+		"url":           vkOAuthURL,
+		"urlPattern":    "blank.html",
+		"param":         "access_token",
+		"urlTimeoutSec": 300,
+	})
+	fmt.Printf("ACTION_REQUIRED|%s|%s\n", id, base64.StdEncoding.EncodeToString(rule))
+	_ = os.Stdout.Sync()
+	res, gaveUp := awaitActionResult(context.Background(), profileDir, id, vkOAuthTimeout)
+	if gaveUp {
+		return "", fmt.Errorf("VK login timed out")
+	}
+	if res == "" || res == "CANCELLED" {
+		return "", fmt.Errorf("VK login cancelled")
+	}
+	if strings.HasPrefix(strings.ToLower(res), "error:") {
+		return "", fmt.Errorf("VK login failed: %s", res)
+	}
+	if dec, err := base64.StdEncoding.DecodeString(res); err == nil && len(strings.TrimSpace(string(dec))) > 0 {
+		res = strings.TrimSpace(string(dec))
+	}
+	res = strings.TrimSpace(res)
+	if res == "" {
+		return "", fmt.Errorf("empty access_token")
+	}
+	return res, nil
 }

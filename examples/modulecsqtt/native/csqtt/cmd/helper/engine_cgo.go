@@ -58,10 +58,12 @@ static void csqtt_stop(void) { if (fn_stop) fn_stop(); }
 import "C"
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"unsafe"
 )
 
@@ -150,6 +152,9 @@ func engineStop() { C.csqtt_stop() }
 
 func findEngineLib(name string, extra ...string) (string, error) {
 	var dirs []string
+	if d := androidModuleDir(); d != "" {
+		dirs = append(dirs, d)
+	}
 	if exe, err := os.Executable(); err == nil {
 		dirs = append(dirs, filepath.Dir(exe))
 	}
@@ -170,4 +175,29 @@ func findEngineLib(name string, extra ...string) (string, error) {
 		return env, nil
 	}
 	return "", fmt.Errorf("%s not found next to helper (searched %v)", name, dirs)
+}
+
+func androidModuleDir() string {
+	if runtime.GOOS != "android" {
+		return ""
+	}
+	f, err := os.Open("/proc/self/maps")
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := sc.Text()
+		idx := strings.Index(line, "libcsqtthelper.so")
+		if idx < 0 {
+			continue
+		}
+		path := strings.TrimSpace(line[strings.LastIndex(line, " ")+1:])
+		if strings.HasSuffix(path, "libcsqtthelper.so") {
+			return filepath.Dir(path)
+		}
+	}
+	return ""
 }

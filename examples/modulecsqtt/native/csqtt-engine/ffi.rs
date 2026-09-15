@@ -22,6 +22,10 @@ struct EngineJson {
     #[serde(default)]
     hashes: String,
     #[serde(default)]
+    vk_hash_mode: String,
+    #[serde(default)]
+    vk_js_token: String,
+    #[serde(default)]
     workers: usize,
     #[serde(default)]
     device_id: String,
@@ -35,6 +39,12 @@ struct EngineJson {
     turn_transport: String,
     #[serde(default)]
     fingerprint: String,
+    #[serde(default)]
+    allow_hash_redistribution: bool,
+    #[serde(default)]
+    generation: u64,
+    #[serde(default)]
+    salt: String,
 }
 
 fn arguments_from_json(raw: &str) -> Result<Arguments, String> {
@@ -42,7 +52,19 @@ fn arguments_from_json(raw: &str) -> Result<Arguments, String> {
     if cfg.peer.trim().is_empty() || cfg.password.trim().is_empty() {
         return Err("peer and password are required".into());
     }
-    if cfg.hashes.trim().is_empty() {
+    let hash_mode = if cfg.vk_hash_mode.trim().is_empty() {
+        if cfg.hashes.trim().is_empty() {
+            "auto_js".into()
+        } else {
+            "manual".into()
+        }
+    } else {
+        cfg.vk_hash_mode.trim().to_ascii_lowercase()
+    };
+    if hash_mode == "auto_js" && cfg.vk_js_token.trim().is_empty() {
+        return Err("auto_js requires vk_js_token".into());
+    }
+    if hash_mode != "auto_js" && cfg.hashes.trim().is_empty() {
         return Err("vk hashes are required".into());
     }
     let workers = if cfg.workers == 0 { 18 } else { cfg.workers };
@@ -51,10 +73,11 @@ fn arguments_from_json(raw: &str) -> Result<Arguments, String> {
         port: String::new(),
         listen: "127.0.0.1:0".into(),
         vk: cfg.hashes,
-        vk_hash_mode: "manual".into(),
+        vk_hash_mode: hash_mode.clone(),
+        vk_js_token: cfg.vk_js_token,
         peer: cfg.peer,
         workers,
-        allow_hash_redistribution: false,
+        allow_hash_redistribution: hash_mode == "auto_js" || cfg.allow_hash_redistribution,
         device_id: if cfg.device_id.is_empty() {
             "antinet".into()
         } else {
@@ -87,8 +110,8 @@ fn arguments_from_json(raw: &str) -> Result<Arguments, String> {
         } else {
             cfg.turn_transport
         },
-        generation: 0,
-        salt: String::new(),
+        generation: cfg.generation,
+        salt: cfg.salt,
         tun_uds: String::new(),
         validate_vk_hashes: false,
     })
