@@ -132,7 +132,7 @@ fn write_cstr(src: &str, buf: *mut c_char, n: i32) -> i32 {
     }
     let Ok(c) = CString::new(src) else {
         return -1;
-    }
+    };
     let bytes = c.as_bytes_with_nul();
     if bytes.len() > n as usize {
         return -1;
@@ -143,14 +143,14 @@ fn write_cstr(src: &str, buf: *mut c_char, n: i32) -> i32 {
     0
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn csqtt_engine_set_protect(cb: Option<protect::ProtectCb>) {
     if let Some(cb) = cb {
         protect::set_protect(cb);
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn csqtt_engine_start(config_json: *const c_char) -> i32 {
     let Ok(raw) = c_str(config_json) else {
         return -1;
@@ -193,7 +193,7 @@ pub extern "C" fn csqtt_engine_start(config_json: *const c_char) -> i32 {
     0
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn csqtt_engine_wait_ready(timeout_ms: i32) -> i32 {
     let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
     let deadline = std::time::Instant::now() + timeout;
@@ -215,24 +215,24 @@ pub extern "C" fn csqtt_engine_wait_ready(timeout_ms: i32) -> i32 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn csqtt_engine_packet_port() -> i32 {
     PACKET_PORT.load(Ordering::Acquire) as i32
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn csqtt_engine_tun_ip(buf: *mut c_char, n: i32) -> i32 {
     let ip = TUN_IP.lock().map(|s| s.clone()).unwrap_or_default();
     write_cstr(&ip, buf, n)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn csqtt_engine_tun_dns(buf: *mut c_char, n: i32) -> i32 {
     let dns = TUN_DNS.lock().map(|s| s.clone()).unwrap_or_default();
     write_cstr(&dns, buf, n)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn csqtt_engine_stop() {
     if let Ok(guard) = ENGINE_CANCEL.lock() {
         if let Some(cancel) = guard.as_ref() {
