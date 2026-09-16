@@ -58,6 +58,46 @@ func TestRewriteHTMLRootRelative(t *testing.T) {
 	}
 }
 
+func TestRewriteHTMLSkipsAlreadyProxiedRootRel(t *testing.T) {
+	p := &vkOAuthProxy{base: "http://127.0.0.1:9"}
+	in := `<a href="/v/oauth.vk.com/authorize">retry</a><link href="/v/oauth.vk.com/css/a.css">`
+	out := p.rewriteHTML(in, "oauth.vk.com")
+	if strings.Contains(out, "/v/oauth.vk.com/v/oauth.vk.com/") {
+		t.Fatalf("nested /v/ rewrite: %s", out)
+	}
+	if !strings.Contains(out, `href="/v/oauth.vk.com/authorize"`) {
+		t.Fatalf("authorize href lost: %s", out)
+	}
+	if !strings.Contains(out, `href="/v/oauth.vk.com/css/a.css"`) {
+		t.Fatalf("css href lost: %s", out)
+	}
+}
+
+func TestUnwrapVkProxyPath(t *testing.T) {
+	host, path, ok := unwrapVkProxyPath("/v/oauth.vk.com/v/oauth.vk.com/v/oauth.vk.com/authorize")
+	if !ok || host != "oauth.vk.com" || path != "/authorize" {
+		t.Fatalf("got host=%q path=%q ok=%v", host, path, ok)
+	}
+	got := canonicalVkProxyRequestURI("/v/oauth.vk.com/v/oauth.vk.com/authorize", "x=1")
+	if got != "/v/oauth.vk.com/authorize?x=1" {
+		t.Fatalf("canonical=%q", got)
+	}
+}
+
+func TestResolveUpstreamLocationAlreadyProxied(t *testing.T) {
+	got := resolveUpstreamLocation("oauth.vk.com", "/v/oauth.vk.com/authorize")
+	if got != "https://oauth.vk.com/authorize" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestVkOAuthProxyInjectJSSkipsProxiedRootRel(t *testing.T) {
+	js := vkOAuthProxyInjectJS("http://127.0.0.1:50999", "http://127.0.0.1:50999/csqtt-vk-oauth-done")
+	if !strings.Contains(js, "u.indexOf(prefix)===0") {
+		t.Fatal("inject JS rootProxy must skip already-proxied /v/ paths")
+	}
+}
+
 func TestResolveUpstreamLocation(t *testing.T) {
 	got := resolveUpstreamLocation("oauth.vk.com", "/blank.html#access_token=abc")
 	if got != "https://oauth.vk.com/blank.html#access_token=abc" {

@@ -129,6 +129,40 @@ func parseVkProxyPath(p string) (host, path string, ok bool) {
 	return normalizeVkProxyHost(host), path, true
 }
 
+// unwrapVkProxyPath peels accidental nesting like
+// /v/oauth.vk.com/v/oauth.vk.com/authorize → oauth.vk.com + /authorize.
+func unwrapVkProxyPath(p string) (host, path string, ok bool) {
+	host, path, ok = parseVkProxyPath(p)
+	if !ok {
+		return "", "", false
+	}
+	for n := 0; n < 64 && strings.HasPrefix(path, vkOAuthProxyPrefix); n++ {
+		h2, p2, ok2 := parseVkProxyPath(path)
+		if !ok2 {
+			break
+		}
+		host, path = h2, p2
+	}
+	return host, path, true
+}
+
+// canonicalVkProxyRequestURI rebuilds /v/<host><path>?<query> after unwrapping nests
+// so cooldown retry links never deepen /v/oauth.vk.com/v/... chains.
+func canonicalVkProxyRequestURI(rawPath, rawQuery string) string {
+	host, path, ok := unwrapVkProxyPath(rawPath)
+	if !ok {
+		if strings.HasPrefix(rawPath, "/") {
+			return rawPath
+		}
+		return vkOAuthStartPath
+	}
+	out := vkOAuthProxyPrefix + host + path
+	if rawQuery != "" {
+		out += "?" + rawQuery
+	}
+	return out
+}
+
 func startVkOAuthProxyServer() (startURLs []string, doneURL string, stop func(), err error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -305,11 +339,18 @@ func (p *vkOAuthProxy) rewriteHTML(body, host string) string {
 			if len(sub) != 5 || strings.HasPrefix(sub[3], "//") {
 				return m
 			}
+			// Already proxied (/v/oauth.vk.com/...) — do not nest.
+			if strings.HasPrefix(sub[3], vkOAuthProxyPrefix) {
+				return m
+			}
 			return sub[1] + sub[2] + prefix + sub[3] + sub[4]
 		})
 		body = reRootRelCSS.ReplaceAllStringFunc(body, func(m string) string {
 			sub := reRootRelCSS.FindStringSubmatch(m)
 			if len(sub) != 5 || strings.HasPrefix(sub[3], "//") {
+				return m
+			}
+			if strings.HasPrefix(sub[3], vkOAuthProxyPrefix) {
 				return m
 			}
 			return sub[1] + sub[2] + prefix + sub[3] + sub[4]
@@ -327,6 +368,12 @@ func resolveUpstreamLocation(host, loc string) string {
 		return "https:" + loc
 	}
 	if strings.HasPrefix(loc, "/") {
+		// Already a proxy path (e.g. /v/oauth.vk.com/authorize) — unwrap instead of nesting.
+		if strings.HasPrefix(loc, vkOAuthProxyPrefix) {
+			if h, p, ok := unwrapVkProxyPath(loc); ok {
+				return "https://" + h + p
+			}
+		}
 		return "https://" + normalizeVkProxyHost(host) + loc
 	}
 	if strings.Contains(loc, "://") {
@@ -450,7 +497,7 @@ func (p *vkOAuthProxy) writeRetryPage(w http.ResponseWriter, title, detail, retr
 }
 
 func (p *vkOAuthProxy) serve(w http.ResponseWriter, r *http.Request) {
-	host, path, ok := parseVkProxyPath(r.URL.Path)
+	host, path, ok := unwrapVkProxyPath(r.URL.Path)
 	if !ok {
 		http.NotFound(w, r)
 		return
@@ -461,7 +508,7 @@ func (p *vkOAuthProxy) serve(w http.ResponseWriter, r *http.Request) {
 		Path:     path,
 		RawQuery: r.URL.RawQuery,
 	}
-	retrySelf := r.URL.RequestURI()
+	retrySelf := canonicalVkProxyRequestURI(r.URL.Path, r.URL.RawQuery)
 	if !strings.HasPrefix(retrySelf, "/") {
 		retrySelf = vkOAuthStartPath
 	}
@@ -616,5 +663,5 @@ func vkOAuthProxyInjectJS(base, doneURL string) string {
 	d, _ := json.Marshal(strings.TrimSpace(doneURL))
 	prefix, _ := json.Marshal(vkOAuthProxyPrefix)
 	marker, _ := json.Marshal(vkOAuthCallbackPath)
-	return `(function(){if(window.__csqttOauthProxy)return;window.__csqttOauthProxy=1;var base=` + string(b) + `;var prefix=` + string(prefix) + `;var done=` + string(d) + `;var marker=` + string(marker) + `;function rootProxy(u){try{if(!u||u.charAt(0)!=='/'||u.charAt(1)==='/')return u;var m=String(location.pathname||'').match(/^\/v\/([^\/]+)/);if(!m)return u;return prefix+m[1]+u;}catch(e){return u;}}function toProxy(u){try{u=String(u||'');if(u.charAt(0)==='/'&&u.charAt(1)!=='/'){var rp=rootProxy(u);if(rp!==u)return rp;}var a=document.createElement('a');a.href=u;var h=String(a.hostname||'').toLowerCase();if(!h||h==='127.0.0.1'||h==='localhost')return String(u);if(!(/(^|\.)vk\.(com|ru)$/.test(h)||/(^|\.)userapi\.com$/.test(h)||h.indexOf('vk-cdn')>=0||h.indexOf('vkuseraudio')>=0||h.indexOf('vkcc.net')>=0))return String(u);h=h.replace(/\.vk\.ru$/i,'.vk.com').replace(/^vk\.ru$/i,'vk.com');return base+prefix+h+(a.pathname||'/')+(a.search||'')+(a.hash||'');}catch(e){return String(u);}}function hoist(){try{var href=String(location.href||'');if(href.indexOf(marker)>=0)return;if(/^https?:/i.test(href)&&href.indexOf('127.0.0.1')<0&&href.indexOf('localhost')<0){var p=toProxy(href);if(p!==href){location.replace(p);return;}}var h=String(location.hash||'');var s=String(location.search||'');if(h.indexOf('payload=')>=0&&/silent_token/.test(h)){location.replace(base+prefix+'oauth.vk.com/authorize?client_id=7793118&scope=1073737727&redirect_uri='+encodeURIComponent('https://oauth.vk.com/blank.html')+'&display=mobile&response_type=token&revoke=1&v=5.199');return;}var q='';if(h.indexOf('access_token=')>=0||h.indexOf('error=')>=0){q=h.replace(/^#/,'');}else if(s.indexOf('access_token=')>=0||s.indexOf('error=')>=0){q=s.replace(/^\?/,'');}else{return;}var sep=done.indexOf('?')>=0?'&':'?';location.replace(done+sep+q);}catch(e){}}function rewriteAttrs(){try{var nodes=document.querySelectorAll('a[href],form[action],link[href],script[src],img[src],iframe[src]');for(var i=0;i<nodes.length;i++){var el=nodes[i];var attr='href';if(el.tagName==='FORM')attr='action';else if(el.tagName==='SCRIPT'||el.tagName==='IMG'||el.tagName==='IFRAME')attr='src';var cur=el.getAttribute(attr);if(!cur)continue;var n=toProxy(cur);if(n!==cur)el.setAttribute(attr,n);}}catch(e){}}document.addEventListener('click',function(e){var t=e.target;while(t&&t.tagName!=='A')t=t.parentNode;if(!t||!t.href)return;var n=toProxy(t.getAttribute('href')||t.href);if(n!==(t.getAttribute('href')||t.href)){e.preventDefault();location.href=n;}},true);document.addEventListener('submit',function(e){try{var f=e.target;if(!f||!f.action)return;var n=toProxy(f.getAttribute('action')||f.action);if(n!==(f.getAttribute('action')||f.action))f.action=n;}catch(err){}},true);hoist();rewriteAttrs();window.addEventListener('hashchange',hoist);setInterval(function(){hoist();rewriteAttrs();},250);})();`
+	return `(function(){if(window.__csqttOauthProxy)return;window.__csqttOauthProxy=1;var base=` + string(b) + `;var prefix=` + string(prefix) + `;var done=` + string(d) + `;var marker=` + string(marker) + `;function rootProxy(u){try{if(!u||u.charAt(0)!=='/'||u.charAt(1)==='/')return u;if(u.indexOf(prefix)===0)return u;var m=String(location.pathname||'').match(/^\/v\/([^\/]+)/);if(!m)return u;return prefix+m[1]+u;}catch(e){return u;}}function toProxy(u){try{u=String(u||'');if(u.charAt(0)==='/'&&u.charAt(1)!=='/'){var rp=rootProxy(u);if(rp!==u)return rp;}var a=document.createElement('a');a.href=u;var h=String(a.hostname||'').toLowerCase();if(!h||h==='127.0.0.1'||h==='localhost')return String(u);if(!(/(^|\.)vk\.(com|ru)$/.test(h)||/(^|\.)userapi\.com$/.test(h)||h.indexOf('vk-cdn')>=0||h.indexOf('vkuseraudio')>=0||h.indexOf('vkcc.net')>=0))return String(u);h=h.replace(/\.vk\.ru$/i,'.vk.com').replace(/^vk\.ru$/i,'vk.com');return base+prefix+h+(a.pathname||'/')+(a.search||'')+(a.hash||'');}catch(e){return String(u);}}function hoist(){try{var href=String(location.href||'');if(href.indexOf(marker)>=0)return;if(/^https?:/i.test(href)&&href.indexOf('127.0.0.1')<0&&href.indexOf('localhost')<0){var p=toProxy(href);if(p!==href){location.replace(p);return;}}var h=String(location.hash||'');var s=String(location.search||'');if(h.indexOf('payload=')>=0&&/silent_token/.test(h)){location.replace(base+prefix+'oauth.vk.com/authorize?client_id=7793118&scope=1073737727&redirect_uri='+encodeURIComponent('https://oauth.vk.com/blank.html')+'&display=mobile&response_type=token&revoke=1&v=5.199');return;}var q='';if(h.indexOf('access_token=')>=0||h.indexOf('error=')>=0){q=h.replace(/^#/,'');}else if(s.indexOf('access_token=')>=0||s.indexOf('error=')>=0){q=s.replace(/^\?/,'');}else{return;}var sep=done.indexOf('?')>=0?'&':'?';location.replace(done+sep+q);}catch(e){}}function rewriteAttrs(){try{var nodes=document.querySelectorAll('a[href],form[action],link[href],script[src],img[src],iframe[src]');for(var i=0;i<nodes.length;i++){var el=nodes[i];var attr='href';if(el.tagName==='FORM')attr='action';else if(el.tagName==='SCRIPT'||el.tagName==='IMG'||el.tagName==='IFRAME')attr='src';var cur=el.getAttribute(attr);if(!cur)continue;var n=toProxy(cur);if(n!==cur)el.setAttribute(attr,n);}}catch(e){}}document.addEventListener('click',function(e){var t=e.target;while(t&&t.tagName!=='A')t=t.parentNode;if(!t||!t.href)return;var n=toProxy(t.getAttribute('href')||t.href);if(n!==(t.getAttribute('href')||t.href)){e.preventDefault();location.href=n;}},true);document.addEventListener('submit',function(e){try{var f=e.target;if(!f||!f.action)return;var n=toProxy(f.getAttribute('action')||f.action);if(n!==(f.getAttribute('action')||f.action))f.action=n;}catch(err){}},true);hoist();rewriteAttrs();window.addEventListener('hashchange',hoist);setInterval(function(){hoist();rewriteAttrs();},250);})();`
 }
