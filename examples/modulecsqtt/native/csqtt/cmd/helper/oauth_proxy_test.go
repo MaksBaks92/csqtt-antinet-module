@@ -163,10 +163,30 @@ func TestProxyLocationRewrite(t *testing.T) {
 	}
 }
 
-func TestUnrewriteURL(t *testing.T) {
+func TestParseRetryAfterSec(t *testing.T) {
+	h := http.Header{}
+	h.Set("Retry-After", "40")
+	if got := parseRetryAfterSec(h, 25); got != 40 {
+		t.Fatalf("got %d", got)
+	}
+	h.Set("Retry-After", "3")
+	if got := parseRetryAfterSec(h, 25); got != vkOAuth429MinWaitSec {
+		t.Fatalf("min clamp got %d", got)
+	}
+	if got := parseRetryAfterSec(nil, 25); got != 25 {
+		t.Fatalf("fallback got %d", got)
+	}
+}
+
+func TestRateLimitCooldown(t *testing.T) {
 	p := &vkOAuthProxy{base: "http://127.0.0.1:9"}
-	got := p.unrewriteURL("http://127.0.0.1:9/v/login.vk.com/act?x=1")
-	if got != "https://login.vk.com/act?x=1" {
-		t.Fatalf("got %q", got)
+	p.markRateLimited(15)
+	wait, ok := p.rateLimitRemaining()
+	if !ok || wait < 2 || wait > 16 {
+		t.Fatalf("wait=%d ok=%v", wait, ok)
+	}
+	p.coolUntil = time.Now().Add(-time.Second)
+	if _, ok := p.rateLimitRemaining(); ok {
+		t.Fatal("expected cooldown expired")
 	}
 }

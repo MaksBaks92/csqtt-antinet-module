@@ -10,7 +10,9 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -58,7 +60,19 @@ var (
 type vkOAuthProxy struct {
 	base   string // http://127.0.0.1:port
 	client *http.Client
+
+	// After VK 429, skip upstream for a while so WebView auto-refresh / dual hops
+	// do not burn the rate limit further.
+	mu          sync.Mutex
+	coolUntil   time.Time
+	coolWaitSec int
 }
+
+const (
+	vkOAuth429DefaultWaitSec = 25
+	vkOAuth429MaxWaitSec     = 90
+	vkOAuth429MinWaitSec     = 12
+)
 
 func isProxiedVkHost(host string) bool {
 	h := strings.ToLower(strings.TrimSpace(host))
@@ -335,6 +349,80 @@ func shouldDropProxiedHeader(name string) bool {
 	}
 }
 
+func parseRetryAfterSec(h http.Header, fallback int) int {
+	wait := fallback
+	if wait < vkOAuth429MinWaitSec {
+		wait = vkOAuth429MinWaitSec
+	}
+	if wait > vkOAuth429MaxWaitSec {
+		wait = vkOAuth429MaxWaitSec
+	}
+	if h == nil {
+		return wait
+	}
+	ra := strings.TrimSpace(h.Get("Retry-After"))
+	if ra == "" {
+		return wait
+	}
+	if sec, err := strconv.Atoi(ra); err == nil && sec > 0 {
+		if sec < vkOAuth429MinWaitSec {
+			sec = vkOAuth429MinWaitSec
+		}
+		if sec > vkOAuth429MaxWaitSec {
+			sec = vkOAuth429MaxWaitSec
+		}
+		return sec
+	}
+	if t, err := http.ParseTime(ra); err == nil {
+		sec := int(time.Until(t).Seconds())
+		if sec < vkOAuth429MinWaitSec {
+			sec = vkOAuth429MinWaitSec
+		}
+		if sec > vkOAuth429MaxWaitSec {
+			sec = vkOAuth429MaxWaitSec
+		}
+		return sec
+	}
+	return wait
+}
+
+func (p *vkOAuthProxy) markRateLimited(waitSec int) {
+	if waitSec < vkOAuth429MinWaitSec {
+		waitSec = vkOAuth429MinWaitSec
+	}
+	if waitSec > vkOAuth429MaxWaitSec {
+		waitSec = vkOAuth429MaxWaitSec
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	until := time.Now().Add(time.Duration(waitSec) * time.Second)
+	if until.After(p.coolUntil) {
+		p.coolUntil = until
+		p.coolWaitSec = waitSec
+	}
+}
+
+func (p *vkOAuthProxy) rateLimitRemaining() (waitSec int, ok bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	left := time.Until(p.coolUntil)
+	if left <= 0 {
+		return 0, false
+	}
+	sec := int(left.Seconds()) + 1
+	if sec < 2 {
+		sec = 2
+	}
+	return sec, true
+}
+
+func (p *vkOAuthProxy) writeRateLimitPage(w http.ResponseWriter, retryURL string, waitSec int) {
+	detail := fmt.Sprintf(
+		"VK вернул 429 (слишком много запросов к oauth). Подождите ~%d с — окно само повторит. Не закрывайте до входа. Если часто срывается: в настройках CSQTT поставьте «Режим хешей → Ручной» и «Режим кредов → Авто» — вход в VK не нужен.",
+		waitSec)
+	p.writeRetryPage(w, "Слишком много запросов к VK", detail, retryURL, waitSec)
+}
+
 func (p *vkOAuthProxy) writeRetryPage(w http.ResponseWriter, title, detail, retryURL string, waitSec int) {
 	if waitSec < 2 {
 		waitSec = 4
@@ -378,6 +466,13 @@ func (p *vkOAuthProxy) serve(w http.ResponseWriter, r *http.Request) {
 		retrySelf = vkOAuthStartPath
 	}
 
+	// Local cooldown after 429: do not hit VK again while WebView refreshes.
+	if wait, cooling := p.rateLimitRemaining(); cooling {
+		emitLog("CSQTT OAuth proxy: cooldown %ds — skip upstream %s %s", wait, r.Method, up.Host+up.Path)
+		p.writeRateLimitPage(w, retrySelf, wait)
+		return
+	}
+
 	var bodyBytes []byte
 	if r.Body != nil && r.Method != http.MethodGet && r.Method != http.MethodHead {
 		bodyBytes, _ = io.ReadAll(io.LimitReader(r.Body, vkOAuthProxyMaxBody))
@@ -387,9 +482,9 @@ func (p *vkOAuthProxy) serve(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	var resp *http.Response
 	var lastErr error
-	got429 := false
-	const maxAttempts = 3
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
+	// Transport errors only — never re-hammer authorize after 429 (makes limit worse).
+	const maxTransportAttempts = 3
+	for attempt := 1; attempt <= maxTransportAttempts; attempt++ {
 		var body io.Reader
 		if len(bodyBytes) > 0 {
 			body = strings.NewReader(string(bodyBytes))
@@ -418,8 +513,18 @@ func (p *vkOAuthProxy) serve(w http.ResponseWriter, r *http.Request) {
 		}
 
 		resp, lastErr = p.client.Do(req)
-		got429 = lastErr == nil && resp != nil && resp.StatusCode == http.StatusTooManyRequests
-		if lastErr == nil && resp != nil && !got429 {
+		if lastErr == nil && resp != nil && resp.StatusCode == http.StatusTooManyRequests {
+			waitSec := parseRetryAfterSec(resp.Header, vkOAuth429DefaultWaitSec)
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+			_ = resp.Body.Close()
+			resp = nil
+			p.markRateLimited(waitSec)
+			emitLog("CSQTT OAuth proxy: 429 %s %s wait=%ds after %s",
+				r.Method, up.Host+up.Path, waitSec, time.Since(started).Round(time.Millisecond))
+			p.writeRateLimitPage(w, retrySelf, waitSec)
+			return
+		}
+		if lastErr == nil && resp != nil {
 			break
 		}
 		status := 0
@@ -430,8 +535,8 @@ func (p *vkOAuthProxy) serve(w http.ResponseWriter, r *http.Request) {
 			resp = nil
 		}
 		emitLog("CSQTT OAuth proxy: attempt %d/%d %s %s status=%d err=%v (%s)",
-			attempt, maxAttempts, r.Method, up.Host+up.Path, status, lastErr, time.Since(started).Round(time.Millisecond))
-		if attempt < maxAttempts {
+			attempt, maxTransportAttempts, r.Method, up.Host+up.Path, status, lastErr, time.Since(started).Round(time.Millisecond))
+		if attempt < maxTransportAttempts {
 			time.Sleep(time.Duration(attempt) * 1600 * time.Millisecond)
 		}
 	}
@@ -446,11 +551,8 @@ func (p *vkOAuthProxy) serve(w http.ResponseWriter, r *http.Request) {
 		p.writeRetryPage(w, title, detail, retrySelf, 5)
 		return
 	}
-	if got429 || resp == nil {
-		emitLog("CSQTT OAuth proxy: 429 %s %s after %s", r.Method, up.Host+up.Path, time.Since(started).Round(time.Millisecond))
-		p.writeRetryPage(w, "Слишком много запросов к VK",
-			"Upstream вернул 429 (rate limit). Подождите и повторите — не закрывайте окно до входа.",
-			retrySelf, 8)
+	if resp == nil {
+		p.writeRetryPage(w, "Пустой ответ VK", "Нет HTTP-ответа от oauth.", retrySelf, 5)
 		return
 	}
 	defer resp.Body.Close()
@@ -485,9 +587,9 @@ func (p *vkOAuthProxy) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	bodyStr := string(raw)
 	if resp.StatusCode == http.StatusOK && (strings.Contains(bodyStr, "429 Too Many Requests") || strings.Contains(strings.ToLower(bodyStr), "kittenx")) {
-		p.writeRetryPage(w, "Слишком много запросов к VK",
-			"Страница rate-limit от промежуточного узла. Подождите и нажмите «Повторить».",
-			retrySelf, 8)
+		waitSec := parseRetryAfterSec(resp.Header, vkOAuth429DefaultWaitSec)
+		p.markRateLimited(waitSec)
+		p.writeRateLimitPage(w, retrySelf, waitSec)
 		return
 	}
 	out := p.rewriteHTML(bodyStr, host)
