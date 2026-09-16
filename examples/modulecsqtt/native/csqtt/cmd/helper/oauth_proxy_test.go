@@ -15,8 +15,8 @@ func TestParseVkProxyPath(t *testing.T) {
 		t.Fatalf("got host=%q path=%q ok=%v", host, path, ok)
 	}
 	host, path, ok = parseVkProxyPath("/v/login.vk.ru/")
-	if !ok || host != "login.vk.com" || path != "/" {
-		t.Fatalf("ru→com host=%q path=%q ok=%v", host, path, ok)
+	if !ok || host != "login.vk.ru" || path != "/" {
+		t.Fatalf("keep .ru host=%q path=%q ok=%v", host, path, ok)
 	}
 	if _, _, ok := parseVkProxyPath("/v/evil.com/x"); ok {
 		t.Fatal("expected reject")
@@ -38,7 +38,7 @@ func TestRewriteHTMLRewritesHosts(t *testing.T) {
 	if !strings.Contains(out, "http://127.0.0.1:9/v/login.vk.com/") {
 		t.Fatalf("login rewrite missing: %s", out)
 	}
-	if !strings.Contains(out, "http://127.0.0.1:9/v/oauth.vk.com/authorize") {
+	if !strings.Contains(out, "http://127.0.0.1:9/v/oauth.vk.ru/authorize") {
 		t.Fatalf("oauth.ru rewrite missing: %s", out)
 	}
 }
@@ -307,7 +307,7 @@ func TestOAuthProxyHopToWebView(t *testing.T) {
 		t.Fatalf("code=%d body=%s hits=%v", rr.Code, rr.Body.String(), hits)
 	}
 	loc := rr.Header().Get("Location")
-	if !strings.Contains(loc, "/v/id.vk.com/auth") || !strings.Contains(loc, "h=1") {
+	if !strings.Contains(loc, "/v/id.vk.ru/auth") || !strings.Contains(loc, "h=1") {
 		t.Fatalf("loc=%q hits=%v", loc, hits)
 	}
 	if len(hits) < 2 {
@@ -315,7 +315,7 @@ func TestOAuthProxyHopToWebView(t *testing.T) {
 	}
 }
 
-func TestOAuthProxyNoHopBounceSameNormalizedURL(t *testing.T) {
+func TestOAuthProxyHopComToRuAuthorize(t *testing.T) {
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Host == "oauth.vk.com" && r.URL.Path == "/authorize" {
 			return &http.Response{
@@ -348,11 +348,13 @@ func TestOAuthProxyNoHopBounceSameNormalizedURL(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9/v/oauth.vk.com/authorize?client_id=1", nil)
 	rr := httptest.NewRecorder()
 	p.serve(rr, req)
-	if rr.Code != http.StatusOK {
+	// Bounce WebView onto the final .ru host so Set-Cookie domain matches document URL.
+	if rr.Code != http.StatusFound {
 		t.Fatalf("code=%d loc=%q body=%s", rr.Code, rr.Header().Get("Location"), rr.Body.String())
 	}
-	if !strings.Contains(rr.Body.String(), "ok") {
-		t.Fatalf("body=%s", rr.Body.String())
+	loc := rr.Header().Get("Location")
+	if !strings.Contains(loc, "/v/oauth.vk.ru/authorize") {
+		t.Fatalf("loc=%q", loc)
 	}
 }
 
@@ -362,5 +364,8 @@ func TestVkOAuthProxyInjectJSHooksNet(t *testing.T) {
 		if !strings.Contains(js, needle) {
 			t.Fatalf("inject missing %q", needle)
 		}
+	}
+	if strings.Contains(js, ".replace(/.vk.ru$/i,'.vk.com')") || strings.Contains(js, "replace(/\\.vk\\.ru$/i,'.vk.com')") {
+		t.Fatal("inject must not force .vk.ru → .vk.com (breaks id.vk.ru cookies)")
 	}
 }
