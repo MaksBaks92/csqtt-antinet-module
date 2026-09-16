@@ -865,7 +865,7 @@ func requestVkAccessToken(profileDir string) (string, error) {
 		return "", fmt.Errorf("VK login cancelled (закройте окно только после входа и редиректа)")
 	}
 	if strings.TrimSpace(res) == "" {
-		return "", fmt.Errorf("VK login empty (AntiNet не передал токен — обновите модуль ≥1.2.15)")
+		return "", fmt.Errorf("VK login empty (AntiNet не передал токен — обновите модуль ≥1.2.16)")
 	}
 	tok, err := parseVkAccessTokenFromCallbackURL(res)
 	if err != nil {

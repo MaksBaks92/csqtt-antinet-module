@@ -34,7 +34,7 @@ func TestRewriteAbsoluteURLPreservesFragment(t *testing.T) {
 func TestRewriteHTMLRewritesHosts(t *testing.T) {
 	p := &vkOAuthProxy{base: "http://127.0.0.1:9"}
 	in := `<a href="https://login.vk.com/">x</a><form action="//oauth.vk.ru/authorize">`
-	out := p.rewriteHTML(in)
+	out := p.rewriteHTML(in, "oauth.vk.com")
 	if !strings.Contains(out, "http://127.0.0.1:9/v/login.vk.com/") {
 		t.Fatalf("login rewrite missing: %s", out)
 	}
@@ -43,9 +43,35 @@ func TestRewriteHTMLRewritesHosts(t *testing.T) {
 	}
 }
 
+func TestRewriteHTMLRootRelative(t *testing.T) {
+	p := &vkOAuthProxy{base: "http://127.0.0.1:9"}
+	in := `<link href="/css/a.css"><form action="/act/login"><a href="//login.vk.com/x">x</a>`
+	out := p.rewriteHTML(in, "login.vk.com")
+	if !strings.Contains(out, `href="/v/login.vk.com/css/a.css"`) {
+		t.Fatalf("root css: %s", out)
+	}
+	if !strings.Contains(out, `action="/v/login.vk.com/act/login"`) {
+		t.Fatalf("root action: %s", out)
+	}
+	if !strings.Contains(out, "http://127.0.0.1:9/v/login.vk.com/x") {
+		t.Fatalf("protocol-relative still absolute-rewritten: %s", out)
+	}
+}
+
+func TestResolveUpstreamLocation(t *testing.T) {
+	got := resolveUpstreamLocation("oauth.vk.com", "/blank.html#access_token=abc")
+	if got != "https://oauth.vk.com/blank.html#access_token=abc" {
+		t.Fatalf("got %q", got)
+	}
+	got = resolveUpstreamLocation("login.vk.ru", "//m.vk.com/")
+	if got != "https://m.vk.com/" {
+		t.Fatalf("got %q", got)
+	}
+}
+
 func TestVkOAuthProxyInjectJS(t *testing.T) {
 	js := vkOAuthProxyInjectJS("http://127.0.0.1:50999", "http://127.0.0.1:50999/csqtt-vk-oauth-done")
-	for _, part := range []string{vkOAuthCallbackPath, vkOAuthProxyPrefix, "access_token=", "127.0.0.1:50999", "toProxy"} {
+	for _, part := range []string{vkOAuthCallbackPath, vkOAuthProxyPrefix, "access_token=", "127.0.0.1:50999", "toProxy", "rootProxy"} {
 		if !strings.Contains(js, part) {
 			t.Fatalf("inject JS missing %q", part)
 		}
@@ -70,27 +96,45 @@ func TestStartVkOAuthProxyServerLocalOnly(t *testing.T) {
 
 	client := &http.Client{
 		Timeout: 3 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 		Transport: &http.Transport{
-			Proxy:           nil,
+			Proxy:             nil,
 			DisableKeepAlives: true,
 		},
 	}
-	for _, u := range []string{done, starts[0]} {
-		res, err := client.Get(u)
-		if err != nil {
-			t.Fatalf("%s: %v", u, err)
-		}
-		body, _ := io.ReadAll(res.Body)
-		_ = res.Body.Close()
-		if res.StatusCode != 200 {
-			t.Fatalf("%s status=%d body=%q", u, res.StatusCode, body)
-		}
-		if u == starts[0] && !strings.Contains(string(body), "/v/oauth.vk.com/authorize") {
-			t.Fatalf("start page missing authorize link: %q", body)
-		}
-		if u == done && !strings.Contains(string(body), "VK") {
-			t.Fatalf("done page: %q", body)
-		}
+	res, err := client.Get(done)
+	if err != nil {
+		t.Fatalf("done: %v", err)
+	}
+	body, _ := io.ReadAll(res.Body)
+	_ = res.Body.Close()
+	if res.StatusCode != 200 || !strings.Contains(string(body), "VK") {
+		t.Fatalf("done status=%d body=%q", res.StatusCode, body)
+	}
+
+	res, err = client.Get(starts[0])
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	_ = res.Body.Close()
+	if res.StatusCode != http.StatusFound {
+		t.Fatalf("start want 302, got %d", res.StatusCode)
+	}
+	loc := res.Header.Get("Location")
+	if !strings.Contains(loc, "/v/oauth.vk.com/authorize") {
+		t.Fatalf("start Location=%q", loc)
+	}
+
+	res, err = client.Get(starts[0] + "?html=1")
+	if err != nil {
+		t.Fatalf("start html: %v", err)
+	}
+	body, _ = io.ReadAll(res.Body)
+	_ = res.Body.Close()
+	if res.StatusCode != 200 || !strings.Contains(string(body), "/v/oauth.vk.com/authorize") {
+		t.Fatalf("start html status=%d body=%q", res.StatusCode, body)
 	}
 }
 
