@@ -35,6 +35,7 @@ const (
 	linkHostConnect = "connect"
 	defaultDialSec  = 20
 	readyWaitBudget = 90 * time.Second
+	maxVkHashes     = 6
 	vkOAuthTimeout  = 5 * time.Minute
 	vkOAuthURL      = "https://oauth.vk.ru/authorize?client_id=7793118&scope=1073737727&redirect_uri=https%3A%2F%2Foauth.vk.ru%2Fblank.html&display=mobile&response_type=token&revoke=1&v=5.199"
 	vkOAuthURLCom   = "https://oauth.vk.com/authorize?client_id=7793118&scope=1073737727&redirect_uri=https%3A%2F%2Foauth.vk.ru%2Fblank.html&display=mobile&response_type=token&revoke=1&v=5.199"
@@ -59,8 +60,6 @@ type csqttStrings struct {
 	openingEngine        string
 	vkLoginProgress      string
 	vkLoginFailedFmt     string
-	vkLoginFallbackFmt   string
-	vkUsingLinkHashes    string
 	vkAutoAPIProgress    string
 	vkAutoAPIFailedFmt   string
 	handoverLog          string
@@ -68,7 +67,7 @@ type csqttStrings struct {
 
 var csqttStringsRU = csqttStrings{
 	badLinkFmt:           "CSQTT: неверная ссылка: %v",
-	missingHashes:        "CSQTT: в ссылке нет hashes=, укажите VK-хеши в настройках или включите авто-режим",
+	missingHashes:        "CSQTT: в режиме «Ручной» укажите до 6 VK-хешей",
 	engineLoadFailedFmt:  "CSQTT: не удалось загрузить движок: %v",
 	engineStartFailedFmt: "CSQTT: движок не стартовал: %v",
 	engineNotReadyFmt:    "CSQTT: туннель не поднялся за %s",
@@ -81,8 +80,6 @@ var csqttStringsRU = csqttStrings{
 	openingEngine:        "CSQTT: поднимаю TURN-туннель",
 	vkLoginProgress:      "CSQTT: войдите в VK и подтвердите доступ; окно закроется само",
 	vkLoginFailedFmt:     "CSQTT: не удалось получить VK-токен: %v",
-	vkLoginFallbackFmt:   "CSQTT: вход в VK не удался (%v), беру хеши из ссылки/настроек",
-	vkUsingLinkHashes:    "CSQTT: в ссылке уже есть хеши — вход в VK пропускаю",
 	vkAutoAPIProgress:    "CSQTT: создаю звонки VK через API",
 	vkAutoAPIFailedFmt:   "CSQTT: не удалось создать звонки VK: %v",
 	handoverLog:          "хендовер: сменилась сеть — TURN-воркеры переподключатся сами",
@@ -90,7 +87,7 @@ var csqttStringsRU = csqttStrings{
 
 var csqttStringsEN = csqttStrings{
 	badLinkFmt:           "CSQTT: bad link: %v",
-	missingHashes:        "CSQTT: link has no hashes=; set VK hashes in settings or enable auto mode",
+	missingHashes:        "CSQTT: in Manual mode set up to 6 VK hashes",
 	engineLoadFailedFmt:  "CSQTT: failed to load engine: %v",
 	engineStartFailedFmt: "CSQTT: engine failed to start: %v",
 	engineNotReadyFmt:    "CSQTT: tunnel did not come up within %s",
@@ -103,8 +100,6 @@ var csqttStringsEN = csqttStrings{
 	openingEngine:        "CSQTT: starting TURN tunnel",
 	vkLoginProgress:      "CSQTT: sign in to VK and allow access; the window closes itself",
 	vkLoginFailedFmt:     "CSQTT: failed to get VK token: %v",
-	vkLoginFallbackFmt:   "CSQTT: VK login failed (%v), using hashes from link/settings",
-	vkUsingLinkHashes:    "CSQTT: link already has hashes, skipping VK login",
 	vkAutoAPIProgress:    "CSQTT: creating VK calls via API",
 	vkAutoAPIFailedFmt:   "CSQTT: failed to create VK calls: %v",
 	handoverLog:          "handover: network changed, TURN workers will reconnect",
@@ -218,9 +213,65 @@ func splitHashes(raw string) []string {
 	for _, p := range strings.FieldsFunc(raw, func(r rune) bool {
 		return r == '+' || r == ',' || r == ' ' || r == '\t' || r == '\n'
 	}) {
-		p = strings.TrimSpace(p)
+		p = stripVkCallURL(p)
 		if p != "" {
 			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func stripVkCallURL(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	lower := strings.ToLower(s)
+	prefixes := []string{
+		"https://vk.com/call/join/",
+		"http://vk.com/call/join/",
+		"https://m.vk.com/call/join/",
+		"http://m.vk.com/call/join/",
+		"m.vk.com/call/join/",
+		"vk.com/call/join/",
+		"https://vk.ru/call/join/",
+		"http://vk.ru/call/join/",
+		"https://m.vk.ru/call/join/",
+		"http://m.vk.ru/call/join/",
+		"m.vk.ru/call/join/",
+		"vk.ru/call/join/",
+	}
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(lower, prefix) {
+			s = s[len(prefix):]
+			break
+		}
+	}
+	if i := strings.IndexAny(s, "?#"); i >= 0 {
+		s = s[:i]
+	}
+	return strings.Trim(strings.TrimSpace(s), "/")
+}
+
+// Manual hashes only. Auto API / Auto VK create their own and ignore these.
+func collectManualHashes(cfg map[string]string, linkHashes []string) []string {
+	raw := append([]string{}, linkHashes...)
+	for i := 1; i <= maxVkHashes; i++ {
+		raw = append(raw, cfg[fmt.Sprintf("SETTING_vkHash%d", i)])
+	}
+	raw = append(raw, cfg["SETTING_vkHashes"])
+	seen := make(map[string]struct{}, maxVkHashes)
+	out := make([]string, 0, maxVkHashes)
+	for _, chunk := range raw {
+		for _, h := range splitHashes(chunk) {
+			if _, ok := seen[h]; ok {
+				continue
+			}
+			seen[h] = struct{}{}
+			out = append(out, h)
+			if len(out) >= maxVkHashes {
+				return out
+			}
 		}
 	}
 	return out
@@ -326,35 +377,22 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 		emitStatus(statusFatal, "bad link")
 		log.Fatalf("parse LINK: %v", err)
 	}
-	hashes := link.Hashes
-	if len(hashes) == 0 {
-		hashes = splitHashes(cfg["SETTING_vkHashes"])
-	}
 	workers, _ := strconv.Atoi(strings.TrimSpace(cfg["SETTING_workers"]))
 	if workers <= 0 {
 		workers = 18
 	}
-	hashMode := normalizeHashMode(cfg["SETTING_hashMode"], len(hashes) > 0)
+	hashMode := normalizeHashMode(cfg["SETTING_hashMode"])
 	vkToken := ""
 	allowRedistrib := false
-	if len(hashes) > 0 && (hashMode == "auto_api" || hashMode == "auto_js") {
-		emitLog(s.vkUsingLinkHashes)
-		hashMode = "manual"
-	}
+	var hashes []string
 	if hashMode == "auto_api" || hashMode == "auto_js" {
 		tok, terr := ensureVkToken(cfg["MODULE_STATE"], profileDir, s)
 		if terr != nil {
-			if len(hashes) > 0 {
-				emitLog(s.vkLoginFallbackFmt, terr)
-				hashMode = "manual"
-			} else {
-				emitLog(s.vkLoginFailedFmt, terr)
-				emitStatus(statusFatal, "vk login failed")
-				log.Fatalf("vk token: %v", terr)
-			}
-		} else {
-			vkToken = tok
+			emitLog(s.vkLoginFailedFmt, terr)
+			emitStatus(statusFatal, "vk login failed")
+			log.Fatalf("vk token: %v", terr)
 		}
+		vkToken = tok
 	}
 	switch hashMode {
 	case "auto_api":
@@ -365,11 +403,6 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 			emitProgress("%s", s.vkLoginProgress)
 			fresh, ferr := requestVkAccessToken(profileDir)
 			if ferr != nil {
-				if len(hashes) > 0 {
-					emitLog(s.vkLoginFallbackFmt, ferr)
-					hashMode = "manual"
-					break
-				}
 				emitLog(s.vkLoginFailedFmt, ferr)
 				emitStatus(statusFatal, "vk login failed")
 				log.Fatalf("vk token: %v", ferr)
@@ -378,17 +411,9 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 			saveVkToken(vkToken)
 			started, aerr = startVkAutoCalls(vkToken, workers)
 		}
-		if hashMode != "auto_api" {
-			break
-		}
 		if aerr != nil || len(started.Hashes) == 0 {
 			if aerr == nil {
 				aerr = fmt.Errorf("empty hash list")
-			}
-			if len(hashes) > 0 {
-				emitLog(s.vkLoginFallbackFmt, aerr)
-				hashMode = "manual"
-				break
 			}
 			emitLog(s.vkAutoAPIFailedFmt, aerr)
 			emitStatus(statusFatal, "vk auto api failed")
@@ -400,6 +425,7 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	case "auto_js":
 		// токен уже в vkToken — rust создаёт звонок сам
 	default:
+		hashes = collectManualHashes(cfg, link.Hashes)
 		if len(hashes) == 0 {
 			emitLog(s.missingHashes)
 			emitStatus(statusFatal, "missing vk hashes")
@@ -409,7 +435,13 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 
 	dialTimeout := settingDuration(cfg, "SETTING_dialTimeoutSec", defaultDialSec)
 	obfs := strings.TrimSpace(cfg["SETTING_obfs"])
-	turnTransport := strings.TrimSpace(cfg["SETTING_turnTransport"])
+	turnTransport := strings.ToLower(strings.TrimSpace(cfg["SETTING_turnTransport"]))
+	switch turnTransport {
+	case "tcp", "tcp_tls", "tcp-tls", "tcp/tls":
+		turnTransport = "tcp_tls"
+	default:
+		turnTransport = "udp"
+	}
 
 	resolver := newProtectedResolver(cfg["DNS_SERVERS"], protectPath)
 	proxyURL, stopProxy, perr := startProtectHTTPProxy(protectPath, resolver)
@@ -722,19 +754,12 @@ func randomHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
-func normalizeHashMode(raw string, hasHashes bool) string {
+func normalizeHashMode(raw string) string {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "auto", "auto_api":
 		return "auto_api"
 	case "auto_js":
 		return "auto_js"
-	case "manual":
-		return "manual"
-	case "":
-		if hasHashes {
-			return "manual"
-		}
-		return "auto_api"
 	default:
 		return "manual"
 	}

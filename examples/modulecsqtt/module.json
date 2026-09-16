@@ -5,9 +5,9 @@
   ],
   "name": "CSQTT",
   "description": "L3-туннель CSQTT (TURN/RTP поверх VK Calls): SOCKS5 → gVisor → rust-движок. Хеши VK: Авто API (calls.start, 1–6 звонков), Авто ВК (один звонок в rust) или вручную. Вход в VK — webview AntiNet.",
-  "homepage": "https://github.com/amurcanov/csqtt",
+  "homepage": "https://github.com/MaxPain99/csqtt-antinet-module",
   "updateUrl": "https://raw.githubusercontent.com/MaxPain99/csqtt-antinet-module/main/antinet-module.json",
-  "version": "1.2.5",
+  "version": "1.2.6",
   "license": "PolyForm-Noncommercial-1.0.0",
   "handoverMode": "signal",
   "hostEvents": ["handover", "netlost", "netback", "stall"],
@@ -38,35 +38,84 @@
     {
       "key": "hashMode",
       "type": "enum",
-      "label": "VK-хеши",
+      "label": "Режим хешей",
       "default": "manual",
-      "description": "Авто API — как в клиенте CSQTT: helper создаёт 1–6 звонков через calls.start и закрывает их при отключении. Авто ВК — rust создаёт один звонок (vchat.startConversation). В обоих нужен вход в VK (webview AntiNet); cookie остаются в хранилище AntiNet. Ручной — хеши из ссылки или поля ниже.",
+      "description": "Ручной — свои хеши (до 6). Авто API — helper создаёт 1–6 звонков через calls.start и закрывает их при отключении. Авто ВК — rust создаёт один звонок. Авто-режимы не берут ручные хеши; нужен вход в VK.",
       "options": [
-        { "value": "auto_api", "label": "Авто API (calls.start, 1–6 звонков)" },
-        { "value": "auto_js", "label": "Авто ВК (один звонок в rust)" },
-        { "value": "manual", "label": "Ручной (хеши из ссылки / поля)" }
+        { "value": "manual", "label": "Ручной" },
+        { "value": "auto_api", "label": "Авто API" },
+        { "value": "auto_js", "label": "Авто ВК" }
       ]
     },
     {
-      "key": "vkHashes",
+      "key": "vkHash1",
       "type": "string",
-      "label": "VK-хеши (ручной режим)",
+      "label": "VK-хеш 1",
       "default": "",
-      "description": "Список хешей через запятую. Нужен только если режим «Ручной» и в ссылке нет hashes=."
+      "description": "Ссылка звонка или хеш. Только ручной режим.",
+      "visibleWhen": { "key": "hashMode", "equals": "manual" }
+    },
+    {
+      "key": "vkHash2",
+      "type": "string",
+      "label": "VK-хеш 2",
+      "default": "",
+      "description": "Необязательно. Только ручной режим.",
+      "visibleWhen": { "key": "hashMode", "equals": "manual" }
+    },
+    {
+      "key": "vkHash3",
+      "type": "string",
+      "label": "VK-хеш 3",
+      "default": "",
+      "description": "Необязательно. Только ручной режим.",
+      "visibleWhen": { "key": "hashMode", "equals": "manual" }
+    },
+    {
+      "key": "vkHash4",
+      "type": "string",
+      "label": "VK-хеш 4",
+      "default": "",
+      "description": "Необязательно. Только ручной режим.",
+      "visibleWhen": { "key": "hashMode", "equals": "manual" }
+    },
+    {
+      "key": "vkHash5",
+      "type": "string",
+      "label": "VK-хеш 5",
+      "default": "",
+      "description": "Необязательно. Только ручной режим.",
+      "visibleWhen": { "key": "hashMode", "equals": "manual" }
+    },
+    {
+      "key": "vkHash6",
+      "type": "string",
+      "label": "VK-хеш 6",
+      "default": "",
+      "description": "Необязательно. Только ручной режим.",
+      "visibleWhen": { "key": "hashMode", "equals": "manual" }
     },
     {
       "key": "obfs",
-      "type": "string",
+      "type": "enum",
       "label": "Обфускация RTP",
       "default": "video",
-      "description": "video или audio — как маскировать туннель под медиапоток VK Calls."
+      "description": "Как маскировать туннель под медиапоток VK Calls.",
+      "options": [
+        { "value": "video", "label": "Video" },
+        { "value": "audio", "label": "Audio" }
+      ]
     },
     {
       "key": "turnTransport",
-      "type": "string",
+      "type": "enum",
       "label": "Транспорт TURN",
       "default": "udp",
-      "description": "udp или tcp."
+      "description": "UDP — обычный путь до VK TURN. TCP — только если оператор режет UDP (участок до TURN; дальше всегда UDP).",
+      "options": [
+        { "value": "udp", "label": "UDP" },
+        { "value": "tcp_tls", "label": "TCP" }
+      ]
     },
     {
       "key": "debugLog",
