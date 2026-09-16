@@ -262,3 +262,105 @@ func TestRateLimitCooldown(t *testing.T) {
 		t.Fatal("expected cooldown expired")
 	}
 }
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestOAuthProxyHopToWebView(t *testing.T) {
+	var hits []string
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		hits = append(hits, r.URL.Host+r.URL.Path)
+		switch {
+		case r.URL.Host == "oauth.vk.com" && r.URL.Path == "/authorize":
+			return &http.Response{
+				StatusCode: http.StatusFound,
+				Header:     http.Header{"Location": []string{"https://id.vk.ru/auth?h=1"}},
+				Body:       io.NopCloser(strings.NewReader("")),
+				Request:    r,
+			}, nil
+		case r.URL.Host == "id.vk.ru" && r.URL.Path == "/auth":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
+				Body:       io.NopCloser(strings.NewReader("<html><body>login</body></html>")),
+				Request:    r,
+			}, nil
+		default:
+			t.Fatalf("unexpected upstream %s", r.URL.String())
+			return nil, nil
+		}
+	})
+	p := &vkOAuthProxy{
+		base: "http://127.0.0.1:9",
+		client: &http.Client{
+			Transport: rt,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9/v/oauth.vk.com/authorize?client_id=1", nil)
+	rr := httptest.NewRecorder()
+	p.serve(rr, req)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("code=%d body=%s hits=%v", rr.Code, rr.Body.String(), hits)
+	}
+	loc := rr.Header().Get("Location")
+	if !strings.Contains(loc, "/v/id.vk.com/auth") || !strings.Contains(loc, "h=1") {
+		t.Fatalf("loc=%q hits=%v", loc, hits)
+	}
+	if len(hits) < 2 {
+		t.Fatalf("expected follow, hits=%v", hits)
+	}
+}
+
+func TestOAuthProxyNoHopBounceSameNormalizedURL(t *testing.T) {
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Host == "oauth.vk.com" && r.URL.Path == "/authorize" {
+			return &http.Response{
+				StatusCode: http.StatusMovedPermanently,
+				Header:     http.Header{"Location": []string{"https://oauth.vk.ru/authorize?client_id=1"}},
+				Body:       io.NopCloser(strings.NewReader("")),
+				Request:    r,
+			}, nil
+		}
+		if r.URL.Host == "oauth.vk.ru" && r.URL.Path == "/authorize" {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
+				Body:       io.NopCloser(strings.NewReader("<html><body>ok</body></html>")),
+				Request:    r,
+			}, nil
+		}
+		t.Fatalf("unexpected %s", r.URL.String())
+		return nil, nil
+	})
+	p := &vkOAuthProxy{
+		base: "http://127.0.0.1:9",
+		client: &http.Client{
+			Transport: rt,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9/v/oauth.vk.com/authorize?client_id=1", nil)
+	rr := httptest.NewRecorder()
+	p.serve(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("code=%d loc=%q body=%s", rr.Code, rr.Header().Get("Location"), rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "ok") {
+		t.Fatalf("body=%s", rr.Body.String())
+	}
+}
+
+func TestVkOAuthProxyInjectJSHooksNet(t *testing.T) {
+	js := vkOAuthProxyInjectJS("http://127.0.0.1:9", "http://127.0.0.1:9/csqtt-vk-oauth-done")
+	for _, needle := range []string{"hookNet", "window.fetch", "XMLHttpRequest.prototype.open", "toProxy"} {
+		if !strings.Contains(js, needle) {
+			t.Fatalf("inject missing %q", needle)
+		}
+	}
+}
