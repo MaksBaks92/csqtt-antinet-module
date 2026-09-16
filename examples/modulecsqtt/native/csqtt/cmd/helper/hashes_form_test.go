@@ -11,6 +11,10 @@ func TestParseHashFormResult(t *testing.T) {
 	if len(fromURL) != 2 || fromURL[0] != "one" || fromURL[1] != "two" {
 		t.Fatalf("url got %#v", fromURL)
 	}
+	fromQuery := parseHashFormResult("https://oauth.vk.ru/blank.html?csqtt_hashes=1&hashes=one+two")
+	if len(fromQuery) != 2 || fromQuery[0] != "one" || fromQuery[1] != "two" {
+		t.Fatalf("query got %#v", fromQuery)
+	}
 	if parseHashFormResult("") != nil && len(parseHashFormResult("")) != 0 {
 		t.Fatal("empty should be empty")
 	}

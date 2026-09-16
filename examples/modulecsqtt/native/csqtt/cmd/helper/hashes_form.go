@@ -17,7 +17,10 @@ import (
 	"time"
 )
 
-const hashFormDoneURL = "https://oauth.vk.ru/blank.html"
+const (
+	hashFormDoneURL    = "https://oauth.vk.ru/blank.html"
+	hashFormDoneMarker = "csqtt_hashes=1"
+)
 
 func promptManualHashes(profileDir string, prefill []string, s csqttStrings) ([]string, error) {
 	if profileDir == "" {
@@ -32,7 +35,7 @@ func promptManualHashes(profileDir string, prefill []string, s csqttStrings) ([]
 		"type":          "webview",
 		"mode":          "navigation",
 		"url":           "https://m.vk.ru/",
-		"urlPattern":    "blank.html",
+		"urlPattern":    hashFormDoneMarker,
 		"param":         "hashes",
 		"urlTimeoutSec": int(vkOAuthTimeout / time.Second),
 		"injectJs":      hashFormInjectJS(prefill, s),
@@ -95,7 +98,7 @@ function paint(){
         var t=el&&el.value?String(el.value).replace(/^\s+|\s+$/g,''):'';
         if(t) hs.push(t);
       }
-      location.replace(p.done+'#hashes='+encodeURIComponent(hs.join(' ')));
+      location.replace(p.done+'?csqtt_hashes=1&hashes='+encodeURIComponent(hs.join(' ')));
     };
   }catch(e){}
 }
@@ -131,17 +134,26 @@ func extractHashesParam(raw string) string {
 	if s == "" || s == "<nil>" {
 		return ""
 	}
-	if i := strings.Index(s, "hashes="); i >= 0 {
-		rest := s[i+len("hashes="):]
-		if j := strings.IndexAny(rest, "&?#"); j >= 0 {
-			rest = rest[:j]
+	rest := ""
+	for _, sep := range []string{"?hashes=", "&hashes=", "#hashes="} {
+		if i := strings.Index(s, sep); i >= 0 {
+			rest = s[i+len(sep):]
+			break
 		}
-		if u, err := url.QueryUnescape(rest); err == nil && strings.TrimSpace(u) != "" {
-			rest = u
-		}
-		return strings.TrimSpace(rest)
 	}
-	return ""
+	if rest == "" && strings.HasPrefix(s, "hashes=") {
+		rest = s[len("hashes="):]
+	}
+	if rest == "" {
+		return ""
+	}
+	if j := strings.IndexAny(rest, "&?#"); j >= 0 {
+		rest = rest[:j]
+	}
+	if u, err := url.QueryUnescape(rest); err == nil && strings.TrimSpace(u) != "" {
+		rest = u
+	}
+	return strings.TrimSpace(rest)
 }
 
 func uniqHashes(raw []string) []string {

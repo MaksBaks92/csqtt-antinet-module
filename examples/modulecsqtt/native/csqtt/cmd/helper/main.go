@@ -37,11 +37,13 @@ const (
 	readyWaitBudget = 90 * time.Second
 	maxVkHashes     = 4
 	vkOAuthTimeout  = 5 * time.Minute
-	vkOAuthURLHop   = 45 * time.Second
-	// VK отдаёт implicit-токен в location.hash. Android WebView часто не включает fragment
-	// в URL колбэка хоста — param=access_token тогда пустой, юзер видит blank.html и закрывает
-	// окно → CANCELLED. JS читает hash и переписывает его в query, который хост уже умеет.
-	vkOAuthHoistJS = `(function(){if(window.__csqttOauthHoist)return;window.__csqttOauthHoist=1;function hoist(){try{var h=String(location.hash||'');if(h.indexOf('access_token=')<0)return;var q=h.replace(/^#/,'');if(String(location.search||'').indexOf('access_token=')>=0)return;location.replace(location.protocol+'//'+location.host+location.pathname+'?'+q);}catch(e){}}hoist();setInterval(hoist,250);})();`
+	vkOAuthURLHop   = 90 * time.Second
+	// Хост ловит urlPattern как только URL содержит подстроку. VK редиректит на
+	// blank.html#access_token=… — fragment Android WebView хосту не отдаёт, param пустой,
+	// окно закрывается → CANCELLED (~30с после логина, ~3с если cookies уже есть).
+	// JS переписывает hash в query И добавляет маркер csqtt_ok=1; urlPattern — этот маркер,
+	// не blank.html. silent_token (payload=) — повтор authorize, как в клиенте CSQTT.
+	vkOAuthDoneMarker = "csqtt_ok=1"
 )
 
 type csqttStrings struct {
@@ -68,6 +70,7 @@ type csqttStrings struct {
 	hashFormCancelled    string
 	hashFormOk           string
 	hashFormProgress     string
+	deviceBoundFmt       string
 }
 
 var csqttStringsRU = csqttStrings{
@@ -94,6 +97,7 @@ var csqttStringsRU = csqttStrings{
 	hashFormCancelled:    "CSQTT: ввод хешей отменён",
 	hashFormOk:           "Подключить",
 	hashFormProgress:     "CSQTT: укажите до 4 VK-хешей",
+	deviceBoundFmt:       "CSQTT: GETCONF device_id=%s (%s). Если FATAL_AUTH «пароль привязан к другому устройству» — «Отвязать» в панели сервера CSQTT или вставьте Device ID из лога приложения CSQTT в настройку модуля",
 }
 
 var csqttStringsEN = csqttStrings{
@@ -120,6 +124,7 @@ var csqttStringsEN = csqttStrings{
 	hashFormCancelled:    "CSQTT: hash entry cancelled",
 	hashFormOk:           "Connect",
 	hashFormProgress:     "CSQTT: enter up to 4 VK hashes",
+	deviceBoundFmt:       "CSQTT: GETCONF device_id=%s (%s). If FATAL_AUTH says the password is bound to another device — Unbind it in the CSQTT server panel, or paste the CSQTT app Device ID into module settings",
 }
 
 func csqttStringsFor(lang string) csqttStrings {
@@ -383,6 +388,7 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	persisted = restoreSavedState(cfg["MODULE_STATE"])
 	deviceID, generation, sessionSalt := nextEngineIdentity(cfg, &persisted)
 	persistState()
+	emitLog(s.deviceBoundFmt, deviceID, persistedDeviceSource(cfg, deviceID))
 	port, _ := strconv.Atoi(cfg["LISTEN_PORT"])
 	user := cfg["SOCKS_USER"]
 	pass := cfg["SOCKS_PASS"]
@@ -758,7 +764,10 @@ func persistState() {
 }
 
 func nextEngineIdentity(cfg map[string]string, st *savedState) (deviceID string, generation uint64, salt string) {
-	deviceID = strings.TrimSpace(cfg["DEVICE_ID"])
+	deviceID = strings.TrimSpace(cfg["SETTING_deviceId"])
+	if deviceID == "" {
+		deviceID = strings.TrimSpace(cfg["DEVICE_ID"])
+	}
 	if deviceID == "" {
 		deviceID = strings.TrimSpace(st.DeviceID)
 	}
@@ -776,6 +785,16 @@ func nextEngineIdentity(cfg map[string]string, st *savedState) (deviceID string,
 		st.Generation = 1
 	}
 	return deviceID, st.Generation, randomHex(16)
+}
+
+func persistedDeviceSource(cfg map[string]string, deviceID string) string {
+	if strings.TrimSpace(cfg["SETTING_deviceId"]) == deviceID {
+		return "setting"
+	}
+	if strings.TrimSpace(cfg["DEVICE_ID"]) == deviceID {
+		return "antinet"
+	}
+	return "saved"
 }
 
 func randomHex(n int) string {
@@ -826,7 +845,7 @@ func vkOAuthAuthorizeURL(host, display string) string {
 }
 
 func vkOAuthURLList() []string {
-	// qWDTT rotates URLs every ~45s. oauth.vk.ru often fails DNS in AntiNet WebView
+	// qWDTT rotates URLs every hop. oauth.vk.ru often fails DNS in AntiNet WebView
 	// (ERR_NAME_NOT_RESOLVED); .com must redirect to .com/blank.html, not .ru.
 	return []string{
 		vkOAuthAuthorizeURL("oauth.vk.com", "mobile"),
@@ -834,6 +853,11 @@ func vkOAuthURLList() []string {
 		vkOAuthAuthorizeURL("oauth.vk.com", "page"),
 		vkOAuthAuthorizeURL("oauth.vk.ru", "page"),
 	}
+}
+
+func vkOAuthHoistJS() string {
+	oauth, _ := json.Marshal(vkOAuthAuthorizeURL("oauth.vk.com", "mobile"))
+	return `(function(){if(window.__csqttOauthHoist)return;window.__csqttOauthHoist=1;var oauth=` + string(oauth) + `;function hoist(){try{var h=String(location.hash||'');var s=String(location.search||'');if(s.indexOf('csqtt_ok=1')>=0)return;if(h.indexOf('payload=')>=0&&/silent_token/.test(h)){location.replace(oauth);return;}if(s.indexOf('access_token=')>=0){location.replace(location.protocol+'//'+location.host+'/blank.html?csqtt_ok=1&'+s.replace(/^\?/,''));return;}if(h.indexOf('access_token=')<0&&h.indexOf('error=')<0)return;location.replace(location.protocol+'//'+location.host+'/blank.html?csqtt_ok=1&'+h.replace(/^#/,''));}catch(e){}}hoist();setInterval(hoist,250);})();`
 }
 
 func requestVkAccessToken(profileDir string) (string, error) {
@@ -845,10 +869,10 @@ func requestVkAccessToken(profileDir string) (string, error) {
 		"type":          "webview",
 		"mode":          "navigation",
 		"url":           vkOAuthURLList(),
-		"urlPattern":    "blank.html",
+		"urlPattern":    vkOAuthDoneMarker,
 		"param":         "access_token",
 		"urlTimeoutSec": int(vkOAuthURLHop / time.Second),
-		"injectJs":      vkOAuthHoistJS,
+		"injectJs":      vkOAuthHoistJS(),
 	})
 	if cancelled {
 		return "", fmt.Errorf("VK login cancelled")
