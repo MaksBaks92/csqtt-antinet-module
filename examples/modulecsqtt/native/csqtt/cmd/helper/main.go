@@ -63,6 +63,10 @@ type csqttStrings struct {
 	vkAutoAPIProgress    string
 	vkAutoAPIFailedFmt   string
 	handoverLog          string
+	hashFormTitle        string
+	hashFormHint         string
+	hashFormLabelFmt     string
+	hashFormCancelled    string
 }
 
 var csqttStringsRU = csqttStrings{
@@ -83,6 +87,10 @@ var csqttStringsRU = csqttStrings{
 	vkAutoAPIProgress:    "CSQTT: создаю звонки VK через API",
 	vkAutoAPIFailedFmt:   "CSQTT: не удалось создать звонки VK: %v",
 	handoverLog:          "хендовер: сменилась сеть — TURN-воркеры переподключатся сами",
+	hashFormTitle:        "VK-хеши",
+	hashFormHint:         "До 6 хешей. Можно вставить ссылку звонка. Только для режима «Ручной».",
+	hashFormLabelFmt:     "VK-хеш %d",
+	hashFormCancelled:    "CSQTT: ввод хешей отменён",
 }
 
 var csqttStringsEN = csqttStrings{
@@ -103,6 +111,10 @@ var csqttStringsEN = csqttStrings{
 	vkAutoAPIProgress:    "CSQTT: creating VK calls via API",
 	vkAutoAPIFailedFmt:   "CSQTT: failed to create VK calls: %v",
 	handoverLog:          "handover: network changed, TURN workers will reconnect",
+	hashFormTitle:        "VK hashes",
+	hashFormHint:         "Up to 6 hashes. A call link is fine. Manual mode only.",
+	hashFormLabelFmt:     "VK hash %d",
+	hashFormCancelled:    "CSQTT: hash entry cancelled",
 }
 
 func csqttStringsFor(lang string) csqttStrings {
@@ -347,7 +359,8 @@ func canPingCSQTT(arg string) string {
 	if l, err := parseCsqttLink(link); err == nil && len(l.Hashes) > 0 {
 		return "ok"
 	}
-	if restoreSavedState(blob).VKToken != "" {
+	st := restoreSavedState(blob)
+	if len(st.ManualHashes) > 0 || st.VKToken != "" {
 		return "ok"
 	}
 	return "no"
@@ -425,12 +438,21 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	case "auto_js":
 		// токен уже в vkToken — rust создаёт звонок сам
 	default:
-		hashes = collectManualHashes(cfg, link.Hashes)
+		hashes = uniqHashes(append(collectManualHashes(cfg, link.Hashes), persisted.ManualHashes...))
+		filled, herr := promptManualHashes(profileDir, hashes, s)
+		if herr != nil {
+			emitLog("%s", herr)
+			emitStatus(statusFatal, "missing vk hashes")
+			log.Fatalf("vk hashes: %v", herr)
+		}
+		hashes = filled
 		if len(hashes) == 0 {
 			emitLog(s.missingHashes)
 			emitStatus(statusFatal, "missing vk hashes")
 			log.Fatalf("missing vk hashes")
 		}
+		persisted.ManualHashes = hashes
+		persistState()
 	}
 
 	dialTimeout := settingDuration(cfg, "SETTING_dialTimeoutSec", defaultDialSec)
@@ -689,9 +711,10 @@ func resolveV4(req socksRequest, resolver *protectedResolver) (string, error) {
 }
 
 type savedState struct {
-	VKToken    string `json:"vk_token"`
-	DeviceID   string `json:"device_id"`
-	Generation uint64 `json:"generation"`
+	VKToken      string   `json:"vk_token"`
+	DeviceID     string   `json:"device_id"`
+	Generation   uint64   `json:"generation"`
+	ManualHashes []string `json:"manual_hashes,omitempty"`
 }
 
 var persisted savedState
@@ -709,6 +732,7 @@ func restoreSavedState(blob string) savedState {
 	_ = json.Unmarshal(raw, &st)
 	st.VKToken = strings.TrimSpace(st.VKToken)
 	st.DeviceID = strings.TrimSpace(st.DeviceID)
+	st.ManualHashes = uniqHashes(st.ManualHashes)
 	return st
 }
 

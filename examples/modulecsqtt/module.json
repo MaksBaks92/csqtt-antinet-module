@@ -7,7 +7,7 @@
   "description": "L3-туннель CSQTT (TURN/RTP поверх VK Calls): SOCKS5 → gVisor → rust-движок. Хеши VK: Авто API (calls.start, 1–6 звонков), Авто ВК (один звонок в rust) или вручную. Вход в VK — webview AntiNet.",
   "homepage": "https://github.com/MaxPain99/csqtt-antinet-module",
   "updateUrl": "https://raw.githubusercontent.com/MaxPain99/csqtt-antinet-module/main/antinet-module.json",
-  "version": "1.2.6",
+  "version": "1.2.7",
   "license": "PolyForm-Noncommercial-1.0.0",
   "handoverMode": "signal",
   "hostEvents": ["handover", "netlost", "netback", "stall"],
@@ -40,60 +40,12 @@
       "type": "enum",
       "label": "Режим хешей",
       "default": "manual",
-      "description": "Ручной — свои хеши (до 6). Авто API — helper создаёт 1–6 звонков через calls.start и закрывает их при отключении. Авто ВК — rust создаёт один звонок. Авто-режимы не берут ручные хеши; нужен вход в VK.",
+      "description": "Ручной — при подключении откроется окно для 1–6 хешей (как в клиенте CSQTT). Авто API — helper создаёт 1–6 звонков через calls.start. Авто ВК — rust создаёт один звонок. Авто-режимы ручные хеши не используют; нужен вход в VK.",
       "options": [
         { "value": "manual", "label": "Ручной" },
         { "value": "auto_api", "label": "Авто API" },
         { "value": "auto_js", "label": "Авто ВК" }
       ]
-    },
-    {
-      "key": "vkHash1",
-      "type": "string",
-      "label": "VK-хеш 1",
-      "default": "",
-      "description": "Ссылка звонка или хеш. Только ручной режим.",
-      "visibleWhen": { "key": "hashMode", "equals": "manual" }
-    },
-    {
-      "key": "vkHash2",
-      "type": "string",
-      "label": "VK-хеш 2",
-      "default": "",
-      "description": "Необязательно. Только ручной режим.",
-      "visibleWhen": { "key": "hashMode", "equals": "manual" }
-    },
-    {
-      "key": "vkHash3",
-      "type": "string",
-      "label": "VK-хеш 3",
-      "default": "",
-      "description": "Необязательно. Только ручной режим.",
-      "visibleWhen": { "key": "hashMode", "equals": "manual" }
-    },
-    {
-      "key": "vkHash4",
-      "type": "string",
-      "label": "VK-хеш 4",
-      "default": "",
-      "description": "Необязательно. Только ручной режим.",
-      "visibleWhen": { "key": "hashMode", "equals": "manual" }
-    },
-    {
-      "key": "vkHash5",
-      "type": "string",
-      "label": "VK-хеш 5",
-      "default": "",
-      "description": "Необязательно. Только ручной режим.",
-      "visibleWhen": { "key": "hashMode", "equals": "manual" }
-    },
-    {
-      "key": "vkHash6",
-      "type": "string",
-      "label": "VK-хеш 6",
-      "default": "",
-      "description": "Необязательно. Только ручной режим.",
-      "visibleWhen": { "key": "hashMode", "equals": "manual" }
     },
     {
       "key": "obfs",
