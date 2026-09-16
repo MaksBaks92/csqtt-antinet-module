@@ -7,6 +7,10 @@ func TestParseHashFormResult(t *testing.T) {
 	if len(got) != 2 || got[0] != "aaa" || got[1] != "bbb" {
 		t.Fatalf("got %#v", got)
 	}
+	fromURL := parseHashFormResult("https://oauth.vk.ru/blank.html#hashes=one+two")
+	if len(fromURL) != 2 || fromURL[0] != "one" || fromURL[1] != "two" {
+		t.Fatalf("url got %#v", fromURL)
+	}
 	if parseHashFormResult("") != nil && len(parseHashFormResult("")) != 0 {
 		t.Fatal("empty should be empty")
 	}

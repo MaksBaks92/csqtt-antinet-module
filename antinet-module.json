@@ -1,15 +1,15 @@
 {
-  "version": "1.2.7",
+  "version": "1.2.8",
   "android": {
-    "arm64-v8a": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.7/csqtt-android-arm64-v8a.zip",
-    "armeabi-v7a": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.7/csqtt-android-armeabi-v7a.zip",
-    "x86": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.7/csqtt-android-x86.zip",
-    "x86_64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.7/csqtt-android-x86_64.zip"
+    "arm64-v8a": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.8/csqtt-android-arm64-v8a.zip",
+    "armeabi-v7a": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.8/csqtt-android-armeabi-v7a.zip",
+    "x86": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.8/csqtt-android-x86.zip",
+    "x86_64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.8/csqtt-android-x86_64.zip"
   },
   "desktop": {
     "windows_amd64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.0.0/csqtt-windows_amd64.zip",
     "linux_amd64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.0.0/csqtt-linux_amd64.zip",
     "darwin_amd64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.0.0/csqtt-darwin_amd64.zip"
   },
-  "changelog": "1.2.7: поля хешей убраны из настроек модуля (AntiNet не умеет прятать их по режиму). В «Ручной» окно на 1–6 хешей открывается при подключении; Авто API / Авто ВК его не показывают. 1.2.6: репозиторий, UDP/TCP dropdown. Desktop-бандлы пока 1.0.0."
+  "changelog": "1.2.8: ручные хеши вводятся в WebView при подключении (как капча/логин qWDTT), а не type=form — на Android окно реально открывается. Хеши из csqtt:// hashes= тоже принимаются. Авто API / Авто ВК окно не показывают. 1.2.7: поля убраны из настроек. Desktop-бандлы пока 1.0.0."
 }

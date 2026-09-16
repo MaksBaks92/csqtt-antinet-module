@@ -67,6 +67,8 @@ type csqttStrings struct {
 	hashFormHint         string
 	hashFormLabelFmt     string
 	hashFormCancelled    string
+	hashFormOk           string
+	hashFormProgress     string
 }
 
 var csqttStringsRU = csqttStrings{
@@ -91,6 +93,8 @@ var csqttStringsRU = csqttStrings{
 	hashFormHint:         "До 6 хешей. Можно вставить ссылку звонка. Только для режима «Ручной».",
 	hashFormLabelFmt:     "VK-хеш %d",
 	hashFormCancelled:    "CSQTT: ввод хешей отменён",
+	hashFormOk:           "Подключить",
+	hashFormProgress:     "CSQTT: укажите до 6 VK-хешей",
 }
 
 var csqttStringsEN = csqttStrings{
@@ -115,6 +119,8 @@ var csqttStringsEN = csqttStrings{
 	hashFormHint:         "Up to 6 hashes. A call link is fine. Manual mode only.",
 	hashFormLabelFmt:     "VK hash %d",
 	hashFormCancelled:    "CSQTT: hash entry cancelled",
+	hashFormOk:           "Connect",
+	hashFormProgress:     "CSQTT: enter up to 6 VK hashes",
 }
 
 func csqttStringsFor(lang string) csqttStrings {
@@ -445,7 +451,9 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 			emitStatus(statusFatal, "missing vk hashes")
 			log.Fatalf("vk hashes: %v", herr)
 		}
-		hashes = filled
+		if len(filled) > 0 {
+			hashes = filled
+		}
 		if len(hashes) == 0 {
 			emitLog(s.missingHashes)
 			emitStatus(statusFatal, "missing vk hashes")
