@@ -8,8 +8,8 @@ import (
 	"strings"
 )
 
-// Локальный callback: VK implicit OAuth отдаёт access_token во fragment на oauth.vk.com/blank.html,
-// а AntiNet в navigation-режиме часто не видит hash. injectJs перенаправляет на loopback с token в query.
+// Локальный callback: VK implicit OAuth отдаёт access_token во fragment;
+// injectJs перенаправляет на loopback с token в query (AntiNet navigation часто не видит hash).
 const vkOAuthCallbackPath = "/csqtt-vk-oauth-done"
 
 func startVkOAuthCallbackServer() (doneURL string, stop func(), err error) {
@@ -55,13 +55,4 @@ func parseVkAccessTokenFromCallbackURL(raw string) (string, error) {
 		s = s[i:]
 	}
 	return parseVkAccessToken(s)
-}
-
-// WebView OAuth рисует AntiNet (не helper): DNS идёт через VPN приложения, не через protect модуля.
-func vkDomainComShimJS() string {
-	return `(function(){if(window.__csqttVkCom)return;window.__csqttVkCom=1;function fix(){try{var u=String(location.href||'');if(u.indexOf('127.0.0.1')>=0||u.indexOf('localhost')>=0)return;if(/\.vk\.ru(\/|:|$)/i.test(u)||u.indexOf('://vk.ru/')>=0||u.indexOf('://vk.ru?')>=0){location.replace(u.replace(/\.vk\.ru/gi,'.vk.com').replace(/:\/\/vk\.ru/gi,'://vk.com'));}}catch(e){}}fix();window.addEventListener('hashchange',fix);setInterval(fix,400);})();`
-}
-
-func vkOAuthInjectJS(callbackURL string) string {
-	return vkDomainComShimJS() + vkOAuthHoistJS(callbackURL)
 }

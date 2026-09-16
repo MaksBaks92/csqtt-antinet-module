@@ -19,5 +19,5 @@ func logVkDNSHint(resolver *protectedResolver) {
 		}
 		parts = append(parts, fmt.Sprintf("%s=%s", h, ips[0]))
 	}
-	emitLog("CSQTT: DNS off-TUN модуля: %s. Окно VK в AntiNet идёт мимо protect — при ERR_NAME_NOT_RESOLVED отключите активный туннель; модуль переводит *.vk.ru → *.vk.com в WebView", strings.Join(parts, ", "))
+	emitLog("CSQTT: DNS off-TUN модуля: %s. OAuth WebView открывает только 127.0.0.1 — VK качает helper через protect", strings.Join(parts, ", "))
 }

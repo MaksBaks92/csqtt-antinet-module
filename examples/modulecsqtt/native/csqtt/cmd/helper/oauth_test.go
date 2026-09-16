@@ -42,10 +42,10 @@ func TestParseVkAccessTokenCancelled(t *testing.T) {
 	}
 }
 
-func TestVkOAuthHoistJSRedirectsToLoopback(t *testing.T) {
+func TestVkOAuthProxyJSHasLoopbackMarker(t *testing.T) {
 	done := vkOAuthDoneURLForTest(50999)
-	js := vkOAuthInjectJS(done)
-	for _, part := range []string{vkOAuthCallbackPath, "access_token=", "silent_token", "127.0.0.1:50999", "__csqttVkCom", "vk.ru"} {
+	js := vkOAuthProxyInjectJS("http://127.0.0.1:50999", done)
+	for _, part := range []string{vkOAuthCallbackPath, "access_token=", "silent_token", "127.0.0.1:50999", vkOAuthProxyPrefix} {
 		if !strings.Contains(js, part) {
 			t.Fatalf("oauth inject JS missing %q", part)
 		}
