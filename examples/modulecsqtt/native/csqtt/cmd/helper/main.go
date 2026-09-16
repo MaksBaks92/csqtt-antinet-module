@@ -73,7 +73,7 @@ type csqttStrings struct {
 
 var csqttStringsRU = csqttStrings{
 	badLinkFmt:           "CSQTT: неверная ссылка: %v",
-	missingHashes:        "CSQTT: в режиме «Ручной» укажите до 6 VK-хешей",
+	missingHashes:        "CSQTT: в режиме «Ручной» заполните VK-хеш 1…6 в настройках модуля",
 	engineLoadFailedFmt:  "CSQTT: не удалось загрузить движок: %v",
 	engineStartFailedFmt: "CSQTT: движок не стартовал: %v",
 	engineNotReadyFmt:    "CSQTT: туннель не поднялся за %s",
@@ -99,7 +99,7 @@ var csqttStringsRU = csqttStrings{
 
 var csqttStringsEN = csqttStrings{
 	badLinkFmt:           "CSQTT: bad link: %v",
-	missingHashes:        "CSQTT: in Manual mode set up to 6 VK hashes",
+	missingHashes:        "CSQTT: in Manual mode fill VK hash 1…6 in module settings",
 	engineLoadFailedFmt:  "CSQTT: failed to load engine: %v",
 	engineStartFailedFmt: "CSQTT: engine failed to start: %v",
 	engineNotReadyFmt:    "CSQTT: tunnel did not come up within %s",
@@ -445,13 +445,13 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 		// токен уже в vkToken — rust создаёт звонок сам
 	default:
 		hashes = uniqHashes(append(collectManualHashes(cfg, link.Hashes), persisted.ManualHashes...))
-		filled, herr := promptManualHashes(profileDir, hashes, s)
-		if herr != nil {
-			emitLog("%s", herr)
-			emitStatus(statusFatal, "missing vk hashes")
-			log.Fatalf("vk hashes: %v", herr)
-		}
-		if len(filled) > 0 {
+		if len(hashes) == 0 {
+			filled, herr := promptManualHashes(profileDir, hashes, s)
+			if herr != nil {
+				emitLog("%s", herr)
+				emitStatus(statusFatal, "missing vk hashes")
+				log.Fatalf("vk hashes: %v", herr)
+			}
 			hashes = filled
 		}
 		if len(hashes) == 0 {
