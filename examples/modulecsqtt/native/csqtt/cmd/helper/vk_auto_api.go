@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 amurcanov
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 //
-// Авто API как в клиенте CSQTT: POST api.vk.ru/method/calls.start,
+// Авто API как в клиенте CSQTT: POST api.vk.com/method/calls.start (fallback api.vk.ru),
 // хеши из ok_join_link / join_link, при остановке calls.forceFinish.
 
 package main
@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	vkAPIMethodBase     = "https://api.vk.ru/method/"
+	vkAPIMethodBase     = "https://api.vk.com/method/"
 	vkAPIVersion        = "5.199"
 	workersPerGroup     = 9
 	groupsPerVKHash     = 3
@@ -291,7 +291,7 @@ func vkAPIRequest(ctx context.Context, method, token string, params url.Values) 
 	params.Set("access_token", token)
 	body := params.Encode()
 	var last error
-	hosts := []string{vkAPIMethodBase, "https://api.vk.com/method/"}
+	hosts := []string{vkAPIMethodBase, "https://api.vk.ru/method/"}
 	for i, base := range hosts {
 		raw, err := vkAPIRequestOnce(ctx, base+method, token, body)
 		if err == nil {
@@ -318,8 +318,8 @@ func vkAPIRequestOnce(ctx context.Context, endpoint, token, body string) (json.R
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("User-Agent", vkBrowserUA)
 	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Origin", "https://vk.ru")
-	req.Header.Set("Referer", "https://vk.ru/")
+	req.Header.Set("Origin", "https://vk.com")
+	req.Header.Set("Referer", "https://vk.com/")
 	resp, err := vkHTTP.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("vk api %s dial: %w", endpoint, err)

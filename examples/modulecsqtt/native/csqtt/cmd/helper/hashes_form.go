@@ -5,7 +5,7 @@
 // mode the helper emits ACTION_REQUIRED webview (mode=navigation) — the same
 // host UI that shows qWDTT captcha / VK-account join. type=form is a demo
 // echo-module type and does not pop a window on the Android host we target.
-// Submit navigates to oauth.vk.ru/blank.html#hashes=… (same intercept as VK OAuth).
+// Submit navigates to loopback /csqtt-hashes-done?hashes=… (без DNS VK).
 
 package main
 
@@ -17,10 +17,7 @@ import (
 	"time"
 )
 
-const (
-	hashFormDoneURL    = "https://oauth.vk.ru/blank.html"
-	hashFormDoneMarker = "csqtt_hashes=1"
-)
+const hashFormDoneMarker = "csqtt_hashes=1"
 
 func promptManualHashes(profileDir string, prefill []string, s csqttStrings) ([]string, error) {
 	if profileDir == "" {
@@ -29,16 +26,22 @@ func promptManualHashes(profileDir string, prefill []string, s csqttStrings) ([]
 		}
 		return nil, fmt.Errorf("%s", s.missingHashes)
 	}
+	pageURL, doneURL, stopForm, serr := startManualHashFormServer()
+	if serr != nil {
+		return nil, fmt.Errorf("hash form server: %w", serr)
+	}
+	defer stopForm()
+
 	emitProgress("%s", s.hashFormProgress)
 	id := fmt.Sprintf("vk-hashes-%d", time.Now().UnixNano())
 	res, cancelled := runAction(profileDir, id, map[string]any{
 		"type":          "webview",
 		"mode":          "navigation",
-		"url":           "https://m.vk.ru/",
-		"urlPattern":    hashFormDoneMarker,
+		"url":           pageURL,
+		"urlPattern":    hashFormDonePath,
 		"param":         "hashes",
 		"urlTimeoutSec": int(vkOAuthTimeout / time.Second),
-		"injectJs":      hashFormInjectJS(prefill, s),
+		"injectJs":      hashFormInjectJS(prefill, s, doneURL),
 	})
 	if cancelled {
 		if len(prefill) > 0 {
@@ -53,7 +56,7 @@ func promptManualHashes(profileDir string, prefill []string, s csqttStrings) ([]
 	return parsed, nil
 }
 
-func hashFormInjectJS(prefill []string, s csqttStrings) string {
+func hashFormInjectJS(prefill []string, s csqttStrings, doneURL string) string {
 	values := make([]string, maxVkHashes)
 	labels := make([]string, maxVkHashes)
 	for i := 0; i < maxVkHashes; i++ {
@@ -66,7 +69,7 @@ func hashFormInjectJS(prefill []string, s csqttStrings) string {
 		"title":  s.hashFormTitle,
 		"hint":   s.hashFormHint,
 		"ok":     s.hashFormOk,
-		"done":   hashFormDoneURL,
+		"done":   doneURL,
 		"values": values,
 		"labels": labels,
 	})
@@ -98,7 +101,8 @@ function paint(){
         var t=el&&el.value?String(el.value).replace(/^\s+|\s+$/g,''):'';
         if(t) hs.push(t);
       }
-      location.replace(p.done+'?csqtt_hashes=1&hashes='+encodeURIComponent(hs.join(' ')));
+      var sep=p.done.indexOf('?')>=0?'&':'?';
+      location.replace(p.done+sep+'csqtt_hashes=1&hashes='+encodeURIComponent(hs.join(' ')));
     };
   }catch(e){}
 }

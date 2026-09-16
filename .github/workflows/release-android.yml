@@ -1,0 +1,60 @@
+name: Release Android bundles
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: examples/modulecsqtt/native/csqtt/go.mod
+          cache-dependency-path: examples/modulecsqtt/native/csqtt/go.sum
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Android targets
+        run: |
+          rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+
+      - name: Android NDK
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27d
+
+      - name: Build all Android ABIs
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          python build.py --os android --module csqtt --abis all -y
+          python build.py --bundle --module csqtt
+
+      - name: Upload build artifacts (manual runs)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: csqtt-android-dist-release
+          path: examples/modulecsqtt/dist-release/
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: |
+            Android module bundles for AntiNet (all ABIs).
+            Manifest: `antinet-module.json` (also on `main` for auto-update).
+          files: |
+            examples/modulecsqtt/dist-release/csqtt-android-*.zip
+            antinet-module.json

@@ -5,14 +5,23 @@ import (
 	"testing"
 )
 
-func TestParseVkAccessTokenFromHoistedURL(t *testing.T) {
+func TestParseVkAccessTokenFromLoopbackCallback(t *testing.T) {
 	const tok = "vk1.a.abcdefghijklmnopqrstuvwxyz0123456789ABCDEF"
-	got, err := parseVkAccessToken("https://oauth.vk.com/blank.html?csqtt_ok=1&access_token=" + tok + "&expires_in=0")
+	raw := vkOAuthDoneURLForTest(41217) + "?access_token=" + tok + "&expires_in=0"
+	got, err := parseVkAccessTokenFromCallbackURL(raw)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
 	if got != tok {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestParseVkAccessTokenFromHoistedURL(t *testing.T) {
+	const tok = "vk1.a.abcdefghijklmnopqrstuvwxyz0123456789ABCDEF"
+	got, err := parseVkAccessToken("https://oauth.vk.com/blank.html?csqtt_ok=1&access_token=" + tok + "&expires_in=0")
+	if err != nil || got != tok {
+		t.Fatalf("got %q err %v", got, err)
 	}
 }
 
@@ -33,12 +42,24 @@ func TestParseVkAccessTokenCancelled(t *testing.T) {
 	}
 }
 
-func TestVkOAuthHoistJSUsesDoneMarker(t *testing.T) {
-	js := vkOAuthHoistJS()
-	for _, part := range []string{"csqtt_ok=1", "access_token=", "silent_token"} {
+func TestVkOAuthHoistJSRedirectsToLoopback(t *testing.T) {
+	done := vkOAuthDoneURLForTest(50999)
+	js := vkOAuthInjectJS(done)
+	for _, part := range []string{vkOAuthCallbackPath, "access_token=", "silent_token", "127.0.0.1:50999", "__csqttVkCom", "vk.ru"} {
 		if !strings.Contains(js, part) {
-			t.Fatalf("hoist JS missing %q", part)
+			t.Fatalf("oauth inject JS missing %q", part)
 		}
+	}
+}
+
+func TestStartVkOAuthCallbackServer(t *testing.T) {
+	doneURL, stop, err := startVkOAuthCallbackServer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	if !strings.Contains(doneURL, vkOAuthCallbackPath) {
+		t.Fatalf("doneURL=%q", doneURL)
 	}
 }
 

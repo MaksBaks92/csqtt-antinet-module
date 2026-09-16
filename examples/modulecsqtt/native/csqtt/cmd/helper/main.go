@@ -38,12 +38,7 @@ const (
 	maxVkHashes     = 4
 	vkOAuthTimeout  = 5 * time.Minute
 	vkOAuthURLHop   = 90 * time.Second
-	// Хост ловит urlPattern как только URL содержит подстроку. VK редиректит на
-	// blank.html#access_token=… — fragment Android WebView хосту не отдаёт, param пустой,
-	// окно закрывается → CANCELLED (~30с после логина, ~3с если cookies уже есть).
-	// JS переписывает hash в query И добавляет маркер csqtt_ok=1; urlPattern — этот маркер,
-	// не blank.html. silent_token (payload=) — повтор authorize, как в клиенте CSQTT.
-	vkOAuthDoneMarker = "csqtt_ok=1"
+	// VK implicit OAuth: token во fragment blank.html → injectJs → 127.0.0.1/csqtt-vk-oauth-done (oauth_relay.go).
 )
 
 type csqttStrings struct {
@@ -420,7 +415,7 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	allowRedistrib := false
 	var hashes []string
 	if hashMode == "auto_api" || hashMode == "auto_js" {
-		tok, terr := ensureVkToken(cfg["MODULE_STATE"], profileDir, s)
+		tok, terr := ensureVkToken(cfg["MODULE_STATE"], profileDir, s, resolver)
 		if terr != nil {
 			emitLog(s.vkLoginFailedFmt, terr)
 			emitStatus(statusFatal, "vk login failed")
@@ -816,7 +811,7 @@ func normalizeHashMode(raw string) string {
 	}
 }
 
-func ensureVkToken(stateBlob, profileDir string, s csqttStrings) (string, error) {
+func ensureVkToken(stateBlob, profileDir string, s csqttStrings, resolver *protectedResolver) (string, error) {
 	if tok := strings.TrimSpace(persisted.VKToken); tok != "" {
 		return tok, nil
 	}
@@ -825,6 +820,7 @@ func ensureVkToken(stateBlob, profileDir string, s csqttStrings) (string, error)
 		return tok, nil
 	}
 	emitProgress("%s", s.vkLoginProgress)
+	logVkDNSHint(resolver)
 	tok, err := requestVkAccessToken(profileDir)
 	if err != nil {
 		return "", err
@@ -845,39 +841,47 @@ func vkOAuthAuthorizeURL(host, display string) string {
 }
 
 func vkOAuthURLList() []string {
-	// qWDTT rotates URLs every hop. oauth.vk.ru often fails DNS in AntiNet WebView
-	// (ERR_NAME_NOT_RESOLVED); .com must redirect to .com/blank.html, not .ru.
+	// oauth.vk.ru часто ERR_NAME_NOT_RESOLVED в WebView AntiNet; authorize только .com.
 	return []string{
 		vkOAuthAuthorizeURL("oauth.vk.com", "mobile"),
-		vkOAuthAuthorizeURL("oauth.vk.ru", "mobile"),
 		vkOAuthAuthorizeURL("oauth.vk.com", "page"),
-		vkOAuthAuthorizeURL("oauth.vk.ru", "page"),
 	}
 }
 
-func vkOAuthHoistJS() string {
+func vkOAuthHoistJS(callbackURL string) string {
 	oauth, _ := json.Marshal(vkOAuthAuthorizeURL("oauth.vk.com", "mobile"))
-	return `(function(){if(window.__csqttOauthHoist)return;window.__csqttOauthHoist=1;var oauth=` + string(oauth) + `;function hoist(){try{var h=String(location.hash||'');var s=String(location.search||'');if(s.indexOf('csqtt_ok=1')>=0)return;if(h.indexOf('payload=')>=0&&/silent_token/.test(h)){location.replace(oauth);return;}if(s.indexOf('access_token=')>=0){location.replace(location.protocol+'//'+location.host+'/blank.html?csqtt_ok=1&'+s.replace(/^\?/,''));return;}if(h.indexOf('access_token=')<0&&h.indexOf('error=')<0)return;location.replace(location.protocol+'//'+location.host+'/blank.html?csqtt_ok=1&'+h.replace(/^#/,''));}catch(e){}}hoist();setInterval(hoist,250);})();`
+	done, _ := json.Marshal(strings.TrimSpace(callbackURL))
+	pathMarker, _ := json.Marshal(vkOAuthCallbackPath)
+	return `(function(){if(window.__csqttOauthHoist)return;window.__csqttOauthHoist=1;var oauth=` + string(oauth) + `;var done=` + string(done) + `;var marker=` + string(pathMarker) + `;function hoist(){try{var href=String(location.href||'');if(href.indexOf(marker)>=0)return;var h=String(location.hash||'');var s=String(location.search||'');if(h.indexOf('payload=')>=0&&/silent_token/.test(h)){location.replace(oauth);return;}var q='';if(h.indexOf('access_token=')>=0||h.indexOf('error=')>=0){q=h.replace(/^#/,'');}else if(s.indexOf('access_token=')>=0||s.indexOf('error=')>=0){q=s.replace(/^\?/,'');}else{return;}var sep=done.indexOf('?')>=0?'&':'?';location.replace(done+sep+q);}catch(e){}}hoist();window.addEventListener('hashchange',hoist);setInterval(hoist,200);})();`
 }
 
 func requestVkAccessToken(profileDir string) (string, error) {
 	if profileDir == "" {
 		return "", fmt.Errorf("profileDir not set")
 	}
+	doneURL, stopRelay, err := startVkOAuthCallbackServer()
+	if err != nil {
+		return "", fmt.Errorf("oauth callback server: %w", err)
+	}
+	defer stopRelay()
+
 	id := fmt.Sprintf("vk-oauth-%d", time.Now().UnixNano())
 	res, cancelled := runAction(profileDir, id, map[string]any{
 		"type":          "webview",
 		"mode":          "navigation",
 		"url":           vkOAuthURLList(),
-		"urlPattern":    vkOAuthDoneMarker,
+		"urlPattern":    vkOAuthCallbackPattern(),
 		"param":         "access_token",
 		"urlTimeoutSec": int(vkOAuthURLHop / time.Second),
-		"injectJs":      vkOAuthHoistJS(),
+		"injectJs":      vkOAuthInjectJS(doneURL),
 	})
 	if cancelled {
-		return "", fmt.Errorf("VK login cancelled")
+		return "", fmt.Errorf("VK login cancelled (закройте окно только после входа и редиректа)")
 	}
-	tok, err := parseVkAccessToken(res)
+	if strings.TrimSpace(res) == "" {
+		return "", fmt.Errorf("VK login empty (AntiNet не передал токен — обновите модуль ≥1.2.13)")
+	}
+	tok, err := parseVkAccessTokenFromCallbackURL(res)
 	if err != nil {
 		return "", err
 	}
