@@ -4,10 +4,10 @@
     "csqtt"
   ],
   "name": "CSQTT",
-  "description": "L3-туннель CSQTT (TURN/RTP поверх VK Calls): SOCKS5 → gVisor → rust-движок. Хеши VK: Авто API (calls.start, до 4 звонков), Авто ВК (один звонок в rust) или вручную. Вход в VK — webview AntiNet.",
+  "description": "L3-туннель CSQTT (TURN/RTP поверх VK Calls): SOCKS5 → gVisor → rust-движок. Режим кредов (TURN): Авто / Авто ВК / Капча. Режим хешей: Ручной / Авто API / Авто ВК. Вход в VK — webview AntiNet.",
   "homepage": "https://github.com/MaxPain99/csqtt-antinet-module",
   "updateUrl": "https://raw.githubusercontent.com/MaxPain99/csqtt-antinet-module/main/antinet-module.json",
-  "version": "1.2.16",
+  "version": "1.2.17",
   "license": "PolyForm-Noncommercial-1.0.0",
   "handoverMode": "signal",
   "hostEvents": ["handover", "netlost", "netback", "stall"],
@@ -36,11 +36,23 @@
       "description": "Сколько параллельных TURN-путей держать. Больше — запас по обрывам, выше нагрузка на VK/TURN."
     },
     {
+      "key": "vkAuthMode",
+      "type": "enum",
+      "label": "Режим кредов",
+      "default": "vkcalls",
+      "description": "Как получать TURN-креды VK (как в приложении CSQTT). Авто — гостевая цепочка VK Calls без капчи. Авто ВК — getConversationParams под аккаунтом (нужен вход в VK; фиксирует режим хешей на Авто ВК). Капча — старый путь через client_id + капча.",
+      "options": [
+        { "value": "vkcalls", "label": "Авто" },
+        { "value": "auto_js", "label": "Авто ВК" },
+        { "value": "legacy", "label": "Капча" }
+      ]
+    },
+    {
       "key": "hashMode",
       "type": "enum",
       "label": "Режим хешей",
       "default": "manual",
-      "description": "Ручной — заполните VK-хеш 1…4 ниже. Авто API — helper создаёт до 4 звонков через calls.start. Авто ВК — rust создаёт один звонок. В авто ручные поля не используются.",
+      "description": "Ручной — заполните VK-хеш 1…4 ниже. Авто API — helper создаёт до 4 звонков через calls.start. Авто ВК — rust создаёт звонок и (вместе с режимом кредов Авто ВК) берёт креды аккаунта. Выбор Авто ВК здесь или в режиме кредов включает оба.",
       "options": [
         { "value": "manual", "label": "Ручной" },
         { "value": "auto_api", "label": "Авто API" },

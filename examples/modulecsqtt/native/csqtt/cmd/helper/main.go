@@ -410,11 +410,12 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 		defer stopProxy()
 	}
 
-	hashMode := normalizeHashMode(cfg["SETTING_hashMode"])
+	hashMode, authMode := normalizeVkModes(cfg["SETTING_hashMode"], cfg["SETTING_vkAuthMode"])
+	emitLog("CSQTT: режим хешей=%s · режим кредов=%s", hashMode, authModeLabel(authMode))
 	vkToken := ""
 	allowRedistrib := false
 	var hashes []string
-	if hashMode == "auto_api" || hashMode == "auto_js" {
+	if needsVkOAuth(hashMode, authMode) {
 		tok, terr := ensureVkToken(cfg["MODULE_STATE"], profileDir, s, resolver)
 		if terr != nil {
 			emitLog(s.vkLoginFailedFmt, terr)
@@ -510,6 +511,7 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 		"generation":     generation,
 		"salt":           sessionSalt,
 		"captcha_mode":   "auto",
+		"vk_auth_mode":   authMode,
 		"obfs":           obfs,
 		"turn_transport": turnTransport,
 		"fingerprint":    "firefox",
@@ -808,6 +810,44 @@ func normalizeHashMode(raw string) string {
 		return "auto_js"
 	default:
 		return "manual"
+	}
+}
+
+// normalizeVkAuthMode — как CsqttConstants.VkAuth в родном клиенте.
+func normalizeVkAuthMode(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "legacy", "captcha", "капча":
+		return "legacy"
+	case "auto_js":
+		return "auto_js"
+	default:
+		return "vkcalls"
+	}
+}
+
+// normalizeVkModes — связка «режим хешей» ↔ «режим кредов» как VkModePolicy.kt:
+// Авто ВК по любому из двух полей фиксирует оба на auto_js (аккаунтные TURN-креды).
+func normalizeVkModes(hashRaw, authRaw string) (hashMode, authMode string) {
+	hashMode = normalizeHashMode(hashRaw)
+	authMode = normalizeVkAuthMode(authRaw)
+	if authMode == "auto_js" || hashMode == "auto_js" {
+		return "auto_js", "auto_js"
+	}
+	return hashMode, authMode
+}
+
+func needsVkOAuth(hashMode, authMode string) bool {
+	return hashMode == "auto_api" || hashMode == "auto_js" || authMode == "auto_js"
+}
+
+func authModeLabel(mode string) string {
+	switch mode {
+	case "legacy":
+		return "Капча (legacy)"
+	case "auto_js":
+		return "Авто ВК (аккаунт)"
+	default:
+		return "Авто (vkcalls)"
 	}
 }
 
