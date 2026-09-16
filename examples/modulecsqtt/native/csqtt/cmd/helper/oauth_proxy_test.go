@@ -203,6 +203,38 @@ func TestProxyLocationRewrite(t *testing.T) {
 	}
 }
 
+func TestIsOAuthTerminalLocation(t *testing.T) {
+	if !isOAuthTerminalLocation("https://oauth.vk.com/blank.html#access_token=abc") {
+		t.Fatal("blank+token")
+	}
+	if !isOAuthTerminalLocation("https://oauth.vk.com/blank.html#error=access_denied") {
+		t.Fatal("blank+error")
+	}
+	if isOAuthTerminalLocation("https://oauth.vk.com/authorize?client_id=1") {
+		t.Fatal("authorize must not be terminal")
+	}
+}
+
+func TestUpstreamURLKeyDistinctRuCom(t *testing.T) {
+	com := upstreamURLKey("https://oauth.vk.com/authorize?x=1")
+	ru := upstreamURLKey("https://oauth.vk.ru/authorize?x=1")
+	if com == ru {
+		t.Fatalf("com/ru keys must differ: %q", com)
+	}
+	if upstreamURLKey("https://oauth.vk.com/authorize?x=1#frag") != com {
+		t.Fatal("fragment must be ignored")
+	}
+}
+
+func TestIsHTTPRedirect(t *testing.T) {
+	if !isHTTPRedirect(301) || !isHTTPRedirect(302) || !isHTTPRedirect(307) {
+		t.Fatal("expected redirect codes")
+	}
+	if isHTTPRedirect(200) || isHTTPRedirect(404) {
+		t.Fatal("non-redirect")
+	}
+}
+
 func TestParseRetryAfterSec(t *testing.T) {
 	h := http.Header{}
 	h.Set("Retry-After", "40")

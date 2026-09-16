@@ -72,6 +72,9 @@ const (
 	vkOAuth429DefaultWaitSec = 25
 	vkOAuth429MaxWaitSec     = 90
 	vkOAuth429MinWaitSec     = 12
+	// Follow VK 3xx inside the helper so WebView never sees authorize→authorize
+	// self-redirects (common .com↔.ru / cookie hops) which loop forever on loopback.
+	vkOAuthMaxUpstreamRedirects = 12
 )
 
 func isProxiedVkHost(host string) bool {
@@ -382,6 +385,51 @@ func resolveUpstreamLocation(host, loc string) string {
 	return "https://" + normalizeVkProxyHost(host) + "/" + strings.TrimPrefix(loc, "./")
 }
 
+func isHTTPRedirect(code int) bool {
+	switch code {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
+		http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		return true
+	default:
+		return false
+	}
+}
+
+// OAuth completion (token in fragment) must be exposed to WebView — following
+// blank.html upstream would drop the #access_token=… fragment.
+func isOAuthTerminalLocation(loc string) bool {
+	u, err := url.Parse(strings.TrimSpace(loc))
+	if err != nil || u == nil {
+		return false
+	}
+	path := strings.ToLower(u.EscapedPath())
+	if strings.HasSuffix(path, "/blank.html") || path == "/blank.html" {
+		return true
+	}
+	if strings.Contains(u.Fragment, "access_token=") || strings.Contains(u.Fragment, "error=") {
+		return true
+	}
+	if strings.Contains(u.RawQuery, "access_token=") || strings.Contains(u.RawQuery, "error=") {
+		return true
+	}
+	return false
+}
+
+// upstreamURLKey ignores fragments for redirect-loop detection. Keep .vk.ru vs
+// .vk.com distinct so the first com→ru hop is followed (normalizing would false-positive).
+func upstreamURLKey(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u == nil {
+		return strings.ToLower(strings.TrimSpace(raw))
+	}
+	host := strings.ToLower(u.Hostname())
+	path := u.EscapedPath()
+	if path == "" {
+		path = "/"
+	}
+	return host + path + "?" + u.RawQuery
+}
+
 func shouldDropProxiedHeader(name string) bool {
 	switch strings.ToLower(name) {
 	case "content-length", "content-encoding", "transfer-encoding", "set-cookie", "location":
@@ -602,8 +650,160 @@ func (p *vkOAuthProxy) serve(w http.ResponseWriter, r *http.Request) {
 		p.writeRetryPage(w, "Пустой ответ VK", "Нет HTTP-ответа от oauth.", retrySelf, 5)
 		return
 	}
+
+	// Follow non-terminal redirects in-proxy (cookie jar). Passing authorize→301→authorize
+	// back to WebView caused infinite loops on Android (v1.2.19 log).
+	seen := map[string]bool{}
+	method := r.Method
+	for hop := 0; hop < vkOAuthMaxUpstreamRedirects && resp != nil && isHTTPRedirect(resp.StatusCode); hop++ {
+		redirStatus := resp.StatusCode
+		rawLoc := resp.Header.Get("Location")
+		if rawLoc == "" {
+			break
+		}
+		absLoc := resolveUpstreamLocation(host, rawLoc)
+		shortLoc := absLoc
+		if len(shortLoc) > 120 {
+			shortLoc = shortLoc[:117] + "..."
+		}
+		emitLog("CSQTT OAuth proxy: OK %s %s → %d Location=%s (%s)",
+			method, host+path, redirStatus, shortLoc, time.Since(started).Round(time.Millisecond))
+
+		if isOAuthTerminalLocation(absLoc) {
+			for k, vv := range resp.Header {
+				if shouldDropProxiedHeader(k) {
+					continue
+				}
+				for _, v := range vv {
+					w.Header().Add(k, v)
+				}
+			}
+			w.Header().Set("Location", p.rewriteLocation(absLoc))
+			w.Header().Set("Cache-Control", "no-store")
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+			_ = resp.Body.Close()
+			w.WriteHeader(redirStatus)
+			return
+		}
+
+		key := upstreamURLKey(absLoc)
+		if seen[key] {
+			emitLog("CSQTT OAuth proxy: redirect loop at %s — stop follow", key)
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+			_ = resp.Body.Close()
+			p.writeRetryPage(w, "Цикл редиректа VK",
+				"oauth.vk.com отвечает 301 на тот же authorize. Подождите и повторите, либо «Режим хешей → Ручной» + «Креды → Авто».",
+				vkOAuthStartPath, 6)
+			return
+		}
+		seen[key] = true
+
+		nextURL, err := url.Parse(absLoc)
+		if err != nil || nextURL.Host == "" {
+			break
+		}
+		if !isProxiedVkHost(nextURL.Hostname()) {
+			break
+		}
+
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		_ = resp.Body.Close()
+		resp = nil
+
+		nextMethod := method
+		switch redirStatus {
+		case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther:
+			nextMethod = http.MethodGet
+			bodyBytes = nil
+		}
+
+		// Follow Location host as-is (.vk.ru stays .vk.ru) — do not force .com.
+		nextHost := strings.ToLower(nextURL.Hostname())
+		followURL := &url.URL{
+			Scheme:   "https",
+			Host:     nextHost,
+			Path:     nextURL.Path,
+			RawQuery: nextURL.RawQuery,
+		}
+		if followURL.Path == "" {
+			followURL.Path = "/"
+		}
+
+		var body io.Reader
+		if len(bodyBytes) > 0 && nextMethod != http.MethodGet && nextMethod != http.MethodHead {
+			body = strings.NewReader(string(bodyBytes))
+		}
+		req, err := http.NewRequestWithContext(r.Context(), nextMethod, followURL.String(), body)
+		if err != nil {
+			p.writeRetryPage(w, "Ошибка редиректа VK", err.Error(), vkOAuthStartPath, 3)
+			return
+		}
+		copyHopHeaders(r.Header, req.Header)
+		req.Header.Del("Accept-Encoding")
+		req.Header.Set("Accept-Encoding", "identity")
+		if req.Header.Get("User-Agent") == "" {
+			req.Header.Set("User-Agent", vkBrowserUA)
+		}
+		req.Header.Set("Referer", "https://"+host+path)
+		req.Host = nextHost
+		if body != nil {
+			req.ContentLength = int64(len(bodyBytes))
+		}
+
+		resp, lastErr = p.client.Do(req)
+		if lastErr != nil {
+			emitLog("CSQTT OAuth proxy: follow FAIL %s %s: %v", nextMethod, nextHost+followURL.Path, lastErr)
+			p.writeRetryPage(w, "VK не ответил вовремя", lastErr.Error(), retrySelf, 5)
+			return
+		}
+		if resp != nil && resp.StatusCode == http.StatusTooManyRequests {
+			waitSec := parseRetryAfterSec(resp.Header, vkOAuth429DefaultWaitSec)
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+			_ = resp.Body.Close()
+			p.markRateLimited(waitSec)
+			emitLog("CSQTT OAuth proxy: 429 on follow %s %s wait=%ds", nextMethod, nextHost+followURL.Path, waitSec)
+			p.writeRateLimitPage(w, retrySelf, waitSec)
+			return
+		}
+		host = nextHost
+		path = followURL.Path
+		method = nextMethod
+	}
+
+	if resp == nil {
+		p.writeRetryPage(w, "Пустой ответ VK", "Нет HTTP-ответа после редиректов.", retrySelf, 5)
+		return
+	}
+	if isHTTPRedirect(resp.StatusCode) {
+		rawLoc := resp.Header.Get("Location")
+		absLoc := resolveUpstreamLocation(host, rawLoc)
+		if isOAuthTerminalLocation(absLoc) {
+			for k, vv := range resp.Header {
+				if shouldDropProxiedHeader(k) {
+					continue
+				}
+				for _, v := range vv {
+					w.Header().Add(k, v)
+				}
+			}
+			w.Header().Set("Location", p.rewriteLocation(absLoc))
+			w.Header().Set("Cache-Control", "no-store")
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+			_ = resp.Body.Close()
+			w.WriteHeader(resp.StatusCode)
+			return
+		}
+		// Still a redirect after follow budget / non-VK break: do not bounce WebView.
+		emitLog("CSQTT OAuth proxy: stop exposing redirect %d %s → %s", resp.StatusCode, host+path, absLoc)
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		_ = resp.Body.Close()
+		p.writeRetryPage(w, "Слишком много редиректов VK",
+			"OAuth-прокси остановил цепочку 3xx, чтобы WebView не зациклился. Повторите вход или «Хеши → Ручной» + «Креды → Авто».",
+			vkOAuthStartPath, 5)
+		return
+	}
 	defer resp.Body.Close()
-	emitLog("CSQTT OAuth proxy: OK %s %s → %d (%s)", r.Method, up.Host+up.Path, resp.StatusCode, time.Since(started).Round(time.Millisecond))
+	emitLog("CSQTT OAuth proxy: OK %s %s → %d (%s)", method, host+path, resp.StatusCode, time.Since(started).Round(time.Millisecond))
 
 	ct := strings.ToLower(resp.Header.Get("Content-Type"))
 	rewriteBody := strings.Contains(ct, "text/html") || strings.Contains(ct, "javascript") || strings.Contains(ct, "json") || strings.Contains(ct, "text/css")
