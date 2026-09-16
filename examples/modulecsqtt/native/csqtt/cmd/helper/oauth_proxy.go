@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"net"
 	"net/http"
@@ -18,8 +19,33 @@ import (
 
 const (
 	vkOAuthProxyPrefix = "/v/"
+	vkOAuthStartPath   = "/csqtt-vk-oauth-start"
 	vkOAuthProxyMaxBody = 2 << 20
 )
+
+// newVkOAuthHTTPTransport clones protect DialContext from vkHTTP but with long
+// ResponseHeaderTimeout — shared vkHTTP uses 8s which breaks oauth.vk.com under load.
+func newVkOAuthHTTPTransport() http.RoundTripper {
+	var base *http.Transport
+	if vkHTTP != nil {
+		if t, ok := vkHTTP.Transport.(*http.Transport); ok && t != nil {
+			base = t.Clone()
+		}
+	}
+	if base == nil {
+		if t, ok := http.DefaultTransport.(*http.Transport); ok && t != nil {
+			base = t.Clone()
+		} else {
+			base = &http.Transport{Proxy: nil, ForceAttemptHTTP2: false}
+		}
+	}
+	base.ResponseHeaderTimeout = 45 * time.Second
+	base.TLSHandshakeTimeout = 20 * time.Second
+	base.IdleConnTimeout = 90 * time.Second
+	base.ExpectContinueTimeout = 5 * time.Second
+	base.ForceAttemptHTTP2 = false
+	return base
+}
 
 var (
 	reAbsVKURL = regexp.MustCompile(`(?i)(https?:)?//((?:[a-z0-9-]+\.)*(?:vk\.(?:com|ru)|userapi\.com|vkuseraudio\.net|vk-cdn\.net|vkcc\.net))(/[^"'>\s]*)?`)
@@ -100,16 +126,12 @@ func startVkOAuthProxyServer() (startURLs []string, doneURL string, stop func(),
 		_ = ln.Close()
 		return nil, "", nil, err
 	}
-	transport := http.DefaultTransport
-	if vkHTTP != nil && vkHTTP.Transport != nil {
-		transport = vkHTTP.Transport
-	}
 	p := &vkOAuthProxy{
 		base: base,
 		client: &http.Client{
-			Timeout:   60 * time.Second,
+			Timeout:   90 * time.Second,
 			Jar:       jar,
-			Transport: transport,
+			Transport: newVkOAuthHTTPTransport(),
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
@@ -121,29 +143,52 @@ func startVkOAuthProxyServer() (startURLs []string, doneURL string, stop func(),
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
 		_, _ = io.WriteString(w, `<!DOCTYPE html><html><head><meta charset="utf-8"><title>CSQTT</title></head>`+
-			`<body><p>Авторизация VK… окно закроется автоматически.</p></body></html>`)
+			`<body style="font-family:sans-serif;padding:24px;background:#111;color:#eee"><p>Авторизация VK… окно закроется автоматически.</p></body></html>`)
 	})
-	mux.HandleFunc(vkOAuthProxyPrefix, p.serve)
+	// Instant localhost paint, then one authorize URL (mobile only — dual mobile+page triggered 429).
+	mux.HandleFunc(vkOAuthStartPath, func(w http.ResponseWriter, r *http.Request) {
+		auth := p.authorizeURL("mobile")
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		esc := html.EscapeString(auth)
+		_, _ = io.WriteString(w, `<!DOCTYPE html><html><head><meta charset="utf-8">`+
+			`<meta http-equiv="refresh" content="0;url=`+esc+`">`+
+			`<title>CSQTT VK</title></head>`+
+			`<body style="font-family:sans-serif;padding:24px;background:#111;color:#eee">`+
+			`<p>Загрузка входа VK…</p>`+
+			`<script>location.replace(`+mustJSON(auth)+`);</script>`+
+			`<p><a style="color:#8cf" href="`+esc+`">Продолжить</a></p></body></html>`)
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, vkOAuthProxyPrefix) {
+		path := r.URL.Path
+		if path == "/" || path == "" {
+			http.Redirect(w, r, vkOAuthStartPath, http.StatusFound)
+			return
+		}
+		if strings.HasPrefix(path, vkOAuthProxyPrefix) {
 			p.serve(w, r)
 			return
 		}
 		http.NotFound(w, r)
 	})
 
-	srv := &http.Server{Handler: mux}
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 15 * time.Second}
 	go func() { _ = srv.Serve(ln) }()
 	stop = func() {
 		_ = srv.Close()
 		_ = ln.Close()
 	}
 
-	startURLs = []string{
-		p.authorizeURL("mobile"),
-		p.authorizeURL("page"),
-	}
+	startURLs = []string{base + vkOAuthStartPath}
 	return startURLs, doneURL, stop, nil
+}
+
+func mustJSON(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return `""`
+	}
+	return string(b)
 }
 
 func (p *vkOAuthProxy) authorizeURL(display string) string {
@@ -232,6 +277,32 @@ func (p *vkOAuthProxy) rewriteHTML(body string) string {
 	return body
 }
 
+func (p *vkOAuthProxy) writeRetryPage(w http.ResponseWriter, title, detail, retryURL string, waitSec int) {
+	if waitSec < 2 {
+		waitSec = 4
+	}
+	if retryURL == "" {
+		retryURL = vkOAuthStartPath
+	}
+	escTitle := html.EscapeString(title)
+	escDetail := html.EscapeString(detail)
+	escRetry := html.EscapeString(retryURL)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = fmt.Fprintf(w, `<!DOCTYPE html><html><head><meta charset="utf-8">`+
+		`<meta http-equiv="refresh" content="%d;url=%s">`+
+		`<title>%s</title></head>`+
+		`<body style="font-family:sans-serif;padding:24px;background:#111;color:#eee;line-height:1.45">`+
+		`<h2 style="margin:0 0 12px">%s</h2>`+
+		`<p style="opacity:.85;max-width:36em">%s</p>`+
+		`<p>Повтор через %d с…</p>`+
+		`<p><a style="color:#8cf" href="%s">Повторить сейчас</a></p>`+
+		`<script>setTimeout(function(){location.replace(%s);},%d);</script>`+
+		`</body></html>`,
+		waitSec, escRetry, escTitle, escTitle, escDetail, waitSec, escRetry, mustJSON(retryURL), waitSec*1000)
+}
+
 func (p *vkOAuthProxy) serve(w http.ResponseWriter, r *http.Request) {
 	host, path, ok := parseVkProxyPath(r.URL.Path)
 	if !ok {
@@ -244,32 +315,76 @@ func (p *vkOAuthProxy) serve(w http.ResponseWriter, r *http.Request) {
 		Path:     path,
 		RawQuery: r.URL.RawQuery,
 	}
-	var body io.Reader
-	if r.Body != nil && r.Method != http.MethodGet && r.Method != http.MethodHead {
-		body = r.Body
+	retrySelf := r.URL.RequestURI()
+	if !strings.HasPrefix(retrySelf, "/") {
+		retrySelf = vkOAuthStartPath
 	}
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, up.String(), body)
-	if err != nil {
-		http.Error(w, "bad upstream request", http.StatusBadGateway)
+
+	var bodyBytes []byte
+	if r.Body != nil && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		bodyBytes, _ = io.ReadAll(io.LimitReader(r.Body, vkOAuthProxyMaxBody))
+		_ = r.Body.Close()
+	}
+
+	var resp *http.Response
+	var lastErr error
+	got429 := false
+	const maxAttempts = 3
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		var body io.Reader
+		if len(bodyBytes) > 0 {
+			body = strings.NewReader(string(bodyBytes))
+		}
+		req, err := http.NewRequestWithContext(r.Context(), r.Method, up.String(), body)
+		if err != nil {
+			p.writeRetryPage(w, "Ошибка запроса VK", err.Error(), vkOAuthStartPath, 3)
+			return
+		}
+		copyHopHeaders(r.Header, req.Header)
+		req.Header.Del("Accept-Encoding")
+		req.Header.Set("Accept-Encoding", "identity")
+		if req.Header.Get("User-Agent") == "" {
+			req.Header.Set("User-Agent", vkBrowserUA)
+		}
+		if ref := r.Header.Get("Referer"); ref != "" {
+			req.Header.Set("Referer", p.unrewriteURL(ref))
+		}
+		if origin := r.Header.Get("Origin"); origin != "" {
+			req.Header.Set("Origin", p.unrewriteURL(origin))
+		}
+		req.Host = host
+		if len(bodyBytes) > 0 {
+			req.ContentLength = int64(len(bodyBytes))
+		}
+
+		resp, lastErr = p.client.Do(req)
+		got429 = lastErr == nil && resp != nil && resp.StatusCode == http.StatusTooManyRequests
+		if lastErr == nil && resp != nil && !got429 {
+			break
+		}
+		if resp != nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+			_ = resp.Body.Close()
+			resp = nil
+		}
+		if attempt < maxAttempts {
+			time.Sleep(time.Duration(attempt) * 1600 * time.Millisecond)
+		}
+	}
+	if lastErr != nil {
+		detail := lastErr.Error()
+		title := "VK не ответил вовремя"
+		if strings.Contains(detail, "timeout") || strings.Contains(detail, "Timeout") {
+			title = "Таймаут ответа VK"
+			detail = "Сервер oauth.vk.com долго не отдаёт заголовки. Обычно помогает повтор через несколько секунд (роуминг/нагрузка)."
+		}
+		p.writeRetryPage(w, title, detail, retrySelf, 5)
 		return
 	}
-	copyHopHeaders(r.Header, req.Header)
-	req.Header.Del("Accept-Encoding")
-	req.Header.Set("Accept-Encoding", "identity")
-	if req.Header.Get("User-Agent") == "" {
-		req.Header.Set("User-Agent", vkBrowserUA)
-	}
-	if ref := r.Header.Get("Referer"); ref != "" {
-		req.Header.Set("Referer", p.unrewriteURL(ref))
-	}
-	if origin := r.Header.Get("Origin"); origin != "" {
-		req.Header.Set("Origin", p.unrewriteURL(origin))
-	}
-	req.Host = host
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		http.Error(w, "upstream: "+err.Error(), http.StatusBadGateway)
+	if got429 || resp == nil {
+		p.writeRetryPage(w, "Слишком много запросов к VK",
+			"Upstream вернул 429 (rate limit). Подождите и повторите — не закрывайте окно до входа.",
+			retrySelf, 8)
 		return
 	}
 	defer resp.Body.Close()
@@ -302,10 +417,17 @@ func (p *vkOAuthProxy) serve(w http.ResponseWriter, r *http.Request) {
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, vkOAuthProxyMaxBody))
 	if err != nil {
-		http.Error(w, "upstream read", http.StatusBadGateway)
+		p.writeRetryPage(w, "Обрыв ответа VK", err.Error(), retrySelf, 4)
 		return
 	}
-	out := p.rewriteHTML(string(raw))
+	bodyStr := string(raw)
+	if resp.StatusCode == http.StatusOK && (strings.Contains(bodyStr, "429 Too Many Requests") || strings.Contains(strings.ToLower(bodyStr), "kittenx")) {
+		p.writeRetryPage(w, "Слишком много запросов к VK",
+			"Страница rate-limit от промежуточного узла. Подождите и нажмите «Повторить».",
+			retrySelf, 8)
+		return
+	}
+	out := p.rewriteHTML(bodyStr)
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(out)))
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.WriteString(w, out)

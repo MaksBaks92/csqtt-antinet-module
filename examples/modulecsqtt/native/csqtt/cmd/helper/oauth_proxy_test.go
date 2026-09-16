@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseVkProxyPath(t *testing.T) {
@@ -57,7 +58,7 @@ func TestStartVkOAuthProxyServerLocalOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer stop()
-	if len(starts) < 1 || !strings.Contains(starts[0], "/v/oauth.vk.com/authorize") {
+	if len(starts) != 1 || !strings.Contains(starts[0], vkOAuthStartPath) {
 		t.Fatalf("starts=%v", starts)
 	}
 	if !strings.Contains(done, vkOAuthCallbackPath) {
@@ -67,15 +68,40 @@ func TestStartVkOAuthProxyServerLocalOnly(t *testing.T) {
 		t.Fatalf("start not loopback: %s", starts[0])
 	}
 
-	// Callback page must be reachable without upstream.
-	res, err := http.Get(done)
-	if err != nil {
-		t.Fatal(err)
+	client := &http.Client{
+		Timeout: 3 * time.Second,
+		Transport: &http.Transport{
+			Proxy:           nil,
+			DisableKeepAlives: true,
+		},
 	}
-	defer res.Body.Close()
-	body, _ := io.ReadAll(res.Body)
-	if res.StatusCode != 200 || !strings.Contains(string(body), "VK") {
-		t.Fatalf("status=%d body=%q", res.StatusCode, body)
+	for _, u := range []string{done, starts[0]} {
+		res, err := client.Get(u)
+		if err != nil {
+			t.Fatalf("%s: %v", u, err)
+		}
+		body, _ := io.ReadAll(res.Body)
+		_ = res.Body.Close()
+		if res.StatusCode != 200 {
+			t.Fatalf("%s status=%d body=%q", u, res.StatusCode, body)
+		}
+		if u == starts[0] && !strings.Contains(string(body), "/v/oauth.vk.com/authorize") {
+			t.Fatalf("start page missing authorize link: %q", body)
+		}
+		if u == done && !strings.Contains(string(body), "VK") {
+			t.Fatalf("done page: %q", body)
+		}
+	}
+}
+
+func TestNewVkOAuthHTTPTransportTimeouts(t *testing.T) {
+	rt := newVkOAuthHTTPTransport()
+	tr, ok := rt.(*http.Transport)
+	if !ok || tr == nil {
+		t.Fatalf("expected *http.Transport, got %T", rt)
+	}
+	if tr.ResponseHeaderTimeout < 30*time.Second {
+		t.Fatalf("ResponseHeaderTimeout too short: %v", tr.ResponseHeaderTimeout)
 	}
 }
 
