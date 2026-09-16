@@ -4,10 +4,10 @@
     "csqtt"
   ],
   "name": "CSQTT",
-  "description": "L3-туннель CSQTT (TURN/RTP поверх VK Calls): SOCKS5 → gVisor → rust-движок. Хеши VK: Авто API (calls.start, 1–6 звонков), Авто ВК (один звонок в rust) или вручную. Вход в VK — webview AntiNet.",
+  "description": "L3-туннель CSQTT (TURN/RTP поверх VK Calls): SOCKS5 → gVisor → rust-движок. Хеши VK: Авто API (calls.start, до 4 звонков), Авто ВК (один звонок в rust) или вручную. Вход в VK — webview AntiNet.",
   "homepage": "https://github.com/MaxPain99/csqtt-antinet-module",
   "updateUrl": "https://raw.githubusercontent.com/MaxPain99/csqtt-antinet-module/main/antinet-module.json",
-  "version": "1.2.9",
+  "version": "1.2.10",
   "license": "PolyForm-Noncommercial-1.0.0",
   "handoverMode": "signal",
   "hostEvents": ["handover", "netlost", "netback", "stall"],
@@ -40,7 +40,7 @@
       "type": "enum",
       "label": "Режим хешей",
       "default": "manual",
-      "description": "Ручной — заполните VK-хеш 1…6 ниже (ссылка звонка или хеш, до 6 сразу). Авто API — helper создаёт 1–6 звонков через calls.start. Авто ВК — rust создаёт один звонок. В авто ручные поля не используются.",
+      "description": "Ручной — заполните VK-хеш 1…4 ниже. Авто API — helper создаёт до 4 звонков через calls.start. Авто ВК — rust создаёт один звонок. В авто ручные поля не используются.",
       "options": [
         { "value": "manual", "label": "Ручной" },
         { "value": "auto_api", "label": "Авто API" },
@@ -72,20 +72,6 @@
       "key": "vkHash4",
       "type": "string",
       "label": "VK-хеш 4",
-      "default": "",
-      "description": "Необязательно. Только режим «Ручной»."
-    },
-    {
-      "key": "vkHash5",
-      "type": "string",
-      "label": "VK-хеш 5",
-      "default": "",
-      "description": "Необязательно. Только режим «Ручной»."
-    },
-    {
-      "key": "vkHash6",
-      "type": "string",
-      "label": "VK-хеш 6",
       "default": "",
       "description": "Необязательно. Только режим «Ручной»."
     },

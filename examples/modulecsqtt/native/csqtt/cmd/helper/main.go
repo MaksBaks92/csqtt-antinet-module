@@ -35,10 +35,9 @@ const (
 	linkHostConnect = "connect"
 	defaultDialSec  = 20
 	readyWaitBudget = 90 * time.Second
-	maxVkHashes     = 6
+	maxVkHashes     = 4
 	vkOAuthTimeout  = 5 * time.Minute
-	vkOAuthURL      = "https://oauth.vk.ru/authorize?client_id=7793118&scope=1073737727&redirect_uri=https%3A%2F%2Foauth.vk.ru%2Fblank.html&display=mobile&response_type=token&revoke=1&v=5.199"
-	vkOAuthURLCom   = "https://oauth.vk.com/authorize?client_id=7793118&scope=1073737727&redirect_uri=https%3A%2F%2Foauth.vk.ru%2Fblank.html&display=mobile&response_type=token&revoke=1&v=5.199"
+	vkOAuthURLHop   = 45 * time.Second
 	// VK отдаёт implicit-токен в location.hash. Android WebView часто не включает fragment
 	// в URL колбэка хоста — param=access_token тогда пустой, юзер видит blank.html и закрывает
 	// окно → CANCELLED. JS читает hash и переписывает его в query, который хост уже умеет.
@@ -73,7 +72,7 @@ type csqttStrings struct {
 
 var csqttStringsRU = csqttStrings{
 	badLinkFmt:           "CSQTT: неверная ссылка: %v",
-	missingHashes:        "CSQTT: в режиме «Ручной» заполните VK-хеш 1…6 в настройках модуля",
+	missingHashes:        "CSQTT: в режиме «Ручной» заполните VK-хеш 1…4 в настройках модуля",
 	engineLoadFailedFmt:  "CSQTT: не удалось загрузить движок: %v",
 	engineStartFailedFmt: "CSQTT: движок не стартовал: %v",
 	engineNotReadyFmt:    "CSQTT: туннель не поднялся за %s",
@@ -90,16 +89,16 @@ var csqttStringsRU = csqttStrings{
 	vkAutoAPIFailedFmt:   "CSQTT: не удалось создать звонки VK: %v",
 	handoverLog:          "хендовер: сменилась сеть — TURN-воркеры переподключатся сами",
 	hashFormTitle:        "VK-хеши",
-	hashFormHint:         "До 6 хешей. Можно вставить ссылку звонка. Только для режима «Ручной».",
+	hashFormHint:         "До 4 хешей. Можно вставить ссылку звонка. Только для режима «Ручной».",
 	hashFormLabelFmt:     "VK-хеш %d",
 	hashFormCancelled:    "CSQTT: ввод хешей отменён",
 	hashFormOk:           "Подключить",
-	hashFormProgress:     "CSQTT: укажите до 6 VK-хешей",
+	hashFormProgress:     "CSQTT: укажите до 4 VK-хешей",
 }
 
 var csqttStringsEN = csqttStrings{
 	badLinkFmt:           "CSQTT: bad link: %v",
-	missingHashes:        "CSQTT: in Manual mode fill VK hash 1…6 in module settings",
+	missingHashes:        "CSQTT: in Manual mode fill VK hash 1…4 in module settings",
 	engineLoadFailedFmt:  "CSQTT: failed to load engine: %v",
 	engineStartFailedFmt: "CSQTT: engine failed to start: %v",
 	engineNotReadyFmt:    "CSQTT: tunnel did not come up within %s",
@@ -116,11 +115,11 @@ var csqttStringsEN = csqttStrings{
 	vkAutoAPIFailedFmt:   "CSQTT: failed to create VK calls: %v",
 	handoverLog:          "handover: network changed, TURN workers will reconnect",
 	hashFormTitle:        "VK hashes",
-	hashFormHint:         "Up to 6 hashes. A call link is fine. Manual mode only.",
+	hashFormHint:         "Up to 4 hashes. A call link is fine. Manual mode only.",
 	hashFormLabelFmt:     "VK hash %d",
 	hashFormCancelled:    "CSQTT: hash entry cancelled",
 	hashFormOk:           "Connect",
-	hashFormProgress:     "CSQTT: enter up to 6 VK hashes",
+	hashFormProgress:     "CSQTT: enter up to 4 VK hashes",
 }
 
 func csqttStringsFor(lang string) csqttStrings {
@@ -381,7 +380,6 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 
 	cfg := parseConfig(configContent)
 	s := csqttStringsFor(cfg["APP_LANG"])
-	configureVkHTTP(protectPath)
 	persisted = restoreSavedState(cfg["MODULE_STATE"])
 	deviceID, generation, sessionSalt := nextEngineIdentity(cfg, &persisted)
 	persistState()
@@ -400,6 +398,17 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	if workers <= 0 {
 		workers = 18
 	}
+
+	resolver := newProtectedResolver(cfg["DNS_SERVERS"], protectPath)
+	configureVkHTTP(protectPath, resolver)
+	proxyURL, stopProxy, perr := startProtectHTTPProxy(protectPath, resolver)
+	if perr != nil {
+		emitLog("CSQTT: off-TUN HTTP proxy: %v", perr)
+		stopProxy = func() {}
+	} else {
+		defer stopProxy()
+	}
+
 	hashMode := normalizeHashMode(cfg["SETTING_hashMode"])
 	vkToken := ""
 	allowRedistrib := false
@@ -471,15 +480,6 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 		turnTransport = "tcp_tls"
 	default:
 		turnTransport = "udp"
-	}
-
-	resolver := newProtectedResolver(cfg["DNS_SERVERS"], protectPath)
-	proxyURL, stopProxy, perr := startProtectHTTPProxy(protectPath, resolver)
-	if perr != nil {
-		emitLog("CSQTT: off-TUN HTTP proxy: %v", perr)
-		stopProxy = func() {}
-	} else {
-		defer stopProxy()
 	}
 
 	search := []string{profileDir}
@@ -819,6 +819,23 @@ func saveVkToken(token string) {
 	persistState()
 }
 
+func vkOAuthAuthorizeURL(host, display string) string {
+	redirect := url.QueryEscape("https://" + host + "/blank.html")
+	return "https://" + host + "/authorize?client_id=7793118&scope=1073737727&redirect_uri=" + redirect +
+		"&display=" + display + "&response_type=token&revoke=1&v=5.199"
+}
+
+func vkOAuthURLList() []string {
+	// qWDTT rotates URLs every ~45s. oauth.vk.ru often fails DNS in AntiNet WebView
+	// (ERR_NAME_NOT_RESOLVED); .com must redirect to .com/blank.html, not .ru.
+	return []string{
+		vkOAuthAuthorizeURL("oauth.vk.com", "mobile"),
+		vkOAuthAuthorizeURL("oauth.vk.ru", "mobile"),
+		vkOAuthAuthorizeURL("oauth.vk.com", "page"),
+		vkOAuthAuthorizeURL("oauth.vk.ru", "page"),
+	}
+}
+
 func requestVkAccessToken(profileDir string) (string, error) {
 	if profileDir == "" {
 		return "", fmt.Errorf("profileDir not set")
@@ -827,10 +844,10 @@ func requestVkAccessToken(profileDir string) (string, error) {
 	res, cancelled := runAction(profileDir, id, map[string]any{
 		"type":          "webview",
 		"mode":          "navigation",
-		"url":           []string{vkOAuthURL, vkOAuthURLCom},
+		"url":           vkOAuthURLList(),
 		"urlPattern":    "blank.html",
 		"param":         "access_token",
-		"urlTimeoutSec": int(vkOAuthTimeout / time.Second),
+		"urlTimeoutSec": int(vkOAuthURLHop / time.Second),
 		"injectJs":      vkOAuthHoistJS,
 	})
 	if cancelled {

@@ -24,7 +24,6 @@ import (
 const (
 	vkAPIMethodBase     = "https://api.vk.ru/method/"
 	vkAPIVersion        = "5.199"
-	maxVKHashes         = 6
 	workersPerGroup     = 9
 	groupsPerVKHash     = 3
 	maxWorkers          = 126
@@ -37,21 +36,43 @@ const (
 var (
 	errVkTokenInvalid = errors.New("vk access token invalid")
 	vkHTTP            = &http.Client{Timeout: 16 * time.Second}
+	vkBrowserUA       = "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
 )
 
-func configureVkHTTP(protectPath string) {
+func configureVkHTTP(protectPath string, resolver *protectedResolver) {
+	if resolver == nil || len(resolver.servers) == 0 {
+		resolver = newProtectedResolver("77.88.8.8,77.88.8.1", protectPath)
+	}
+	dialer := &net.Dialer{
+		Timeout:   8 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control:   dialControl(protectPath, nil),
+	}
 	vkHTTP = &http.Client{
 		Timeout: 16 * time.Second,
 		Transport: &http.Transport{
 			Proxy: nil,
-			DialContext: (&net.Dialer{
-				Timeout:   8 * time.Second,
-				KeepAlive: 30 * time.Second,
-				Control:   dialControl(protectPath, nil),
-			}).DialContext,
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				host, port, err := net.SplitHostPort(addr)
+				if err != nil {
+					return nil, err
+				}
+				ip := host
+				if net.ParseIP(host) == nil {
+					ips, lerr := resolver.LookupHost(host)
+					if lerr != nil {
+						return nil, lerr
+					}
+					if len(ips) == 0 {
+						return nil, fmt.Errorf("no DNS records for %s", host)
+					}
+					ip = pickIPv4(ips)
+				}
+				return dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, port))
+			},
 			TLSHandshakeTimeout:   8 * time.Second,
 			ResponseHeaderTimeout: 8 * time.Second,
-			ForceAttemptHTTP2:     true,
+			ForceAttemptHTTP2:     false,
 		},
 	}
 }
@@ -113,8 +134,8 @@ func maximumWorkersForHashes(hashCount int) int {
 	if hashCount < 1 {
 		hashCount = 1
 	}
-	if hashCount > maxVKHashes {
-		hashCount = maxVKHashes
+	if hashCount > maxVkHashes {
+		hashCount = maxVkHashes
 	}
 	return normalizeWorkerCount(hashCount*groupsPerVKHash*workersPerGroup, maxWorkers)
 }
@@ -123,12 +144,12 @@ func callCountForWorkers(workers int) int {
 	if workers <= 0 {
 		workers = workersPerGroup * 2
 	}
-	for n := 1; n <= maxVKHashes; n++ {
+	for n := 1; n <= maxVkHashes; n++ {
 		if workers <= maximumWorkersForHashes(n) {
 			return n
 		}
 	}
-	return maxVKHashes
+	return maxVkHashes
 }
 
 func autoCallDelay(callCount int) time.Duration {
@@ -267,24 +288,50 @@ func vkAPIRequest(ctx context.Context, method, token string, params url.Values) 
 		params = url.Values{}
 	}
 	params.Set("v", vkAPIVersion)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, vkAPIMethodBase+method, bytes.NewBufferString(params.Encode()))
+	params.Set("access_token", token)
+	body := params.Encode()
+	var last error
+	hosts := []string{vkAPIMethodBase, "https://api.vk.com/method/"}
+	for i, base := range hosts {
+		raw, err := vkAPIRequestOnce(ctx, base+method, token, body)
+		if err == nil {
+			return raw, nil
+		}
+		last = err
+		if errors.Is(err, errVkTokenInvalid) {
+			return nil, err
+		}
+		if i+1 < len(hosts) && strings.Contains(err.Error(), "dial") {
+			continue
+		}
+		return nil, err
+	}
+	return nil, last
+}
+
+func vkAPIRequestOnce(ctx context.Context, endpoint, token, body string) (json.RawMessage, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewBufferString(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", vkBrowserUA)
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Origin", "https://vk.ru")
+	req.Header.Set("Referer", "https://vk.ru/")
 	resp, err := vkHTTP.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("vk api %s dial: %w", endpoint, err)
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return nil, err
 	}
 	var env vkAPIEnvelope
-	if err := json.Unmarshal(body, &env); err != nil {
-		return nil, fmt.Errorf("vk api %s: HTTP %d: %w", method, resp.StatusCode, err)
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, fmt.Errorf("vk api %s: HTTP %d: %w", endpoint, resp.StatusCode, err)
 	}
 	if env.Error != nil {
 		if isVkTokenInvalidCode(env.Error.Code) {
@@ -293,7 +340,7 @@ func vkAPIRequest(ctx context.Context, method, token string, params url.Values) 
 		return nil, fmt.Errorf("код=%d %s", env.Error.Code, env.Error.Msg)
 	}
 	if len(env.Response) == 0 {
-		return nil, fmt.Errorf("vk api %s: empty response", method)
+		return nil, fmt.Errorf("vk api %s: empty response", endpoint)
 	}
 	return env.Response, nil
 }
