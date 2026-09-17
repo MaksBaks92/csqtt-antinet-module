@@ -20,9 +20,12 @@ import (
 // на oauth.vk.com. Весь OAuth идёт на 127.0.0.1; helper ходит на VK через protect + cookie jar.
 
 const (
-	vkOAuthProxyPrefix = "/v/"
-	vkOAuthStartPath   = "/csqtt-vk-oauth-start"
+	vkOAuthProxyPrefix  = "/v/"
+	vkOAuthStartPath    = "/csqtt-vk-oauth-start"
+	vkOAuthStatusPath   = "/csqtt-vk-oauth-status"
 	vkOAuthProxyMaxBody = 2 << 20
+	// Same entry as CSQTT client Constants.VK_LOGIN_URL — not oauth authorize (id.vk.ru SPA).
+	vkOAuthLoginHost = "vk.ru"
 )
 
 // newVkOAuthHTTPTransport clones protect DialContext from vkHTTP but with long
@@ -55,6 +58,9 @@ var (
 	// Root-relative "/css/…" on a proxied page would hit 127.0.0.1/css (404). Map to /v/<host>/…
 	reRootRelAttr = regexp.MustCompile(`(?i)(\s(?:href|src|action|poster|data|formaction)=)(["'])(/[^"']*)(["'])`)
 	reRootRelCSS  = regexp.MustCompile(`(?i)(url\(\s*)(['"]?)(/[^)'"]*)(['"]?\s*\))`)
+	// VkTokenScraper-style HTML follow after remixsid login.
+	reOAuthJSLocation = regexp.MustCompile(`(?i)location\.href\s*=\s*["']([^"']+)["']`)
+	reOAuthGrantLink  = regexp.MustCompile(`(?i)(https://login\.vk\.(?:com|ru)/\?act=grant_access[^"'\s<]+)`)
 )
 
 type vkOAuthProxy struct {
@@ -64,9 +70,11 @@ type vkOAuthProxy struct {
 
 	// After VK 429, skip upstream for a while so WebView auto-refresh / dual hops
 	// do not burn the rate limit further.
-	mu          sync.Mutex
-	coolUntil   time.Time
-	coolWaitSec int
+	mu           sync.Mutex
+	coolUntil    time.Time
+	coolWaitSec  int
+	scrapeBusy   bool
+	tokenDoneURL string // cached http://127.0.0.1/…/done?access_token=…
 }
 
 const (
@@ -199,24 +207,21 @@ func startVkOAuthProxyServer() (startURLs []string, doneURL string, stop func(),
 		_, _ = io.WriteString(w, `<!DOCTYPE html><html><head><meta charset="utf-8"><title>CSQTT</title></head>`+
 			`<body style="font-family:sans-serif;padding:24px;background:#111;color:#eee"><p>Авторизация VK… окно закроется автоматически.</p></body></html>`)
 	})
-	// Instant localhost paint, then one authorize URL (mobile only — dual mobile+page triggered 429).
+	mux.HandleFunc(vkOAuthStatusPath, p.handleOAuthStatus)
+	// CSQTT client opens https://vk.ru/ for login, then scrapes token via remixsid.
+	// Do NOT send WebView straight to oauth authorize / id.vk.ru (white screen under loopback).
 	mux.HandleFunc(vkOAuthStartPath, func(w http.ResponseWriter, r *http.Request) {
-		auth := p.authorizeURL("mobile")
-		// 302 avoids a second HTML hop; WebView stays on loopback while proxy fetches VK.
-		if r.URL.Query().Get("html") != "1" {
-			w.Header().Set("Cache-Control", "no-store")
-			http.Redirect(w, r, strings.TrimPrefix(auth, p.base), http.StatusFound)
-			return
-		}
+		login := vkOAuthProxyPrefix + vkOAuthLoginHost + "/"
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
-		esc := html.EscapeString(auth)
+		esc := html.EscapeString(login)
 		_, _ = io.WriteString(w, `<!DOCTYPE html><html><head><meta charset="utf-8">`+
 			`<meta http-equiv="refresh" content="0;url=`+esc+`">`+
 			`<title>CSQTT VK</title></head>`+
-			`<body style="font-family:sans-serif;padding:24px;background:#111;color:#eee">`+
-			`<p>Загрузка входа VK… Не закрывайте окно до редиректа после входа.</p>`+
-			`<script>location.replace(`+mustJSON(auth)+`);</script>`+
+			`<body style="font-family:sans-serif;padding:24px;background:#111;color:#eee;line-height:1.45">`+
+			`<p>Открываем страницу входа VK… Войдите как в приложении CSQTT.</p>`+
+			`<p style="opacity:.75;font-size:14px">После входа окно закроется само.</p>`+
+			`<script>location.replace(`+mustJSON(login)+`);</script>`+
 			`<p><a style="color:#8cf" href="`+esc+`">Продолжить</a></p></body></html>`)
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -254,9 +259,225 @@ func mustJSON(s string) string {
 }
 
 func (p *vkOAuthProxy) authorizeURL(display string) string {
-	redirect := url.QueryEscape("https://oauth.vk.com/blank.html")
+	redirect := url.QueryEscape("https://oauth.vk.ru/blank.html")
 	return fmt.Sprintf("%s%soauth.vk.com/authorize?client_id=7793118&scope=1073737727&redirect_uri=%s&display=%s&response_type=token&revoke=1&v=5.199",
 		p.base, vkOAuthProxyPrefix, redirect, display)
+}
+
+func (p *vkOAuthProxy) handleOAuthStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	p.mu.Lock()
+	if p.tokenDoneURL != "" {
+		u := p.tokenDoneURL
+		p.mu.Unlock()
+		_, _ = fmt.Fprintf(w, `{"state":"ok","url":%s}`, mustJSON(u))
+		return
+	}
+	if p.scrapeBusy {
+		p.mu.Unlock()
+		_, _ = io.WriteString(w, `{"state":"busy"}`)
+		return
+	}
+	loggedIn := p.jarHasRemixSID()
+	if !loggedIn {
+		p.mu.Unlock()
+		_, _ = io.WriteString(w, `{"state":"login"}`)
+		return
+	}
+	p.scrapeBusy = true
+	p.mu.Unlock()
+
+	done, err := p.scrapeAccessToken()
+	p.mu.Lock()
+	p.scrapeBusy = false
+	if err != nil {
+		p.mu.Unlock()
+		emitLog("CSQTT OAuth scrape: %v", err)
+		_, _ = fmt.Fprintf(w, `{"state":"error","detail":%s}`, mustJSON(err.Error()))
+		return
+	}
+	p.tokenDoneURL = done
+	p.mu.Unlock()
+	emitLog("CSQTT OAuth scrape: access_token ready")
+	_, _ = fmt.Fprintf(w, `{"state":"ok","url":%s}`, mustJSON(done))
+}
+
+func remixSIDCookieOK(c *http.Cookie) bool {
+	if c == nil {
+		return false
+	}
+	switch c.Name {
+	case "remixsid", "remixsid_sp", "remixnsid":
+	default:
+		return false
+	}
+	v := strings.TrimSpace(c.Value)
+	return v != "" && !strings.EqualFold(v, "deleted") && v != "0"
+}
+
+func (p *vkOAuthProxy) jarHasRemixSID() bool {
+	if p == nil || p.client == nil || p.client.Jar == nil {
+		return false
+	}
+	for _, raw := range []string{
+		"https://vk.ru/", "https://vk.com/", "https://m.vk.ru/", "https://m.vk.com/",
+		"https://login.vk.ru/", "https://login.vk.com/", "https://id.vk.ru/", "https://id.vk.com/",
+	} {
+		u, err := url.Parse(raw)
+		if err != nil {
+			continue
+		}
+		for _, c := range p.client.Jar.Cookies(u) {
+			if remixSIDCookieOK(c) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func parseOAuthTokenQuery(loc string) (q string, ok bool) {
+	if !strings.Contains(loc, "access_token=") {
+		return "", false
+	}
+	frag := ""
+	if i := strings.IndexByte(loc, '#'); i >= 0 {
+		frag = loc[i+1:]
+	} else if i := strings.IndexByte(loc, '?'); i >= 0 {
+		frag = loc[i+1:]
+	}
+	if !strings.Contains(frag, "access_token=") {
+		return "", false
+	}
+	return frag, true
+}
+
+// scrapeAccessToken mirrors CSQTT VkTokenScraper: authorize with jar cookies after remixsid login.
+func (p *vkOAuthProxy) scrapeAccessToken() (string, error) {
+	endpoint := "https://oauth.vk.com/authorize?client_id=7793118&display=mobile&redirect_uri=https%3A%2F%2Foauth.vk.ru%2Fblank.html&response_type=token&scope=1073737727&v=5.199&revoke=1"
+	for hop := 0; hop < vkOAuthMaxUpstreamRedirects; hop++ {
+		req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("User-Agent", vkBrowserUA)
+		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+		resp, err := p.client.Do(req)
+		if err != nil {
+			return "", err
+		}
+		code := resp.StatusCode
+		loc := resp.Header.Get("Location")
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, vkOAuthProxyMaxBody))
+		_ = resp.Body.Close()
+
+		if isHTTPRedirect(code) {
+			abs := resolveUpstreamLocation("oauth.vk.com", loc)
+			if q, ok := parseOAuthTokenQuery(abs); ok {
+				return p.doneURL + "?" + q, nil
+			}
+			if abs == "" {
+				return "", fmt.Errorf("oauth scrape: empty Location")
+			}
+			endpoint = abs
+			continue
+		}
+		if code != http.StatusOK {
+			return "", fmt.Errorf("oauth scrape HTTP %d", code)
+		}
+		htmlContent := string(body)
+		if m := reOAuthJSLocation.FindStringSubmatch(htmlContent); len(m) == 2 {
+			target := m[1]
+			if q, ok := parseOAuthTokenQuery(target); ok {
+				return p.doneURL + "?" + q, nil
+			}
+			endpoint = target
+			continue
+		}
+		if m := reOAuthGrantLink.FindStringSubmatch(htmlContent); len(m) == 2 {
+			endpoint = strings.ReplaceAll(m[1], "&amp;", "&")
+			continue
+		}
+		return "", fmt.Errorf("oauth scrape: no redirect in HTML")
+	}
+	return "", fmt.Errorf("oauth scrape: too many hops")
+}
+
+// rewriteSetCookieForWebView drops Domain/Secure so cookies stick on http://127.0.0.1.
+func rewriteSetCookieForWebView(raw string) string {
+	parts := strings.Split(raw, ";")
+	if len(parts) == 0 {
+		return raw
+	}
+	out := make([]string, 0, len(parts))
+	out = append(out, strings.TrimSpace(parts[0]))
+	hasPath := false
+	for _, part := range parts[1:] {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		low := strings.ToLower(part)
+		switch {
+		case strings.HasPrefix(low, "domain="):
+			continue
+		case low == "secure":
+			continue
+		case strings.HasPrefix(low, "path="):
+			out = append(out, "Path=/")
+			hasPath = true
+		case strings.HasPrefix(low, "samesite="):
+			out = append(out, "SameSite=Lax")
+		default:
+			out = append(out, part)
+		}
+	}
+	if !hasPath {
+		out = append(out, "Path=/")
+	}
+	return strings.Join(out, "; ")
+}
+
+func writeProxiedSetCookies(w http.ResponseWriter, h http.Header) {
+	if h == nil {
+		return
+	}
+	for _, sc := range h.Values("Set-Cookie") {
+		w.Header().Add("Set-Cookie", rewriteSetCookieForWebView(sc))
+	}
+}
+
+// Mirror helper jar cookies onto WebView (in-proxy hops never exposed Set-Cookie to the browser).
+func (p *vkOAuthProxy) writeJarCookiesToWebView(w http.ResponseWriter) {
+	if p == nil || p.client == nil || p.client.Jar == nil {
+		return
+	}
+	seen := map[string]bool{}
+	for _, raw := range []string{
+		"https://vk.ru/", "https://vk.com/", "https://m.vk.ru/", "https://m.vk.com/",
+		"https://login.vk.ru/", "https://login.vk.com/", "https://id.vk.ru/", "https://id.vk.com/",
+		"https://oauth.vk.com/", "https://oauth.vk.ru/",
+	} {
+		u, err := url.Parse(raw)
+		if err != nil {
+			continue
+		}
+		for _, c := range p.client.Jar.Cookies(u) {
+			key := c.Name + "\x00" + c.Value
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			sc := c.Name + "=" + c.Value + "; Path=/"
+			if c.HttpOnly {
+				sc += "; HttpOnly"
+			}
+			w.Header().Add("Set-Cookie", rewriteSetCookieForWebView(sc))
+		}
+	}
 }
 
 func (p *vkOAuthProxy) unrewriteURL(raw string) string {
@@ -741,6 +962,8 @@ func (p *vkOAuthProxy) serve(w http.ResponseWriter, r *http.Request) {
 					w.Header().Add(k, v)
 				}
 			}
+			writeProxiedSetCookies(w, resp.Header)
+			p.writeJarCookiesToWebView(w)
 			w.Header().Set("Location", p.rewriteLocation(absLoc))
 			w.Header().Set("Cache-Control", "no-store")
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
@@ -851,6 +1074,8 @@ func (p *vkOAuthProxy) serve(w http.ResponseWriter, r *http.Request) {
 					w.Header().Add(k, v)
 				}
 			}
+			writeProxiedSetCookies(w, resp.Header)
+			p.writeJarCookiesToWebView(w)
 			w.Header().Set("Location", p.rewriteLocation(absLoc))
 			w.Header().Set("Cache-Control", "no-store")
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
@@ -874,6 +1099,8 @@ func (p *vkOAuthProxy) serve(w http.ResponseWriter, r *http.Request) {
 	reqKey := upstreamURLKey((&url.URL{Scheme: "https", Host: normalizeVkProxyHost(up.Host), Path: up.Path, RawQuery: up.RawQuery}).String())
 	finalKey := upstreamURLKey((&url.URL{Scheme: "https", Host: normalizeVkProxyHost(host), Path: path, RawQuery: rawQuery}).String())
 	if reqKey != finalKey {
+		writeProxiedSetCookies(w, resp.Header)
+		p.writeJarCookiesToWebView(w)
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 		_ = resp.Body.Close()
 		bounce := (&url.URL{Scheme: "https", Host: normalizeVkProxyHost(host), Path: path, RawQuery: rawQuery}).String()
@@ -905,6 +1132,10 @@ func (p *vkOAuthProxy) serve(w http.ResponseWriter, r *http.Request) {
 		for _, v := range vv {
 			w.Header().Add(k, v)
 		}
+	}
+	writeProxiedSetCookies(w, resp.Header)
+	if strings.Contains(ct, "text/html") {
+		p.writeJarCookiesToWebView(w)
 	}
 	if loc := resp.Header.Get("Location"); loc != "" {
 		w.Header().Set("Location", p.rewriteLocation(resolveUpstreamLocation(host, loc)))
@@ -960,5 +1191,6 @@ func vkOAuthProxyInjectJS(base, doneURL string) string {
 	d, _ := json.Marshal(strings.TrimSpace(doneURL))
 	prefix, _ := json.Marshal(vkOAuthProxyPrefix)
 	marker, _ := json.Marshal(vkOAuthCallbackPath)
-	return `(function(){if(window.__csqttOauthProxy)return;window.__csqttOauthProxy=1;var base=` + string(b) + `;var prefix=` + string(prefix) + `;var done=` + string(d) + `;var marker=` + string(marker) + `;function rootProxy(u){try{if(!u||u.charAt(0)!=='/'||u.charAt(1)==='/')return u;if(u.indexOf(prefix)===0)return u;var m=String(location.pathname||'').match(/^\/v\/([^\/]+)/);if(!m)return u;return prefix+m[1]+u;}catch(e){return u;}}function toProxy(u){try{u=String(u||'');if(u.charAt(0)==='/'&&u.charAt(1)!=='/'){var rp=rootProxy(u);if(rp!==u)return rp;}var a=document.createElement('a');a.href=u;var h=String(a.hostname||'').toLowerCase();if(!h||h==='127.0.0.1'||h==='localhost')return String(u);if(!(/(^|\.)vk\.(com|ru)$/.test(h)||/(^|\.)userapi\.com$/.test(h)||h.indexOf('vk-cdn')>=0||h.indexOf('vkuseraudio')>=0||h.indexOf('vkcc.net')>=0))return String(u);return base+prefix+h+(a.pathname||'/')+(a.search||'')+(a.hash||'');}catch(e){return String(u);}}function hoist(){try{var href=String(location.href||'');if(href.indexOf(marker)>=0)return;if(/^https?:/i.test(href)&&href.indexOf('127.0.0.1')<0&&href.indexOf('localhost')<0){var p=toProxy(href);if(p!==href){location.replace(p);return;}}var h=String(location.hash||'');var s=String(location.search||'');if(h.indexOf('payload=')>=0&&/silent_token/.test(h)){location.replace(base+prefix+'oauth.vk.com/authorize?client_id=7793118&scope=1073737727&redirect_uri='+encodeURIComponent('https://oauth.vk.com/blank.html')+'&display=mobile&response_type=token&revoke=1&v=5.199');return;}var q='';if(h.indexOf('access_token=')>=0||h.indexOf('error=')>=0){q=h.replace(/^#/,'');}else if(s.indexOf('access_token=')>=0||s.indexOf('error=')>=0){q=s.replace(/^\?/,'');}else{return;}var sep=done.indexOf('?')>=0?'&':'?';location.replace(done+sep+q);}catch(e){}}function rewriteAttrs(){try{var nodes=document.querySelectorAll('a[href],form[action],link[href],script[src],img[src],iframe[src]');for(var i=0;i<nodes.length;i++){var el=nodes[i];var attr='href';if(el.tagName==='FORM')attr='action';else if(el.tagName==='SCRIPT'||el.tagName==='IMG'||el.tagName==='IFRAME')attr='src';var cur=el.getAttribute(attr);if(!cur)continue;var n=toProxy(cur);if(n!==cur)el.setAttribute(attr,n);}}catch(e){}}document.addEventListener('click',function(e){var t=e.target;while(t&&t.tagName!=='A')t=t.parentNode;if(!t||!t.href)return;var n=toProxy(t.getAttribute('href')||t.href);if(n!==(t.getAttribute('href')||t.href)){e.preventDefault();location.href=n;}},true);document.addEventListener('submit',function(e){try{var f=e.target;if(!f||!f.action)return;var n=toProxy(f.getAttribute('action')||f.action);if(n!==(f.getAttribute('action')||f.action))f.action=n;}catch(err){}},true);function hookNet(){try{var of=window.fetch;if(typeof of==='function'){window.fetch=function(input,init){try{var u=(typeof input==='string')?input:(input&&input.url);if(u){var n=toProxy(String(u));if(n!==String(u)){if(typeof input==='string')input=n;else if(typeof Request!=='undefined')input=new Request(n,input);}}}catch(e){}return of.call(this,input,init);};}}catch(e){}try{var XO=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(){try{if(typeof arguments[1]==='string')arguments[1]=toProxy(arguments[1]);}catch(e){}return XO.apply(this,arguments);};}catch(e){}}hookNet();hoist();rewriteAttrs();window.addEventListener('hashchange',hoist);setInterval(function(){hoist();rewriteAttrs();},250);})();`
+	status, _ := json.Marshal(strings.TrimRight(base, "/") + vkOAuthStatusPath)
+	return `(function(){if(window.__csqttOauthProxy)return;window.__csqttOauthProxy=1;var base=` + string(b) + `;var prefix=` + string(prefix) + `;var done=` + string(d) + `;var marker=` + string(marker) + `;var status=` + string(status) + `;function rootProxy(u){try{if(!u||u.charAt(0)!=='/'||u.charAt(1)==='/')return u;if(u.indexOf(prefix)===0)return u;var m=String(location.pathname||'').match(/^\/v\/([^\/]+)/);if(!m)return u;return prefix+m[1]+u;}catch(e){return u;}}function toProxy(u){try{u=String(u||'');if(u.charAt(0)==='/'&&u.charAt(1)!=='/'){var rp=rootProxy(u);if(rp!==u)return rp;}var a=document.createElement('a');a.href=u;var h=String(a.hostname||'').toLowerCase();if(!h||h==='127.0.0.1'||h==='localhost')return String(u);if(!(/(^|\.)vk\.(com|ru)$/.test(h)||/(^|\.)userapi\.com$/.test(h)||h.indexOf('vk-cdn')>=0||h.indexOf('vkuseraudio')>=0||h.indexOf('vkcc.net')>=0))return String(u);return base+prefix+h+(a.pathname||'/')+(a.search||'')+(a.hash||'');}catch(e){return String(u);}}function hoist(){try{var href=String(location.href||'');if(href.indexOf(marker)>=0)return;if(/^https?:/i.test(href)&&href.indexOf('127.0.0.1')<0&&href.indexOf('localhost')<0){var p=toProxy(href);if(p!==href){location.replace(p);return;}}var h=String(location.hash||'');var s=String(location.search||'');if(h.indexOf('payload=')>=0&&/silent_token/.test(h)){return;}var q='';if(h.indexOf('access_token=')>=0||h.indexOf('error=')>=0){q=h.replace(/^#/,'');}else if(s.indexOf('access_token=')>=0||s.indexOf('error=')>=0){q=s.replace(/^\?/,'');}else{return;}var sep=done.indexOf('?')>=0?'&':'?';location.replace(done+sep+q);}catch(e){}}function pollStatus(){try{if(window.__csqttOauthDone)return;var x=new XMLHttpRequest();x.open('GET',status,true);x.timeout=10000;x.onload=function(){try{var j=JSON.parse(x.responseText||'{}');if(j&&j.state==='ok'&&j.url){window.__csqttOauthDone=1;location.replace(j.url);}}catch(e){}};x.send();}catch(e){}}function rewriteAttrs(){try{var nodes=document.querySelectorAll('a[href],form[action],link[href],script[src],img[src],iframe[src]');for(var i=0;i<nodes.length;i++){var el=nodes[i];var attr='href';if(el.tagName==='FORM')attr='action';else if(el.tagName==='SCRIPT'||el.tagName==='IMG'||el.tagName==='IFRAME')attr='src';var cur=el.getAttribute(attr);if(!cur)continue;var n=toProxy(cur);if(n!==cur)el.setAttribute(attr,n);}}catch(e){}}document.addEventListener('click',function(e){var t=e.target;while(t&&t.tagName!=='A')t=t.parentNode;if(!t||!t.href)return;var n=toProxy(t.getAttribute('href')||t.href);if(n!==(t.getAttribute('href')||t.href)){e.preventDefault();location.href=n;}},true);document.addEventListener('submit',function(e){try{var f=e.target;if(!f||!f.action)return;var n=toProxy(f.getAttribute('action')||f.action);if(n!==(f.getAttribute('action')||f.action))f.action=n;}catch(err){}},true);function hookNet(){try{var of=window.fetch;if(typeof of==='function'){window.fetch=function(input,init){try{var u=(typeof input==='string')?input:(input&&input.url);if(u){var n=toProxy(String(u));if(n!==String(u)){if(typeof input==='string')input=n;else if(typeof Request!=='undefined')input=new Request(n,input);}}}catch(e){}return of.call(this,input,init);};}}catch(e){}try{var XO=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(){try{if(typeof arguments[1]==='string')arguments[1]=toProxy(arguments[1]);}catch(e){}return XO.apply(this,arguments);};}catch(e){}}hookNet();hoist();rewriteAttrs();pollStatus();window.addEventListener('hashchange',hoist);setInterval(function(){hoist();rewriteAttrs();pollStatus();},800);})();`
 }

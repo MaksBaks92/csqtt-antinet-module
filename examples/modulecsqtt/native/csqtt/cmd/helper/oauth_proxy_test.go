@@ -111,10 +111,30 @@ func TestResolveUpstreamLocation(t *testing.T) {
 
 func TestVkOAuthProxyInjectJS(t *testing.T) {
 	js := vkOAuthProxyInjectJS("http://127.0.0.1:50999", "http://127.0.0.1:50999/csqtt-vk-oauth-done")
-	for _, part := range []string{vkOAuthCallbackPath, vkOAuthProxyPrefix, "access_token=", "127.0.0.1:50999", "toProxy", "rootProxy"} {
+	for _, part := range []string{vkOAuthCallbackPath, vkOAuthProxyPrefix, "access_token=", "127.0.0.1:50999", "toProxy", "rootProxy", vkOAuthStatusPath, "pollStatus"} {
 		if !strings.Contains(js, part) {
 			t.Fatalf("inject JS missing %q", part)
 		}
+	}
+}
+
+func TestRewriteSetCookieForWebView(t *testing.T) {
+	in := "remixsid=abc; Domain=.vk.ru; Path=/; HttpOnly; Secure; SameSite=None"
+	got := rewriteSetCookieForWebView(in)
+	if !strings.Contains(got, "remixsid=abc") {
+		t.Fatalf("name lost: %s", got)
+	}
+	if strings.Contains(strings.ToLower(got), "domain=") {
+		t.Fatalf("domain must be dropped: %s", got)
+	}
+	if strings.Contains(strings.ToLower(got), "secure") {
+		t.Fatalf("secure must be dropped: %s", got)
+	}
+	if !strings.Contains(got, "Path=/") {
+		t.Fatalf("path missing: %s", got)
+	}
+	if !strings.Contains(got, "SameSite=Lax") {
+		t.Fatalf("samesite: %s", got)
 	}
 }
 
@@ -158,23 +178,24 @@ func TestStartVkOAuthProxyServerLocalOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
+	body, _ = io.ReadAll(res.Body)
 	_ = res.Body.Close()
-	if res.StatusCode != http.StatusFound {
-		t.Fatalf("start want 302, got %d", res.StatusCode)
+	if res.StatusCode != 200 {
+		t.Fatalf("start want 200 HTML, got %d", res.StatusCode)
 	}
-	loc := res.Header.Get("Location")
-	if !strings.Contains(loc, "/v/oauth.vk.com/authorize") {
-		t.Fatalf("start Location=%q", loc)
+	if !strings.Contains(string(body), "/v/"+vkOAuthLoginHost+"/") {
+		t.Fatalf("start must open proxied vk.ru login, body=%q", body)
 	}
 
-	res, err = client.Get(starts[0] + "?html=1")
+	statusURL := strings.Replace(done, vkOAuthCallbackPath, vkOAuthStatusPath, 1)
+	res, err = client.Get(statusURL)
 	if err != nil {
-		t.Fatalf("start html: %v", err)
+		t.Fatalf("status: %v", err)
 	}
 	body, _ = io.ReadAll(res.Body)
 	_ = res.Body.Close()
-	if res.StatusCode != 200 || !strings.Contains(string(body), "/v/oauth.vk.com/authorize") {
-		t.Fatalf("start html status=%d body=%q", res.StatusCode, body)
+	if res.StatusCode != 200 || !strings.Contains(string(body), `"state":"login"`) {
+		t.Fatalf("status want login, got %d %q", res.StatusCode, body)
 	}
 }
 
