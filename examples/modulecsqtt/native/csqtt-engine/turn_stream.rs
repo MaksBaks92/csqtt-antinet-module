@@ -14,7 +14,6 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
-    net::TcpStream,
     sync::{mpsc, watch},
 };
 use turn_rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
