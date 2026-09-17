@@ -414,65 +414,101 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	}
 
 	hashMode, authMode := normalizeVkModes(cfg["SETTING_hashMode"], cfg["SETTING_vkAuthMode"])
+	if normalizeHashMode(cfg["SETTING_hashMode"]) == "manual" && normalizeVkAuthMode(cfg["SETTING_vkAuthMode"]) == "auto_js" {
+		emitLog("CSQTT: Режим хешей=Ручной — «Авто ВК» в кредах отключён (движок требует Авто ВК и для хешей). Креды: Авто (vkcalls). Для аккаунтных TURN поставьте оба режима «Авто ВК».")
+	}
 	emitLog("CSQTT: режим хешей=%s · режим кредов=%s", hashMode, authModeLabel(authMode))
 	vkToken := ""
 	allowRedistrib := false
 	var hashes []string
+	seedHashes := uniqHashes(append(collectManualHashes(cfg, link.Hashes), persisted.ManualHashes...))
 	if needsVkOAuth(hashMode, authMode) {
 		tok, terr := ensureVkToken(cfg["MODULE_STATE"], profileDir, s, resolver)
 		if terr != nil {
-			emitLog(s.vkLoginFailedFmt, terr)
-			emitStatus(statusFatal, "vk login failed")
-			log.Fatalf("vk token: %v", terr)
-		}
-		vkToken = tok
-	}
-	switch hashMode {
-	case "auto_api":
-		emitProgress("%s", s.vkAutoAPIProgress)
-		started, aerr := startVkAutoCalls(vkToken, workers)
-		if errors.Is(aerr, errVkTokenInvalid) {
-			saveVkToken("")
-			emitProgress("%s", s.vkLoginProgress)
-			fresh, ferr := requestVkAccessToken(profileDir)
-			if ferr != nil {
-				emitLog(s.vkLoginFailedFmt, ferr)
+			// Как в ≤1.2.5: при срыве OAuth/API не роняем сессию, если хеши уже есть.
+			if len(seedHashes) > 0 {
+				emitLog("CSQTT: вход в VK не удался (%v), беру хеши из ссылки/настроек/состояния", terr)
+				hashMode = "manual"
+				authMode = "vkcalls"
+				hashes = seedHashes
+			} else {
+				emitLog(s.vkLoginFailedFmt, terr)
 				emitStatus(statusFatal, "vk login failed")
-				log.Fatalf("vk token: %v", ferr)
+				log.Fatalf("vk token: %v", terr)
 			}
-			vkToken = fresh
-			saveVkToken(vkToken)
-			started, aerr = startVkAutoCalls(vkToken, workers)
+		} else {
+			vkToken = tok
 		}
-		if aerr != nil || len(started.Hashes) == 0 {
-			if aerr == nil {
-				aerr = fmt.Errorf("empty hash list")
+	}
+	if len(hashes) == 0 {
+		switch hashMode {
+		case "auto_api":
+			emitProgress("%s", s.vkAutoAPIProgress)
+			started, aerr := startVkAutoCalls(vkToken, workers)
+			if errors.Is(aerr, errVkTokenInvalid) {
+				saveVkToken("")
+				emitProgress("%s", s.vkLoginProgress)
+				fresh, ferr := requestVkAccessToken(profileDir)
+				if ferr != nil {
+					if len(seedHashes) > 0 {
+						emitLog("CSQTT: вход в VK не удался (%v), беру хеши из ссылки/настроек/состояния", ferr)
+						hashMode = "manual"
+						authMode = "vkcalls"
+						hashes = seedHashes
+					} else {
+						emitLog(s.vkLoginFailedFmt, ferr)
+						emitStatus(statusFatal, "vk login failed")
+						log.Fatalf("vk token: %v", ferr)
+					}
+				} else {
+					vkToken = fresh
+					saveVkToken(vkToken)
+					started, aerr = startVkAutoCalls(vkToken, workers)
+				}
 			}
-			emitLog(s.vkAutoAPIFailedFmt, aerr)
-			emitStatus(statusFatal, "vk auto api failed")
-			log.Fatalf("vk auto api: %v", aerr)
-		}
-		hashes = started.Hashes
-		allowRedistrib = started.needsRedistribution()
-		defer finishVkAutoCalls(vkToken, started.Calls)
-	case "auto_js":
-		// токен уже в vkToken — rust создаёт звонок сам
-	default:
-		hashes = uniqHashes(append(collectManualHashes(cfg, link.Hashes), persisted.ManualHashes...))
-		if len(hashes) == 0 {
-			filled, herr := promptManualHashes(profileDir, hashes, s)
-			if herr != nil {
-				emitLog("%s", herr)
+			if hashMode == "auto_api" {
+				if aerr != nil || len(started.Hashes) == 0 {
+					if aerr == nil {
+						aerr = fmt.Errorf("empty hash list")
+					}
+					if len(seedHashes) > 0 {
+						emitLog("CSQTT: Авто API не удалось (%v), беру хеши из ссылки/настроек/состояния", aerr)
+						hashMode = "manual"
+						authMode = "vkcalls"
+						hashes = seedHashes
+					} else {
+						emitLog(s.vkAutoAPIFailedFmt, aerr)
+						emitStatus(statusFatal, "vk auto api failed")
+						log.Fatalf("vk auto api: %v", aerr)
+					}
+				} else {
+					hashes = started.Hashes
+					allowRedistrib = started.needsRedistribution()
+					defer finishVkAutoCalls(vkToken, started.Calls)
+				}
+			}
+		case "auto_js":
+			// токен уже в vkToken — rust создаёт звонок сам
+		default:
+			hashes = seedHashes
+			if len(hashes) == 0 {
+				filled, herr := promptManualHashes(profileDir, hashes, s)
+				if herr != nil {
+					emitLog("%s", herr)
+					emitStatus(statusFatal, "missing vk hashes")
+					log.Fatalf("vk hashes: %v", herr)
+				}
+				hashes = filled
+			}
+			if len(hashes) == 0 {
+				emitLog(s.missingHashes)
 				emitStatus(statusFatal, "missing vk hashes")
-				log.Fatalf("vk hashes: %v", herr)
+				log.Fatalf("missing vk hashes")
 			}
-			hashes = filled
+			persisted.ManualHashes = hashes
+			persistState()
 		}
-		if len(hashes) == 0 {
-			emitLog(s.missingHashes)
-			emitStatus(statusFatal, "missing vk hashes")
-			log.Fatalf("missing vk hashes")
-		}
+	} else if hashMode == "manual" {
 		persisted.ManualHashes = hashes
 		persistState()
 	}
@@ -828,11 +864,19 @@ func normalizeVkAuthMode(raw string) string {
 	}
 }
 
-// normalizeVkModes — связка «режим хешей» ↔ «режим кредов» как VkModePolicy.kt:
-// Авто ВК по любому из двух полей фиксирует оба на auto_js (аккаунтные TURN-креды).
+// normalizeVkModes — связка «режим хешей» ↔ «режим кредов» как VkModePolicy.kt,
+// но с приоритетом явного «Ручной»: движок (lib.rs) запрещает vk_auth_mode=auto_js
+// без vk_hash_mode=auto_js, поэтому «Ручной»+«Авто ВК» нельзя молча превратить в
+// Авто ВК по хешам (после 1.2.17 это ломало ручной режим). Креды тогда → vkcalls.
 func normalizeVkModes(hashRaw, authRaw string) (hashMode, authMode string) {
 	hashMode = normalizeHashMode(hashRaw)
 	authMode = normalizeVkAuthMode(authRaw)
+	if hashMode == "manual" {
+		if authMode == "auto_js" {
+			authMode = "vkcalls"
+		}
+		return "manual", authMode
+	}
 	if authMode == "auto_js" || hashMode == "auto_js" {
 		return "auto_js", "auto_js"
 	}
