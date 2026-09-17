@@ -24,8 +24,10 @@ const (
 	vkOAuthStartPath    = "/csqtt-vk-oauth-start"
 	vkOAuthStatusPath   = "/csqtt-vk-oauth-status"
 	vkOAuthProxyMaxBody = 2 << 20
-	// Same entry as CSQTT client Constants.VK_LOGIN_URL — not oauth authorize (id.vk.ru SPA).
-	vkOAuthLoginHost = "vk.ru"
+	// Mobile login shell (same family as CSQTT vk.ru → m.vk.ru). Avoid bare vk.ru:
+	// hop→WebView bounce vk.ru↔m.vk.ru loops and leaves a white WebView.
+	vkOAuthLoginHost = "m.vk.ru"
+	vkOAuthLoginPath = "/login"
 )
 
 // newVkOAuthHTTPTransport clones protect DialContext from vkHTTP but with long
@@ -61,6 +63,8 @@ var (
 	// VkTokenScraper-style HTML follow after remixsid login.
 	reOAuthJSLocation = regexp.MustCompile(`(?i)location\.href\s*=\s*["']([^"']+)["']`)
 	reOAuthGrantLink  = regexp.MustCompile(`(?i)(https://login\.vk\.(?:com|ru)/\?act=grant_access[^"'\s<]+)`)
+	// VK ships empty <base id="base">; without href, root-relative /images/… hit 127.0.0.1/images.
+	reBaseTag = regexp.MustCompile(`(?i)<base\b[^>]*>`)
 )
 
 type vkOAuthProxy struct {
@@ -208,10 +212,10 @@ func startVkOAuthProxyServer() (startURLs []string, doneURL string, stop func(),
 			`<body style="font-family:sans-serif;padding:24px;background:#111;color:#eee"><p>Авторизация VK… окно закроется автоматически.</p></body></html>`)
 	})
 	mux.HandleFunc(vkOAuthStatusPath, p.handleOAuthStatus)
-	// CSQTT client opens https://vk.ru/ for login, then scrapes token via remixsid.
+	// CSQTT client opens https://vk.ru/ → m.vk.ru login, then scrapes token via remixsid.
 	// Do NOT send WebView straight to oauth authorize / id.vk.ru (white screen under loopback).
 	mux.HandleFunc(vkOAuthStartPath, func(w http.ResponseWriter, r *http.Request) {
-		login := vkOAuthProxyPrefix + vkOAuthLoginHost + "/"
+		login := vkOAuthProxyPrefix + vkOAuthLoginHost + vkOAuthLoginPath
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
 		esc := html.EscapeString(login)
@@ -234,7 +238,14 @@ func startVkOAuthProxyServer() (startURLs []string, doneURL string, stop func(),
 			p.serve(w, r)
 			return
 		}
-		// SPA hit absolute path on loopback (inject/rootProxy missing) — surface in logs.
+		// Root-relative asset before <base>/rootProxy kicked in — recover host from Referer.
+		if host := proxyHostFromReferer(r.Header.Get("Referer")); host != "" {
+			r2 := r.Clone(r.Context())
+			r2.URL = cloneURLWithPath(r.URL, vkOAuthProxyPrefix+host+path)
+			emitLog("CSQTT OAuth proxy: recover miss %s → /v/%s%s", path, host, path)
+			p.serve(w, r2)
+			return
+		}
 		emitLog("CSQTT OAuth proxy: miss %s %s (not under /v/)", r.Method, path)
 		http.NotFound(w, r)
 	})
@@ -258,6 +269,34 @@ func mustJSON(s string) string {
 	return string(b)
 }
 
+func cloneURLWithPath(u *url.URL, path string) *url.URL {
+	if u == nil {
+		return &url.URL{Path: path}
+	}
+	out := *u
+	out.Path = path
+	out.RawPath = ""
+	return &out
+}
+
+// proxyHostFromReferer recovers /v/<host>/… from a loopback Referer so root-relative
+// misses like /images/… can be remapped under the proxy prefix.
+func proxyHostFromReferer(ref string) string {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return ""
+	}
+	u, err := url.Parse(ref)
+	if err != nil {
+		return ""
+	}
+	host, _, ok := unwrapVkProxyPath(u.Path)
+	if !ok {
+		return ""
+	}
+	return host
+}
+
 func (p *vkOAuthProxy) authorizeURL(display string) string {
 	redirect := url.QueryEscape("https://oauth.vk.ru/blank.html")
 	return fmt.Sprintf("%s%soauth.vk.com/authorize?client_id=7793118&scope=1073737727&redirect_uri=%s&display=%s&response_type=token&revoke=1&v=5.199",
@@ -268,6 +307,7 @@ func (p *vkOAuthProxy) handleOAuthStatus(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
+	p.ingestRequestCookies(r)
 
 	p.mu.Lock()
 	if p.tokenDoneURL != "" {
@@ -450,6 +490,28 @@ func writeProxiedSetCookies(w http.ResponseWriter, h http.Header) {
 	}
 }
 
+// ingestRequestCookies merges WebView Cookie header into the helper jar so remixsid
+// set only in the browser (or after Path=/ rewrite) still feeds VkTokenScraper.
+func (p *vkOAuthProxy) ingestRequestCookies(r *http.Request) {
+	if p == nil || p.client == nil || p.client.Jar == nil || r == nil {
+		return
+	}
+	cookies := r.Cookies()
+	if len(cookies) == 0 {
+		return
+	}
+	for _, raw := range []string{
+		"https://vk.ru/", "https://vk.com/", "https://m.vk.ru/", "https://m.vk.com/",
+		"https://login.vk.ru/", "https://login.vk.com/", "https://id.vk.ru/", "https://id.vk.com/",
+	} {
+		u, err := url.Parse(raw)
+		if err != nil {
+			continue
+		}
+		p.client.Jar.SetCookies(u, cookies)
+	}
+}
+
 // Mirror helper jar cookies onto WebView (in-proxy hops never exposed Set-Cookie to the browser).
 func (p *vkOAuthProxy) writeJarCookiesToWebView(w http.ResponseWriter) {
 	if p == nil || p.client == nil || p.client.Jar == nil {
@@ -553,6 +615,32 @@ func (p *vkOAuthProxy) injectProxyScript(htmlBody string) string {
 		done = strings.TrimRight(p.base, "/") + vkOAuthCallbackPath
 	}
 	tag := "<script>" + vkOAuthProxyInjectJS(p.base, done) + "</script>"
+	lower := strings.ToLower(htmlBody)
+	if i := strings.Index(lower, "<head>"); i >= 0 {
+		at := i + len("<head>")
+		return htmlBody[:at] + tag + htmlBody[at:]
+	}
+	if i := strings.Index(lower, "<head "); i >= 0 {
+		if j := strings.Index(htmlBody[i:], ">"); j >= 0 {
+			at := i + j + 1
+			return htmlBody[:at] + tag + htmlBody[at:]
+		}
+	}
+	return tag + htmlBody
+}
+
+// ensureProxyBase forces <base href="/v/<host>/"> so root-relative /images/… and
+// empty VK <base id="base"> resolve under the proxy prefix instead of 127.0.0.1/.
+func (p *vkOAuthProxy) ensureProxyBase(htmlBody, host string) string {
+	host = normalizeVkProxyHost(host)
+	if host == "" || !isProxiedVkHost(host) {
+		return htmlBody
+	}
+	href := vkOAuthProxyPrefix + host + "/"
+	tag := `<base id="base" href="` + href + `">`
+	if reBaseTag.MatchString(htmlBody) {
+		return reBaseTag.ReplaceAllString(htmlBody, tag)
+	}
 	lower := strings.ToLower(htmlBody)
 	if i := strings.Index(lower, "<head>"); i >= 0 {
 		at := i + len("<head>")
@@ -828,6 +916,7 @@ func (p *vkOAuthProxy) writeRetryPage(w http.ResponseWriter, title, detail, retr
 }
 
 func (p *vkOAuthProxy) serve(w http.ResponseWriter, r *http.Request) {
+	p.ingestRequestCookies(r)
 	host, path, ok := unwrapVkProxyPath(r.URL.Path)
 	if !ok {
 		http.NotFound(w, r)
@@ -1162,6 +1251,7 @@ func (p *vkOAuthProxy) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	out := p.rewriteHTML(bodyStr, host)
 	if strings.Contains(ct, "text/html") {
+		out = p.ensureProxyBase(out, host)
 		before := len(out)
 		out = p.injectProxyScript(out)
 		if len(out) != before {
@@ -1192,5 +1282,5 @@ func vkOAuthProxyInjectJS(base, doneURL string) string {
 	prefix, _ := json.Marshal(vkOAuthProxyPrefix)
 	marker, _ := json.Marshal(vkOAuthCallbackPath)
 	status, _ := json.Marshal(strings.TrimRight(base, "/") + vkOAuthStatusPath)
-	return `(function(){if(window.__csqttOauthProxy)return;window.__csqttOauthProxy=1;var base=` + string(b) + `;var prefix=` + string(prefix) + `;var done=` + string(d) + `;var marker=` + string(marker) + `;var status=` + string(status) + `;function rootProxy(u){try{if(!u||u.charAt(0)!=='/'||u.charAt(1)==='/')return u;if(u.indexOf(prefix)===0)return u;var m=String(location.pathname||'').match(/^\/v\/([^\/]+)/);if(!m)return u;return prefix+m[1]+u;}catch(e){return u;}}function toProxy(u){try{u=String(u||'');if(u.charAt(0)==='/'&&u.charAt(1)!=='/'){var rp=rootProxy(u);if(rp!==u)return rp;}var a=document.createElement('a');a.href=u;var h=String(a.hostname||'').toLowerCase();if(!h||h==='127.0.0.1'||h==='localhost')return String(u);if(!(/(^|\.)vk\.(com|ru)$/.test(h)||/(^|\.)userapi\.com$/.test(h)||h.indexOf('vk-cdn')>=0||h.indexOf('vkuseraudio')>=0||h.indexOf('vkcc.net')>=0))return String(u);return base+prefix+h+(a.pathname||'/')+(a.search||'')+(a.hash||'');}catch(e){return String(u);}}function hoist(){try{var href=String(location.href||'');if(href.indexOf(marker)>=0)return;if(/^https?:/i.test(href)&&href.indexOf('127.0.0.1')<0&&href.indexOf('localhost')<0){var p=toProxy(href);if(p!==href){location.replace(p);return;}}var h=String(location.hash||'');var s=String(location.search||'');if(h.indexOf('payload=')>=0&&/silent_token/.test(h)){return;}var q='';if(h.indexOf('access_token=')>=0||h.indexOf('error=')>=0){q=h.replace(/^#/,'');}else if(s.indexOf('access_token=')>=0||s.indexOf('error=')>=0){q=s.replace(/^\?/,'');}else{return;}var sep=done.indexOf('?')>=0?'&':'?';location.replace(done+sep+q);}catch(e){}}function pollStatus(){try{if(window.__csqttOauthDone)return;var x=new XMLHttpRequest();x.open('GET',status,true);x.timeout=10000;x.onload=function(){try{var j=JSON.parse(x.responseText||'{}');if(j&&j.state==='ok'&&j.url){window.__csqttOauthDone=1;location.replace(j.url);}}catch(e){}};x.send();}catch(e){}}function rewriteAttrs(){try{var nodes=document.querySelectorAll('a[href],form[action],link[href],script[src],img[src],iframe[src]');for(var i=0;i<nodes.length;i++){var el=nodes[i];var attr='href';if(el.tagName==='FORM')attr='action';else if(el.tagName==='SCRIPT'||el.tagName==='IMG'||el.tagName==='IFRAME')attr='src';var cur=el.getAttribute(attr);if(!cur)continue;var n=toProxy(cur);if(n!==cur)el.setAttribute(attr,n);}}catch(e){}}document.addEventListener('click',function(e){var t=e.target;while(t&&t.tagName!=='A')t=t.parentNode;if(!t||!t.href)return;var n=toProxy(t.getAttribute('href')||t.href);if(n!==(t.getAttribute('href')||t.href)){e.preventDefault();location.href=n;}},true);document.addEventListener('submit',function(e){try{var f=e.target;if(!f||!f.action)return;var n=toProxy(f.getAttribute('action')||f.action);if(n!==(f.getAttribute('action')||f.action))f.action=n;}catch(err){}},true);function hookNet(){try{var of=window.fetch;if(typeof of==='function'){window.fetch=function(input,init){try{var u=(typeof input==='string')?input:(input&&input.url);if(u){var n=toProxy(String(u));if(n!==String(u)){if(typeof input==='string')input=n;else if(typeof Request!=='undefined')input=new Request(n,input);}}}catch(e){}return of.call(this,input,init);};}}catch(e){}try{var XO=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(){try{if(typeof arguments[1]==='string')arguments[1]=toProxy(arguments[1]);}catch(e){}return XO.apply(this,arguments);};}catch(e){}}hookNet();hoist();rewriteAttrs();pollStatus();window.addEventListener('hashchange',hoist);setInterval(function(){hoist();rewriteAttrs();pollStatus();},800);})();`
+	return `(function(){if(window.__csqttOauthProxy)return;window.__csqttOauthProxy=1;var base=` + string(b) + `;var prefix=` + string(prefix) + `;var done=` + string(d) + `;var marker=` + string(marker) + `;var status=` + string(status) + `;function fixBase(){try{var m=String(location.pathname||'').match(/^\/v\/([^\/]+)/);if(!m)return;var want=prefix+m[1]+'/';var b=document.getElementById('base')||document.querySelector('base');if(!b){b=document.createElement('base');b.id='base';(document.head||document.documentElement).insertBefore(b,(document.head||document.documentElement).firstChild);}if(b.getAttribute('href')!==want)b.setAttribute('href',want);}catch(e){}}function preferLogin(){try{var path=String(location.pathname||'');if(/^\/v\/vk\.(ru|com)\/?$/.test(path)){location.replace(base+prefix+'m.vk.ru/login');return true;}return false;}catch(e){return false;}}function rootProxy(u){try{if(!u||u.charAt(0)!=='/'||u.charAt(1)==='/')return u;if(u.indexOf(prefix)===0)return u;var m=String(location.pathname||'').match(/^\/v\/([^\/]+)/);if(!m)return u;return prefix+m[1]+u;}catch(e){return u;}}function toProxy(u){try{u=String(u||'');if(u.charAt(0)==='/'&&u.charAt(1)!=='/'){var rp=rootProxy(u);if(rp!==u)return rp;}var a=document.createElement('a');a.href=u;var h=String(a.hostname||'').toLowerCase();if(!h||h==='127.0.0.1'||h==='localhost')return String(u);if(!(/(^|\.)vk\.(com|ru)$/.test(h)||/(^|\.)userapi\.com$/.test(h)||h.indexOf('vk-cdn')>=0||h.indexOf('vkuseraudio')>=0||h.indexOf('vkcc.net')>=0))return String(u);if((h==='vk.ru'||h==='vk.com')&&(!a.pathname||a.pathname==='/')){return base+prefix+'m.'+h+'/login'+(a.search||'')+(a.hash||'');}return base+prefix+h+(a.pathname||'/')+(a.search||'')+(a.hash||'');}catch(e){return String(u);}}function hoist(){try{if(preferLogin())return;var href=String(location.href||'');if(href.indexOf(marker)>=0)return;if(/^https?:/i.test(href)&&href.indexOf('127.0.0.1')<0&&href.indexOf('localhost')<0){var p=toProxy(href);if(p!==href){location.replace(p);return;}}var h=String(location.hash||'');var s=String(location.search||'');if(h.indexOf('payload=')>=0&&/silent_token/.test(h)){return;}var q='';if(h.indexOf('access_token=')>=0||h.indexOf('error=')>=0){q=h.replace(/^#/,'');}else if(s.indexOf('access_token=')>=0||s.indexOf('error=')>=0){q=s.replace(/^\?/,'');}else{return;}var sep=done.indexOf('?')>=0?'&':'?';location.replace(done+sep+q);}catch(e){}}function pollStatus(){try{if(window.__csqttOauthDone)return;var x=new XMLHttpRequest();x.open('GET',status,true);x.withCredentials=true;x.timeout=10000;x.onload=function(){try{var j=JSON.parse(x.responseText||'{}');if(j&&j.state==='ok'&&j.url){window.__csqttOauthDone=1;location.replace(j.url);}}catch(e){}};x.send();}catch(e){}}function rewriteAttrs(){try{var nodes=document.querySelectorAll('a[href],form[action],link[href],script[src],img[src],iframe[src]');for(var i=0;i<nodes.length;i++){var el=nodes[i];var attr='href';if(el.tagName==='FORM')attr='action';else if(el.tagName==='SCRIPT'||el.tagName==='IMG'||el.tagName==='IFRAME')attr='src';var cur=el.getAttribute(attr);if(!cur)continue;var n=toProxy(cur);if(n!==cur)el.setAttribute(attr,n);}}catch(e){}}document.addEventListener('click',function(e){var t=e.target;while(t&&t.tagName!=='A')t=t.parentNode;if(!t||!t.href)return;var n=toProxy(t.getAttribute('href')||t.href);if(n!==(t.getAttribute('href')||t.href)){e.preventDefault();location.href=n;}},true);document.addEventListener('submit',function(e){try{var f=e.target;if(!f||!f.action)return;var n=toProxy(f.getAttribute('action')||f.action);if(n!==(f.getAttribute('action')||f.action))f.action=n;}catch(err){}},true);function hookNet(){try{var of=window.fetch;if(typeof of==='function'){window.fetch=function(input,init){try{var u=(typeof input==='string')?input:(input&&input.url);if(u){var n=toProxy(String(u));if(n!==String(u)){if(typeof input==='string')input=n;else if(typeof Request!=='undefined')input=new Request(n,input);}}}catch(e){}return of.call(this,input,init);};}}catch(e){}try{var XO=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(){try{if(typeof arguments[1]==='string')arguments[1]=toProxy(arguments[1]);}catch(e){}return XO.apply(this,arguments);};}catch(e){}}hookNet();fixBase();hoist();rewriteAttrs();pollStatus();window.addEventListener('hashchange',hoist);setInterval(function(){fixBase();hoist();rewriteAttrs();pollStatus();},800);})();`
 }

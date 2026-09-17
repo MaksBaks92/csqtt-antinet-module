@@ -43,6 +43,28 @@ func TestRewriteHTMLRewritesHosts(t *testing.T) {
 	}
 }
 
+func TestEnsureProxyBase(t *testing.T) {
+	p := &vkOAuthProxy{base: "http://127.0.0.1:9"}
+	in := `<html><head><base id="base"><title>x</title></head>`
+	out := p.ensureProxyBase(in, "m.vk.ru")
+	if !strings.Contains(out, `href="/v/m.vk.ru/"`) {
+		t.Fatalf("base href missing: %s", out)
+	}
+	if strings.Count(strings.ToLower(out), "<base") != 1 {
+		t.Fatalf("expected single base tag: %s", out)
+	}
+}
+
+func TestProxyHostFromReferer(t *testing.T) {
+	got := proxyHostFromReferer("http://127.0.0.1:9/v/m.vk.ru/login")
+	if got != "m.vk.ru" {
+		t.Fatalf("got %q", got)
+	}
+	if proxyHostFromReferer("http://127.0.0.1:9/other") != "" {
+		t.Fatal("expected empty")
+	}
+}
+
 func TestRewriteHTMLRootRelative(t *testing.T) {
 	p := &vkOAuthProxy{base: "http://127.0.0.1:9"}
 	in := `<link href="/css/a.css"><form action="/act/login"><a href="//login.vk.com/x">x</a>`
@@ -111,7 +133,7 @@ func TestResolveUpstreamLocation(t *testing.T) {
 
 func TestVkOAuthProxyInjectJS(t *testing.T) {
 	js := vkOAuthProxyInjectJS("http://127.0.0.1:50999", "http://127.0.0.1:50999/csqtt-vk-oauth-done")
-	for _, part := range []string{vkOAuthCallbackPath, vkOAuthProxyPrefix, "access_token=", "127.0.0.1:50999", "toProxy", "rootProxy", vkOAuthStatusPath, "pollStatus"} {
+	for _, part := range []string{vkOAuthCallbackPath, vkOAuthProxyPrefix, "access_token=", "127.0.0.1:50999", "toProxy", "rootProxy", vkOAuthStatusPath, "pollStatus", "fixBase", "preferLogin"} {
 		if !strings.Contains(js, part) {
 			t.Fatalf("inject JS missing %q", part)
 		}
@@ -183,8 +205,8 @@ func TestStartVkOAuthProxyServerLocalOnly(t *testing.T) {
 	if res.StatusCode != 200 {
 		t.Fatalf("start want 200 HTML, got %d", res.StatusCode)
 	}
-	if !strings.Contains(string(body), "/v/"+vkOAuthLoginHost+"/") {
-		t.Fatalf("start must open proxied vk.ru login, body=%q", body)
+	if !strings.Contains(string(body), "/v/"+vkOAuthLoginHost+vkOAuthLoginPath) {
+		t.Fatalf("start must open proxied m.vk.ru/login, body=%q", body)
 	}
 
 	statusURL := strings.Replace(done, vkOAuthCallbackPath, vkOAuthStatusPath, 1)
