@@ -369,3 +369,31 @@ func TestVkOAuthProxyInjectJSHooksNet(t *testing.T) {
 		t.Fatal("inject must not force .vk.ru → .vk.com (breaks id.vk.ru cookies)")
 	}
 }
+
+func TestBrowserHeaderURLLoopbackOrigin(t *testing.T) {
+	p := &vkOAuthProxy{base: "http://127.0.0.1:9"}
+	got := p.browserHeaderURL("http://127.0.0.1:9", "id.vk.ru")
+	if got != "https://id.vk.ru" {
+		t.Fatalf("bare origin: got %q", got)
+	}
+	got = p.browserHeaderURL("http://127.0.0.1:9/v/id.vk.ru/auth?x=1", "ignored")
+	if got != "https://id.vk.ru/auth?x=1" {
+		t.Fatalf("proxied referer: got %q", got)
+	}
+}
+
+func TestInjectProxyScriptIntoHTML(t *testing.T) {
+	p := &vkOAuthProxy{base: "http://127.0.0.1:9", doneURL: "http://127.0.0.1:9/csqtt-vk-oauth-done"}
+	in := `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body>hi</body></html>`
+	out := p.injectProxyScript(in)
+	if !strings.Contains(out, "__csqttOauthProxy") || !strings.Contains(out, "hookNet") {
+		t.Fatalf("script not injected: %s", out)
+	}
+	if i := strings.Index(out, "__csqttOauthProxy"); i < 0 || i > strings.Index(out, "</head>") {
+		t.Fatal("inject must land inside <head>")
+	}
+	out2 := p.injectProxyScript(out)
+	if strings.Count(out2, "<script>") != strings.Count(out, "<script>") {
+		t.Fatal("double inject")
+	}
+}

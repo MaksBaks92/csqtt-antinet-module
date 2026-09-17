@@ -58,8 +58,9 @@ var (
 )
 
 type vkOAuthProxy struct {
-	base   string // http://127.0.0.1:port
-	client *http.Client
+	base    string // http://127.0.0.1:port
+	doneURL string // http://127.0.0.1:port/csqtt-vk-oauth-done
+	client  *http.Client
 
 	// After VK 429, skip upstream for a while so WebView auto-refresh / dual hops
 	// do not burn the rate limit further.
@@ -179,7 +180,8 @@ func startVkOAuthProxyServer() (startURLs []string, doneURL string, stop func(),
 		return nil, "", nil, err
 	}
 	p := &vkOAuthProxy{
-		base: base,
+		base:    base,
+		doneURL: doneURL,
 		client: &http.Client{
 			Timeout:   90 * time.Second,
 			Jar:       jar,
@@ -227,6 +229,8 @@ func startVkOAuthProxyServer() (startURLs []string, doneURL string, stop func(),
 			p.serve(w, r)
 			return
 		}
+		// SPA hit absolute path on loopback (inject/rootProxy missing) — surface in logs.
+		emitLog("CSQTT OAuth proxy: miss %s %s (not under /v/)", r.Method, path)
 		http.NotFound(w, r)
 	})
 
@@ -280,6 +284,66 @@ func (p *vkOAuthProxy) unrewriteURL(raw string) string {
 		out += "#" + u.Fragment
 	}
 	return out
+}
+
+// browserHeaderURL maps WebView Origin/Referer (127.0.0.1 or /v/…) back to a
+// real https://<vk-host>… value. Bare loopback Origin has no /v/ path, so
+// unrewriteURL alone leaves "http://127.0.0.1:port" and VK APIs reject it.
+func (p *vkOAuthProxy) browserHeaderURL(raw, upstreamHost string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return raw
+	}
+	if u := p.unrewriteURL(raw); u != raw {
+		return u
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u == nil {
+		return raw
+	}
+	h := strings.ToLower(u.Hostname())
+	if h != "127.0.0.1" && h != "localhost" && h != "::1" {
+		return raw
+	}
+	up := normalizeVkProxyHost(upstreamHost)
+	if up == "" {
+		return raw
+	}
+	path := u.EscapedPath()
+	if path == "" || path == "/" {
+		return "https://" + up
+	}
+	out := "https://" + up + path
+	if u.RawQuery != "" {
+		out += "?" + u.RawQuery
+	}
+	return out
+}
+
+// injectProxyScript embeds hoist/fetch hooks into every HTML page the proxy
+// serves. AntiNet injectJs may run only on the first navigation; after hop→
+// id.vk.ru the SPA otherwise has no rootProxy and APIs die on 127.0.0.1/….
+func (p *vkOAuthProxy) injectProxyScript(htmlBody string) string {
+	if strings.Contains(htmlBody, "__csqttOauthProxy") {
+		return htmlBody
+	}
+	done := p.doneURL
+	if done == "" {
+		done = strings.TrimRight(p.base, "/") + vkOAuthCallbackPath
+	}
+	tag := "<script>" + vkOAuthProxyInjectJS(p.base, done) + "</script>"
+	lower := strings.ToLower(htmlBody)
+	if i := strings.Index(lower, "<head>"); i >= 0 {
+		at := i + len("<head>")
+		return htmlBody[:at] + tag + htmlBody[at:]
+	}
+	if i := strings.Index(lower, "<head "); i >= 0 {
+		if j := strings.Index(htmlBody[i:], ">"); j >= 0 {
+			at := i + j + 1
+			return htmlBody[:at] + tag + htmlBody[at:]
+		}
+	}
+	return tag + htmlBody
 }
 
 func (p *vkOAuthProxy) rewriteAbsoluteURL(raw string) string {
@@ -596,10 +660,10 @@ func (p *vkOAuthProxy) serve(w http.ResponseWriter, r *http.Request) {
 			req.Header.Set("User-Agent", vkBrowserUA)
 		}
 		if ref := r.Header.Get("Referer"); ref != "" {
-			req.Header.Set("Referer", p.unrewriteURL(ref))
+			req.Header.Set("Referer", p.browserHeaderURL(ref, host))
 		}
 		if origin := r.Header.Get("Origin"); origin != "" {
-			req.Header.Set("Origin", p.unrewriteURL(origin))
+			req.Header.Set("Origin", p.browserHeaderURL(origin, host))
 		}
 		req.Host = host
 		if len(bodyBytes) > 0 {
@@ -744,6 +808,7 @@ func (p *vkOAuthProxy) serve(w http.ResponseWriter, r *http.Request) {
 			req.Header.Set("User-Agent", vkBrowserUA)
 		}
 		req.Header.Set("Referer", "https://"+host+path)
+		req.Header.Set("Origin", "https://"+nextHost)
 		req.Host = nextHost
 		if body != nil {
 			req.ContentLength = int64(len(bodyBytes))
@@ -865,6 +930,9 @@ func (p *vkOAuthProxy) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := p.rewriteHTML(bodyStr, host)
+	if strings.Contains(ct, "text/html") {
+		out = p.injectProxyScript(out)
+	}
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(out)))
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.WriteString(w, out)
