@@ -36,8 +36,11 @@ const (
 	defaultDialSec  = 20
 	readyWaitBudget = 90 * time.Second
 	maxVkHashes     = 4
-	vkOAuthTimeout  = 5 * time.Minute
-	vkOAuthURLHop   = 90 * time.Second
+	vkOAuthTimeout = 5 * time.Minute
+	// AntiNet closes the WebView when urlPattern is not hit within urlTimeoutSec.
+	// 90s was shorter than a typical VK ID login (phone → SMS/2FA) and produced
+	// false "VK login cancelled" after hop+static with no further proxy traffic.
+	vkOAuthURLHop = vkOAuthTimeout
 	// VK OAuth: WebView только 127.0.0.1 (oauth_proxy.go); token → /csqtt-vk-oauth-done.
 )
 

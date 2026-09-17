@@ -931,7 +931,11 @@ func (p *vkOAuthProxy) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	out := p.rewriteHTML(bodyStr, host)
 	if strings.Contains(ct, "text/html") {
+		before := len(out)
 		out = p.injectProxyScript(out)
+		if len(out) != before {
+			emitLog("CSQTT OAuth proxy: inject HTML %s (%d→%d B)", host+path, before, len(out))
+		}
 	}
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(out)))
 	w.WriteHeader(resp.StatusCode)
