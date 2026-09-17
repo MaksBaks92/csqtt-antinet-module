@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -133,7 +134,7 @@ func TestResolveUpstreamLocation(t *testing.T) {
 
 func TestVkOAuthProxyInjectJS(t *testing.T) {
 	js := vkOAuthProxyInjectJS("http://127.0.0.1:50999", "http://127.0.0.1:50999/csqtt-vk-oauth-done")
-	for _, part := range []string{vkOAuthCallbackPath, vkOAuthProxyPrefix, "access_token=", "127.0.0.1:50999", "toProxy", "rootProxy", vkOAuthStatusPath, "pollStatus", "fixBase", "preferLogin", "alreadyHere", "hookLocation", "hookNavigation", "pathKey(toProxy"} {
+	for _, part := range []string{vkOAuthCallbackPath, vkOAuthProxyPrefix, "access_token=", "127.0.0.1:50999", "toProxy", "rootProxy", vkOAuthStatusPath, "pollStatus", "fixBase", "preferLogin", "alreadyHere", "allowFullNav", "shellFreezeUntil", "hookLocation", "hookNavigation", "pathKey(toProxy"} {
 		if !strings.Contains(js, part) {
 			t.Fatalf("inject JS missing %q", part)
 		}
@@ -246,6 +247,30 @@ func TestProxyLocationRewrite(t *testing.T) {
 	loc := p.rewriteLocation("https://oauth.vk.com/blank.html#access_token=abc")
 	if !strings.Contains(loc, "/v/oauth.vk.com/blank.html#access_token=abc") {
 		t.Fatalf("loc=%q", loc)
+	}
+}
+
+func TestIsHTMLNavPath(t *testing.T) {
+	if !isHTMLNavPath("/login") || !isHTMLNavPath("/") {
+		t.Fatal("expected html nav")
+	}
+	if isHTMLNavPath("/dist/mobile/x.js") || isHTMLNavPath("/css/fonts/a.woff2") {
+		t.Fatal("static must not be html nav")
+	}
+}
+
+func TestClientRequestCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r := httptest.NewRequestWithContext(ctx, http.MethodGet, "http://127.0.0.1/", nil)
+	if !clientRequestCanceled(r, nil) {
+		t.Fatal("expected canceled request context")
+	}
+	if !clientRequestCanceled(nil, context.Canceled) {
+		t.Fatal("expected canceled error")
+	}
+	if clientRequestCanceled(httptest.NewRequest(http.MethodGet, "http://127.0.0.1/", nil), nil) {
+		t.Fatal("live request must not look canceled")
 	}
 }
 

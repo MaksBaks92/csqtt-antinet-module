@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -85,6 +87,9 @@ type vkOAuthProxy struct {
 	// htmlFlights coalesces concurrent GET HTML document fetches (same host+path)
 	// so SPA remount storms do not re-hit VK and re-inject for every overlapping load.
 	htmlFlights map[string]*htmlFlight
+	// assetFlights coalesces CDN GETs with a detached upstream context so brief
+	// WebView aborts during remounts do not cancel the upstream fetch / cache fill.
+	assetFlights map[string]*htmlFlight
 }
 
 // htmlFlight is one in-flight or short-TTL cached HTML document response.
@@ -97,6 +102,8 @@ type htmlFlight struct {
 }
 
 const htmlCoalesceTTL = 2500 * time.Millisecond
+const assetCoalesceTTL = 30 * time.Second
+const assetUpstreamTimeout = 45 * time.Second
 
 const (
 	vkOAuth429DefaultWaitSec = 25
@@ -1007,9 +1014,15 @@ func (p *vkOAuthProxy) rememberHost(host string) {
 
 func (p *vkOAuthProxy) serve(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
-		if host, docPath, ok := unwrapVkProxyPath(r.URL.Path); ok && isHTMLNavPath(docPath) {
-			p.serveHTMLCoalesced(w, r, host, docPath)
-			return
+		if host, docPath, ok := unwrapVkProxyPath(r.URL.Path); ok {
+			if isHTMLNavPath(docPath) {
+				p.serveHTMLCoalesced(w, r, host, docPath)
+				return
+			}
+			if isVkStaticCDNHost(host) {
+				p.serveAssetCoalesced(w, r, host, docPath)
+				return
+			}
 		}
 	}
 	p.serveOnce(w, r)
@@ -1026,10 +1039,12 @@ func (p *vkOAuthProxy) serveHTMLCoalesced(w http.ResponseWriter, r *http.Request
 		select {
 		case <-f.done:
 		case <-r.Context().Done():
-			http.Error(w, "context canceled", http.StatusRequestTimeout)
 			return
 		}
 		if f.ok {
+			if r.Context().Err() != nil {
+				return
+			}
 			copyHTTPHeader(w.Header(), f.hdr)
 			w.WriteHeader(f.code)
 			_, _ = w.Write(f.body)
@@ -1052,14 +1067,75 @@ func (p *vkOAuthProxy) serveHTMLCoalesced(w http.ResponseWriter, r *http.Request
 	f.ok = r.Context().Err() == nil && f.code >= 200 && f.code < 500 && len(f.body) > 0
 	close(f.done)
 
-	copyHTTPHeader(w.Header(), f.hdr)
-	w.WriteHeader(f.code)
-	_, _ = w.Write(f.body)
+	if r.Context().Err() == nil {
+		copyHTTPHeader(w.Header(), f.hdr)
+		w.WriteHeader(f.code)
+		_, _ = w.Write(f.body)
+	}
 
 	time.AfterFunc(htmlCoalesceTTL, func() {
 		p.mu.Lock()
 		if p.htmlFlights[key] == f {
 			delete(p.htmlFlights, key)
+		}
+		p.mu.Unlock()
+	})
+}
+
+// serveAssetCoalesced fills CDN bytes with a detached upstream context so a WebView
+// remount abort does not cancel the VK fetch; the next remount hits the cache.
+func (p *vkOAuthProxy) serveAssetCoalesced(w http.ResponseWriter, r *http.Request, host, assetPath string) {
+	key := normalizeVkProxyHost(host) + "|" + assetPath + "|" + r.URL.RawQuery
+	p.mu.Lock()
+	if p.assetFlights == nil {
+		p.assetFlights = make(map[string]*htmlFlight)
+	}
+	if f, ok := p.assetFlights[key]; ok {
+		p.mu.Unlock()
+		select {
+		case <-f.done:
+		case <-r.Context().Done():
+			return
+		}
+		if f.ok {
+			if r.Context().Err() != nil {
+				return
+			}
+			copyHTTPHeader(w.Header(), f.hdr)
+			w.WriteHeader(f.code)
+			_, _ = w.Write(f.body)
+			return
+		}
+		p.serveOnce(w, r)
+		return
+	}
+	f := &htmlFlight{done: make(chan struct{})}
+	p.assetFlights[key] = f
+	p.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), assetUpstreamTimeout)
+	defer cancel()
+	rec := httptest.NewRecorder()
+	p.serveOnce(rec, r.Clone(ctx))
+
+	f.code = rec.Code
+	f.hdr = rec.Header().Clone()
+	f.body = append([]byte(nil), rec.Body.Bytes()...)
+	f.ok = f.code >= 200 && f.code < 500 && len(f.body) > 0
+	close(f.done)
+
+	if r.Context().Err() == nil && f.ok {
+		copyHTTPHeader(w.Header(), f.hdr)
+		w.WriteHeader(f.code)
+		_, _ = w.Write(f.body)
+	} else if r.Context().Err() == nil && !f.ok {
+		http.Error(w, "cdn upstream error", http.StatusBadGateway)
+	}
+
+	time.AfterFunc(assetCoalesceTTL, func() {
+		p.mu.Lock()
+		if p.assetFlights[key] == f {
+			delete(p.assetFlights, key)
 		}
 		p.mu.Unlock()
 	})
@@ -1071,6 +1147,13 @@ func copyHTTPHeader(dst, src http.Header) {
 			dst.Add(k, v)
 		}
 	}
+}
+
+func clientRequestCanceled(r *http.Request, err error) bool {
+	if r != nil && r.Context() != nil && errors.Is(r.Context().Err(), context.Canceled) {
+		return true
+	}
+	return err != nil && errors.Is(err, context.Canceled)
 }
 
 func (p *vkOAuthProxy) serveOnce(w http.ResponseWriter, r *http.Request) {
@@ -1148,7 +1231,11 @@ func (p *vkOAuthProxy) serveOnce(w http.ResponseWriter, r *http.Request) {
 			p.markRateLimited(waitSec)
 			emitLog("CSQTT OAuth proxy: 429 %s %s wait=%ds after %s",
 				r.Method, up.Host+up.Path, waitSec, time.Since(started).Round(time.Millisecond))
-			p.writeRateLimitPage(w, retrySelf, waitSec)
+			if isHTMLNavPath(path) {
+				p.writeRateLimitPage(w, retrySelf, waitSec)
+			} else {
+				http.Error(w, "rate limited", http.StatusTooManyRequests)
+			}
 			return
 		}
 		if lastErr == nil && resp != nil {
@@ -1161,20 +1248,39 @@ func (p *vkOAuthProxy) serveOnce(w http.ResponseWriter, r *http.Request) {
 			_ = resp.Body.Close()
 			resp = nil
 		}
+		// WebView remount aborts in-flight asset/document fetches. Retrying on the
+		// same canceled context burns ~4.8s per request and amplifies the storm.
+		if clientRequestCanceled(r, lastErr) {
+			emitLog("CSQTT OAuth proxy: client cancel %s %s (%s)",
+				r.Method, up.Host+up.Path, time.Since(started).Round(time.Millisecond))
+			return
+		}
 		emitLog("CSQTT OAuth proxy: attempt %d/%d %s %s status=%d err=%v (%s)",
 			attempt, maxTransportAttempts, r.Method, up.Host+up.Path, status, lastErr, time.Since(started).Round(time.Millisecond))
 		if attempt < maxTransportAttempts {
 			time.Sleep(time.Duration(attempt) * 1600 * time.Millisecond)
+			if clientRequestCanceled(r, nil) {
+				return
+			}
 		}
 	}
 	if lastErr != nil {
+		if clientRequestCanceled(r, lastErr) {
+			emitLog("CSQTT OAuth proxy: client cancel %s %s after %s",
+				r.Method, up.Host+up.Path, time.Since(started).Round(time.Millisecond))
+			return
+		}
 		detail := lastErr.Error()
+		emitLog("CSQTT OAuth proxy: FAIL %s %s after %s: %v", r.Method, up.Host+up.Path, time.Since(started).Round(time.Millisecond), lastErr)
+		if !isHTMLNavPath(path) {
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
 		title := "VK не ответил вовремя"
 		if strings.Contains(detail, "timeout") || strings.Contains(detail, "Timeout") {
 			title = "Таймаут ответа VK"
 			detail = "Сервер oauth.vk.com долго не отдаёт заголовки. Обычно помогает повтор через несколько секунд (роуминг/нагрузка)."
 		}
-		emitLog("CSQTT OAuth proxy: FAIL %s %s after %s: %v", r.Method, up.Host+up.Path, time.Since(started).Round(time.Millisecond), lastErr)
 		p.writeRetryPage(w, title, detail, retrySelf, 5)
 		return
 	}
@@ -1444,6 +1550,7 @@ func vkOAuthProxyInjectJS(base, doneURL string) string {
 	// Injected first in <head>. Must install Location hooks before VK SPA runs:
 	// rewriteAbsoluteURL turns canonical https://m.vk.ru/login into the loopback
 	// proxy URL; assigning location.href to the current page reloads forever and
-	// leaves a blank WebView (v1.2.27).
-	return `(function(){if(window.__csqttOauthProxy)return;window.__csqttOauthProxy=1;var base=` + string(b) + `;var prefix=` + string(prefix) + `;var done=` + string(d) + `;var marker=` + string(marker) + `;var status=` + string(status) + `;function normPath(p){p=String(p||'');if(p.length>1&&p.charAt(p.length-1)==='/')p=p.slice(0,-1);return p;}function pathKey(u){try{var a=document.createElement('a');a.href=u;return normPath(a.pathname);}catch(e){return '';}}function alreadyHere(u){try{return pathKey(toProxy(String(u||'')))===pathKey(location.href||location.pathname||'');}catch(e){return false;}}function fixBase(){try{var m=String(location.pathname||'').match(/^\/v\/([^\/]+)/);if(!m)return;var want=prefix+m[1]+'/';var b=document.getElementById('base')||document.querySelector('base');if(!b){b=document.createElement('base');b.id='base';(document.head||document.documentElement).insertBefore(b,(document.head||document.documentElement).firstChild);}if(b.getAttribute('href')!==want)b.setAttribute('href',want);}catch(e){}}function preferLogin(){try{var path=String(location.pathname||'');if(/^\/v\/vk\.(ru|com)\/?$/.test(path)){var dest=base+prefix+'m.vk.ru/login';if(!alreadyHere(dest))location.replace(dest);return true;}return false;}catch(e){return false;}}function rootProxy(u){try{if(!u||u.charAt(0)!=='/'||u.charAt(1)==='/')return u;if(u.indexOf(prefix)===0)return u;var m=String(location.pathname||'').match(/^\/v\/([^\/]+)/);if(!m)return u;return prefix+m[1]+u;}catch(e){return u;}}function toProxy(u){try{u=String(u||'');if(u.charAt(0)==='/'&&u.charAt(1)!=='/'){var rp=rootProxy(u);if(rp!==u)return rp;}var a=document.createElement('a');a.href=u;var h=String(a.hostname||'').toLowerCase();if(!h||h==='127.0.0.1'||h==='localhost')return String(u);if(!(/(^|\.)vk\.(com|ru)$/.test(h)||/(^|\.)userapi\.com$/.test(h)||h.indexOf('vk-cdn')>=0||h.indexOf('vkuseraudio')>=0||h.indexOf('vkcc.net')>=0))return String(u);if((h==='vk.ru'||h==='vk.com')&&(!a.pathname||a.pathname==='/')){return base+prefix+'m.'+h+'/login'+(a.search||'')+(a.hash||'');}return base+prefix+h+(a.pathname||'/')+(a.search||'')+(a.hash||'');}catch(e){return String(u);}}function navTo(u,replace){try{var n=toProxy(String(u||''));if(alreadyHere(n))return false;if(replace)location.replace(n);else location.assign(n);return n!==String(u);}catch(e){return false;}}function hoist(){try{if(preferLogin())return;var href=String(location.href||'');if(href.indexOf(marker)>=0)return;if(/^https?:/i.test(href)&&href.indexOf('127.0.0.1')<0&&href.indexOf('localhost')<0){var p=toProxy(href);if(p!==href&&!alreadyHere(p)){location.replace(p);return;}}var h=String(location.hash||'');var s=String(location.search||'');if(h.indexOf('payload=')>=0&&/silent_token/.test(h)){return;}var q='';if(h.indexOf('access_token=')>=0||h.indexOf('error=')>=0){q=h.replace(/^#/,'');}else if(s.indexOf('access_token=')>=0||s.indexOf('error=')>=0){q=s.replace(/^\?/,'');}else{return;}var sep=done.indexOf('?')>=0?'&':'?';location.replace(done+sep+q);}catch(e){}}function pollStatus(){try{if(window.__csqttOauthDone)return;var x=new XMLHttpRequest();x.open('GET',status,true);x.withCredentials=true;x.timeout=10000;x.onload=function(){try{var j=JSON.parse(x.responseText||'{}');if(j&&j.state==='ok'&&j.url){window.__csqttOauthDone=1;location.replace(j.url);}}catch(e){}};x.send();}catch(e){}}function rewriteAttrs(){try{var nodes=document.querySelectorAll('a[href],form[action],link[href],script[src],img[src],iframe[src]');for(var i=0;i<nodes.length;i++){var el=nodes[i];var attr='href';if(el.tagName==='FORM')attr='action';else if(el.tagName==='SCRIPT'||el.tagName==='IMG'||el.tagName==='IFRAME')attr='src';var cur=el.getAttribute(attr);if(!cur)continue;var n=toProxy(cur);if(n!==cur)el.setAttribute(attr,n);}}catch(e){}}function hookLocation(){try{var _as=Location.prototype.assign,_rp=Location.prototype.replace;Location.prototype.assign=function(u){var n=toProxy(String(u));if(alreadyHere(n))return;return _as.call(this,n);};Location.prototype.replace=function(u){var n=toProxy(String(u));if(alreadyHere(n))return;return _rp.call(this,n);};var desc=Object.getOwnPropertyDescriptor(Location.prototype,'href');if(desc&&desc.set&&desc.get){Object.defineProperty(Location.prototype,'href',{configurable:true,enumerable:true,get:function(){return desc.get.call(this);},set:function(v){var n=toProxy(String(v));if(alreadyHere(n))return;desc.set.call(this,n);}});}}catch(e){}try{var _ps=history.pushState,_rs=history.replaceState;history.pushState=function(s,t,u){if(u!=null&&u!==''){var n=toProxy(String(u));if(alreadyHere(n))return;if(n!==String(u))u=n;}return _ps.call(this,s,t,u);};history.replaceState=function(s,t,u){if(u!=null&&u!==''){var n=toProxy(String(u));if(alreadyHere(n))return;if(n!==String(u))u=n;}return _rs.call(this,s,t,u);};}catch(e){}}function hookNavigation(){try{if(!window.navigation||typeof navigation.addEventListener!=='function')return;navigation.addEventListener('navigate',function(e){try{var dest=e.destination&&e.destination.url;if(!dest)return;var n=toProxy(String(dest));if(n===String(dest))return;if(alreadyHere(n)){e.preventDefault();return;}if(typeof e.intercept==='function'){e.intercept({handler:function(){if(e.navigationType==='replace')location.replace(n);else location.assign(n);}});return;}e.preventDefault();if(e.navigationType==='replace')location.replace(n);else location.assign(n);}catch(err){}});}catch(e){}}document.addEventListener('click',function(e){var t=e.target;while(t&&t.tagName!=='A')t=t.parentNode;if(!t||!t.href)return;var raw=t.getAttribute('href')||t.href;var n=toProxy(raw);if(n!==raw){e.preventDefault();if(!alreadyHere(n))location.assign(n);}},true);document.addEventListener('submit',function(e){try{var f=e.target;if(!f||!f.action)return;var n=toProxy(f.getAttribute('action')||f.action);if(n!==(f.getAttribute('action')||f.action))f.action=n;}catch(err){}},true);function hookNet(){try{var of=window.fetch;if(typeof of==='function'){window.fetch=function(input,init){try{var u=(typeof input==='string')?input:(input&&input.url);if(u){var n=toProxy(String(u));if(n!==String(u)){if(typeof input==='string')input=n;else if(typeof Request!=='undefined')input=new Request(n,input);}}}catch(e){}return of.call(this,input,init);};}}catch(e){}try{var XO=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(){try{if(typeof arguments[1]==='string')arguments[1]=toProxy(arguments[1]);}catch(e){}return XO.apply(this,arguments);};}catch(e){}}hookLocation();hookNavigation();hookNet();fixBase();hoist();rewriteAttrs();pollStatus();window.addEventListener('hashchange',hoist);setInterval(function(){fixBase();hoist();rewriteAttrs();pollStatus();},800);})();`
+	// leaves a blank WebView (v1.2.27). v1.2.30: freeze login-shell remounts and
+	// never turn Navigation API rewrites into location.assign full reloads.
+	return `(function(){if(window.__csqttOauthProxy)return;window.__csqttOauthProxy=1;var base=` + string(b) + `;var prefix=` + string(prefix) + `;var done=` + string(d) + `;var marker=` + string(marker) + `;var status=` + string(status) + `;var navStamp=0;var shellFreezeUntil=Date.now()+8000;function normPath(p){p=String(p||'');if(p.length>1&&p.charAt(p.length-1)==='/')p=p.slice(0,-1);return p;}function pathKey(u){try{var a=document.createElement('a');a.href=u;return normPath(a.pathname);}catch(e){return '';}}function isLoginShell(pk){pk=String(pk||'');return /\/m\.vk\.(ru|com)(\/login)?$/.test(pk)||/\/v\/vk\.(ru|com)$/.test(pk);}function alreadyHere(u){try{return pathKey(toProxy(String(u||'')))===pathKey(location.href||location.pathname||'');}catch(e){return false;} }function allowFullNav(u){try{var n=toProxy(String(u||''));if(alreadyHere(n))return false;var cur=pathKey(location.href),nxt=pathKey(n);var now=Date.now();if(cur===nxt)return false;if(/\/v\/vk\.(ru|com)$/.test(cur)&&/\/login$/.test(nxt)){navStamp=now;return true;}if(isLoginShell(cur)&&isLoginShell(nxt)&&now<shellFreezeUntil)return false;if(isLoginShell(cur)&&isLoginShell(nxt)&&now-navStamp<8000)return false;navStamp=now;return true;}catch(e){return true;}}function fixBase(){try{var m=String(location.pathname||'').match(/^\/v\/([^\/]+)/);if(!m)return;var want=prefix+m[1]+'/';var b=document.getElementById('base')||document.querySelector('base');if(!b){b=document.createElement('base');b.id='base';(document.head||document.documentElement).insertBefore(b,(document.head||document.documentElement).firstChild);}if(b.getAttribute('href')!==want)b.setAttribute('href',want);}catch(e){}}function preferLogin(){try{var path=String(location.pathname||'');if(/^\/v\/vk\.(ru|com)\/?$/.test(path)){var dest=base+prefix+'m.vk.ru/login';if(!alreadyHere(dest)){navStamp=Date.now();location.replace(dest);}return true;}return false;}catch(e){return false;}}function rootProxy(u){try{if(!u||u.charAt(0)!=='/'||u.charAt(1)==='/')return u;if(u.indexOf(prefix)===0)return u;var m=String(location.pathname||'').match(/^\/v\/([^\/]+)/);if(!m)return u;return prefix+m[1]+u;}catch(e){return u;}}function toProxy(u){try{u=String(u||'');if(u.charAt(0)==='/'&&u.charAt(1)!=='/'){var rp=rootProxy(u);if(rp!==u)return rp;}var a=document.createElement('a');a.href=u;var h=String(a.hostname||'').toLowerCase();if(!h||h==='127.0.0.1'||h==='localhost')return String(u);if(!(/(^|\.)vk\.(com|ru)$/.test(h)||/(^|\.)userapi\.com$/.test(h)||h.indexOf('vk-cdn')>=0||h.indexOf('vkuseraudio')>=0||h.indexOf('vkcc.net')>=0))return String(u);if((h==='vk.ru'||h==='vk.com')&&(!a.pathname||a.pathname==='/')){return base+prefix+'m.'+h+'/login'+(a.search||'')+(a.hash||'');}return base+prefix+h+(a.pathname||'/')+(a.search||'')+(a.hash||'');}catch(e){return String(u);}}function navTo(u,replace){try{var n=toProxy(String(u||''));if(!allowFullNav(n))return false;if(replace)location.replace(n);else location.assign(n);return n!==String(u);}catch(e){return false;}}function hoist(){try{if(preferLogin())return;var href=String(location.href||'');if(href.indexOf(marker)>=0)return;if(/^https?:/i.test(href)&&href.indexOf('127.0.0.1')<0&&href.indexOf('localhost')<0){var p=toProxy(href);if(p!==href&&allowFullNav(p)){location.replace(p);return;}}var h=String(location.hash||'');var s=String(location.search||'');if(h.indexOf('payload=')>=0&&/silent_token/.test(h)){return;}var q='';if(h.indexOf('access_token=')>=0||h.indexOf('error=')>=0){q=h.replace(/^#/,'');}else if(s.indexOf('access_token=')>=0||s.indexOf('error=')>=0){q=s.replace(/^\?/,'');}else{return;}var sep=done.indexOf('?')>=0?'&':'?';location.replace(done+sep+q);}catch(e){}}function pollStatus(){try{if(window.__csqttOauthDone)return;var x=new XMLHttpRequest();x.open('GET',status,true);x.withCredentials=true;x.timeout=10000;x.onload=function(){try{var j=JSON.parse(x.responseText||'{}');if(j&&j.state==='ok'&&j.url){window.__csqttOauthDone=1;location.replace(j.url);}}catch(e){}};x.send();}catch(e){}}function rewriteAttrs(){try{var nodes=document.querySelectorAll('a[href],form[action],link[href],script[src],img[src],iframe[src]');for(var i=0;i<nodes.length;i++){var el=nodes[i];var attr='href';if(el.tagName==='FORM')attr='action';else if(el.tagName==='SCRIPT'||el.tagName==='IMG'||el.tagName==='IFRAME')attr='src';var cur=el.getAttribute(attr);if(!cur)continue;var n=toProxy(cur);if(n!==cur)el.setAttribute(attr,n);}}catch(e){}}function hookLocation(){try{var _as=Location.prototype.assign,_rp=Location.prototype.replace;Location.prototype.assign=function(u){var n=toProxy(String(u));if(!allowFullNav(n))return;return _as.call(this,n);};Location.prototype.replace=function(u){var n=toProxy(String(u));if(!allowFullNav(n))return;return _rp.call(this,n);};try{Location.prototype.reload=function(){};}catch(e){}var desc=Object.getOwnPropertyDescriptor(Location.prototype,'href');if(desc&&desc.set&&desc.get){Object.defineProperty(Location.prototype,'href',{configurable:true,enumerable:true,get:function(){return desc.get.call(this);},set:function(v){var n=toProxy(String(v));if(!allowFullNav(n))return;desc.set.call(this,n);}});}}catch(e){}try{var _ps=history.pushState,_rs=history.replaceState;history.pushState=function(s,t,u){if(u!=null&&u!==''){var n=toProxy(String(u));if(alreadyHere(n))return;if(n!==String(u))u=n;}return _ps.call(this,s,t,u);};history.replaceState=function(s,t,u){if(u!=null&&u!==''){var n=toProxy(String(u));if(alreadyHere(n))return;if(n!==String(u))u=n;}return _rs.call(this,s,t,u);};}catch(e){}}function hookNavigation(){try{if(!window.navigation||typeof navigation.addEventListener!=='function')return;navigation.addEventListener('navigate',function(e){try{var dest=e.destination&&e.destination.url;if(!dest)return;var n=toProxy(String(dest));if(alreadyHere(n)||pathKey(n)===pathKey(location.href)||!allowFullNav(n)){e.preventDefault();return;}if(n===String(dest))return;if(typeof e.intercept==='function'){e.intercept({handler:function(){if(e.navigationType==='replace')location.replace(n);else location.assign(n);}});return;}e.preventDefault();if(e.navigationType==='replace')location.replace(n);else location.assign(n);}catch(err){}});}catch(e){}}document.addEventListener('click',function(e){var t=e.target;while(t&&t.tagName!=='A')t=t.parentNode;if(!t||!t.href)return;var raw=t.getAttribute('href')||t.href;var n=toProxy(raw);if(n!==raw){e.preventDefault();if(allowFullNav(n))location.assign(n);}},true);document.addEventListener('submit',function(e){try{var f=e.target;if(!f||!f.action)return;var n=toProxy(f.getAttribute('action')||f.action);if(n!==(f.getAttribute('action')||f.action))f.action=n;}catch(err){}},true);function hookNet(){try{var of=window.fetch;if(typeof of==='function'){window.fetch=function(input,init){try{var u=(typeof input==='string')?input:(input&&input.url);if(u){var n=toProxy(String(u));if(n!==String(u)){if(typeof input==='string')input=n;else if(typeof Request!=='undefined')input=new Request(n,input);}}}catch(e){}return of.call(this,input,init);};}}catch(e){}try{var XO=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(){try{if(typeof arguments[1]==='string')arguments[1]=toProxy(arguments[1]);}catch(e){}return XO.apply(this,arguments);};}catch(e){}}hookLocation();hookNavigation();hookNet();fixBase();hoist();rewriteAttrs();pollStatus();window.addEventListener('hashchange',hoist);setInterval(function(){fixBase();hoist();rewriteAttrs();pollStatus();},800);})();`
 }

@@ -52,6 +52,10 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
+          # Do not delete/replace assets already uploaded (avoids GitHub 500
+          # races when a release was created manually before CI finishes).
+          overwrite_files: false
+          fail_on_unmatched_files: true
           body: |
             Android module bundles for AntiNet (all ABIs).
             Manifest: `antinet-module.json` (also on `main` for auto-update).
