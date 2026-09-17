@@ -133,7 +133,7 @@ func TestResolveUpstreamLocation(t *testing.T) {
 
 func TestVkOAuthProxyInjectJS(t *testing.T) {
 	js := vkOAuthProxyInjectJS("http://127.0.0.1:50999", "http://127.0.0.1:50999/csqtt-vk-oauth-done")
-	for _, part := range []string{vkOAuthCallbackPath, vkOAuthProxyPrefix, "access_token=", "127.0.0.1:50999", "toProxy", "rootProxy", vkOAuthStatusPath, "pollStatus", "fixBase", "preferLogin"} {
+	for _, part := range []string{vkOAuthCallbackPath, vkOAuthProxyPrefix, "access_token=", "127.0.0.1:50999", "toProxy", "rootProxy", vkOAuthStatusPath, "pollStatus", "fixBase", "preferLogin", "alreadyHere", "hookLocation"} {
 		if !strings.Contains(js, part) {
 			t.Fatalf("inject JS missing %q", part)
 		}
@@ -166,8 +166,9 @@ func TestStartVkOAuthProxyServerLocalOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer stop()
-	if len(starts) != 1 || !strings.Contains(starts[0], vkOAuthStartPath) {
-		t.Fatalf("starts=%v", starts)
+	loginPath := vkOAuthProxyPrefix + vkOAuthLoginHost + vkOAuthLoginPath
+	if len(starts) != 1 || !strings.Contains(starts[0], loginPath) {
+		t.Fatalf("starts=%v want …%s", starts, loginPath)
 	}
 	if !strings.Contains(done, vkOAuthCallbackPath) {
 		t.Fatalf("done=%q", done)
@@ -196,17 +197,19 @@ func TestStartVkOAuthProxyServerLocalOnly(t *testing.T) {
 		t.Fatalf("done status=%d body=%q", res.StatusCode, body)
 	}
 
-	res, err = client.Get(starts[0])
+	// Legacy start path redirects into proxied login (no intermediate placeholder HTML).
+	base := strings.TrimSuffix(starts[0], loginPath)
+	res, err = client.Get(base + vkOAuthStartPath)
 	if err != nil {
-		t.Fatalf("start: %v", err)
+		t.Fatalf("start path: %v", err)
 	}
 	body, _ = io.ReadAll(res.Body)
 	_ = res.Body.Close()
-	if res.StatusCode != 200 {
-		t.Fatalf("start want 200 HTML, got %d", res.StatusCode)
+	if res.StatusCode != http.StatusFound {
+		t.Fatalf("start path want 302, got %d body=%q", res.StatusCode, body)
 	}
-	if !strings.Contains(string(body), "/v/"+vkOAuthLoginHost+vkOAuthLoginPath) {
-		t.Fatalf("start must open proxied m.vk.ru/login, body=%q", body)
+	if loc := res.Header.Get("Location"); !strings.Contains(loc, loginPath) {
+		t.Fatalf("start Location=%q want %s", loc, loginPath)
 	}
 
 	statusURL := strings.Replace(done, vkOAuthCallbackPath, vkOAuthStatusPath, 1)
