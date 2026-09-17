@@ -133,7 +133,7 @@ func TestResolveUpstreamLocation(t *testing.T) {
 
 func TestVkOAuthProxyInjectJS(t *testing.T) {
 	js := vkOAuthProxyInjectJS("http://127.0.0.1:50999", "http://127.0.0.1:50999/csqtt-vk-oauth-done")
-	for _, part := range []string{vkOAuthCallbackPath, vkOAuthProxyPrefix, "access_token=", "127.0.0.1:50999", "toProxy", "rootProxy", vkOAuthStatusPath, "pollStatus", "fixBase", "preferLogin", "alreadyHere", "hookLocation"} {
+	for _, part := range []string{vkOAuthCallbackPath, vkOAuthProxyPrefix, "access_token=", "127.0.0.1:50999", "toProxy", "rootProxy", vkOAuthStatusPath, "pollStatus", "fixBase", "preferLogin", "alreadyHere", "hookLocation", "hookNavigation", "pathKey(toProxy"} {
 		if !strings.Contains(js, part) {
 			t.Fatalf("inject JS missing %q", part)
 		}

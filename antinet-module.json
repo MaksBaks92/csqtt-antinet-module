@@ -1,15 +1,15 @@
 {
-  "version": "1.2.28",
+  "version": "1.2.29",
   "android": {
-    "arm64-v8a": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.28/csqtt-android-arm64-v8a.zip",
-    "armeabi-v7a": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.28/csqtt-android-armeabi-v7a.zip",
-    "x86": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.28/csqtt-android-x86.zip",
-    "x86_64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.28/csqtt-android-x86_64.zip"
+    "arm64-v8a": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.29/csqtt-android-arm64-v8a.zip",
+    "armeabi-v7a": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.29/csqtt-android-armeabi-v7a.zip",
+    "x86": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.29/csqtt-android-x86.zip",
+    "x86_64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.29/csqtt-android-x86_64.zip"
   },
   "desktop": {
     "windows_amd64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.0.0/csqtt-windows_amd64.zip",
     "linux_amd64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.0.0/csqtt-linux_amd64.zip",
     "darwin_amd64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.0.0/csqtt-darwin_amd64.zip"
   },
-  "changelog": "1.2.28: stop VK OAuth WebView reload loop (Location hooks + open /v/m.vk.ru/login directly). 1.2.27: silence unused rust warnings. 1.2.26: m.vk.ru/login + base href."
+  "changelog": "1.2.29: fix VK OAuth remount storm (pathname-only alreadyHere, Navigation API hook, HTML coalesce, CDN-safe miss recovery). 1.2.28: Location hooks + open /v/m.vk.ru/login directly. 1.2.27: silence unused rust warnings. 1.2.26: m.vk.ru/login + base href."
 }
