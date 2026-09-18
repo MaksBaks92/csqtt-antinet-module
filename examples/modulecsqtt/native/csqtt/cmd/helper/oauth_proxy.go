@@ -28,9 +28,9 @@ const (
 	vkOAuthStartPath    = "/csqtt-vk-oauth-start"
 	vkOAuthStatusPath   = "/csqtt-vk-oauth-status"
 	vkOAuthProxyMaxBody = 2 << 20
-	// Mobile login shell. Opening vk.ru/ used to 302→m.vk.ru and hop→WebView (remount storm);
-	// start on m.vk.ru so the document URL matches the body without a bounce.
-	vkOAuthLoginHost = "m.vk.ru"
+	// Start on VK ID (not m.vk.ru SPA). Soft-shell m.vk.ru/ under loopback remounts forever
+	// (coalesce HIT + recover-miss images) even with soft-root and <base> pin — see 1.2.35 logs.
+	vkOAuthLoginHost = "id.vk.ru"
 	vkOAuthLoginPath = "/"
 )
 
@@ -149,8 +149,9 @@ func isVkStaticCDNHost(host string) bool {
 	return false
 }
 
-// isSoftVkShellHost is the public mobile/desktop login shell (vk.ru ↔ m.vk.ru).
+// isSoftVkShellHost is the public mobile/desktop feed SPA (vk.ru ↔ m.vk.ru).
 // Soft-serving a 302 body under the request /v/ path avoids hop→WebView remounts.
+// Document roots on these hosts are bypassed to id.vk.ru (see softServeLogin).
 func isSoftVkShellHost(host string) bool {
 	switch normalizeVkProxyHost(host) {
 	case "vk.ru", "vk.com", "m.vk.ru", "m.vk.com":
@@ -158,6 +159,12 @@ func isSoftVkShellHost(host string) bool {
 	default:
 		return false
 	}
+}
+
+// softShellDocumentRoot is true for the SPA entry document (not /feed/… etc.).
+func softShellDocumentRoot(path string) bool {
+	p := strings.TrimSpace(path)
+	return p == "" || p == "/"
 }
 
 // isHTMLNavPath is true for SPA/document routes (no static file extension).
@@ -352,14 +359,23 @@ func cloneURLWithPath(u *url.URL, path string) *url.URL {
 // AntiNet WebView document and storms coalesce HIT / recover-miss forever.
 func (p *vkOAuthProxy) softServeRoot(w http.ResponseWriter, r *http.Request) {
 	host, via := p.resolveMissHost("/", r.Header.Get("Referer"))
-	if host == "" {
+	if host == "" || isSoftVkShellHost(host) {
+		// Never soft-root into the feed SPA — it remounts under loopback.
 		host = vkOAuthLoginHost
-		via = "default"
+		via = "login"
 	}
 	r2 := r.Clone(r.Context())
 	r2.URL = cloneURLWithPath(r.URL, vkOAuthProxyPrefix+host+"/")
 	emitLog("CSQTT OAuth proxy: soft-root → /v/%s/ (%s)", host, via)
 	p.serve(w, r2)
+}
+
+// softServeLogin remaps soft-shell SPA document roots to id.vk.ru without a 302.
+func (p *vkOAuthProxy) softServeLogin(w http.ResponseWriter, r *http.Request, fromHost string) {
+	r2 := r.Clone(r.Context())
+	r2.URL = cloneURLWithPath(r.URL, vkOAuthProxyPrefix+vkOAuthLoginHost+vkOAuthLoginPath)
+	emitLog("CSQTT OAuth proxy: soft-shell SPA bypass %s → %s", fromHost, vkOAuthLoginHost)
+	p.serveHTMLCoalesced(w, r2, vkOAuthLoginHost, vkOAuthLoginPath)
 }
 
 // proxyHostFromReferer recovers /v/<host>/… from a loopback Referer so root-relative
@@ -1071,6 +1087,11 @@ func (p *vkOAuthProxy) rememberHost(host string) {
 func (p *vkOAuthProxy) serve(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		if host, docPath, ok := unwrapVkProxyPath(r.URL.Path); ok {
+			// Do not ship the m.vk.ru/vk.ru feed SPA under loopback — it remounts forever.
+			if isHTMLNavPath(docPath) && isSoftVkShellHost(host) && softShellDocumentRoot(docPath) {
+				p.softServeLogin(w, r, host)
+				return
+			}
 			if isHTMLNavPath(docPath) {
 				p.serveHTMLCoalesced(w, r, host, docPath)
 				return

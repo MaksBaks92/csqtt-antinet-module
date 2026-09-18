@@ -393,29 +393,20 @@ func TestOAuthProxyHopToWebView(t *testing.T) {
 	}
 }
 
-func TestOAuthProxySoftServeNoHop(t *testing.T) {
+func TestOAuthProxySoftShellSPABypassToID(t *testing.T) {
 	var hits []string
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		hits = append(hits, r.URL.Host+r.URL.Path)
-		switch {
-		case r.URL.Host == "vk.ru" && r.URL.Path == "/":
-			return &http.Response{
-				StatusCode: http.StatusFound,
-				Header:     http.Header{"Location": []string{"https://m.vk.ru/"}},
-				Body:       io.NopCloser(strings.NewReader("")),
-				Request:    r,
-			}, nil
-		case r.URL.Host == "m.vk.ru" && r.URL.Path == "/":
+		if r.URL.Host == "id.vk.ru" && (r.URL.Path == "/" || r.URL.Path == "") {
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
-				Body:       io.NopCloser(strings.NewReader("<html><head></head><body>mobile</body></html>")),
+				Body:       io.NopCloser(strings.NewReader("<html><head></head><body>vk-id</body></html>")),
 				Request:    r,
 			}, nil
-		default:
-			t.Fatalf("unexpected upstream %s", r.URL.String())
-			return nil, nil
 		}
+		t.Fatalf("unexpected upstream %s (soft-shell SPA must not be fetched)", r.URL.String())
+		return nil, nil
 	})
 	p := &vkOAuthProxy{
 		base: "http://127.0.0.1:9",
@@ -426,22 +417,25 @@ func TestOAuthProxySoftServeNoHop(t *testing.T) {
 			},
 		},
 	}
-	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9/v/vk.ru/", nil)
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9/v/m.vk.ru/", nil)
 	rr := httptest.NewRecorder()
 	p.serve(rr, req)
 	if rr.Code != http.StatusOK {
-		t.Fatalf("soft-serve want 200, got code=%d loc=%q body=%s hits=%v",
+		t.Fatalf("bypass want 200, got code=%d loc=%q body=%s hits=%v",
 			rr.Code, rr.Header().Get("Location"), rr.Body.String(), hits)
 	}
 	if loc := rr.Header().Get("Location"); loc != "" {
-		t.Fatalf("soft-serve must not hop WebView, Location=%q hits=%v", loc, hits)
+		t.Fatalf("bypass must not hop WebView, Location=%q hits=%v", loc, hits)
 	}
 	body := rr.Body.String()
-	if !strings.Contains(body, `href="/v/m.vk.ru/"`) {
-		t.Fatalf("want <base> for m.vk.ru, body=%s hits=%v", body, hits)
+	if !strings.Contains(body, `href="/v/id.vk.ru/"`) {
+		t.Fatalf("want <base> for id.vk.ru, body=%s hits=%v", body, hits)
 	}
-	if len(hits) < 2 {
-		t.Fatalf("expected follow vk.ru→m.vk.ru, hits=%v", hits)
+	if !strings.Contains(body, "vk-id") {
+		t.Fatalf("want id body, got %s hits=%v", body, hits)
+	}
+	if len(hits) != 1 || hits[0] != "id.vk.ru/" {
+		t.Fatalf("hits=%v want [id.vk.ru/]", hits)
 	}
 }
 
@@ -509,12 +503,12 @@ func TestSoftShellAssetCoalesceSurvivesCancel(t *testing.T) {
 	}
 }
 
-// GET / must soft-serve /v/m.vk.ru/ (200) — a 302 remounts the AntiNet WebView forever.
+// GET / must soft-serve /v/id.vk.ru/ (200) — never the m.vk.ru SPA, and never a 302.
 func TestSoftRootNo302(t *testing.T) {
 	var hits []string
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		hits = append(hits, r.URL.Host+r.URL.Path)
-		if r.URL.Host == "m.vk.ru" && r.URL.Path == "/" {
+		if r.URL.Host == "id.vk.ru" && (r.URL.Path == "/" || r.URL.Path == "") {
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
@@ -546,14 +540,14 @@ func TestSoftRootNo302(t *testing.T) {
 		t.Fatalf("soft-root must not 302, Location=%q hits=%v", loc, hits)
 	}
 	body := rr.Body.String()
-	if !strings.Contains(body, `href="/v/m.vk.ru/"`) {
-		t.Fatalf("want <base> for m.vk.ru, body=%s hits=%v", body, hits)
+	if !strings.Contains(body, `href="/v/id.vk.ru/"`) {
+		t.Fatalf("want <base> for id.vk.ru, body=%s hits=%v", body, hits)
 	}
 	if !strings.Contains(body, "soft-root") {
 		t.Fatalf("want soft-root body, got %s hits=%v", body, hits)
 	}
-	if len(hits) != 1 || hits[0] != "m.vk.ru/" {
-		t.Fatalf("hits=%v want [m.vk.ru/]", hits)
+	if len(hits) != 1 || hits[0] != "id.vk.ru/" {
+		t.Fatalf("hits=%v want [id.vk.ru/]", hits)
 	}
 }
 

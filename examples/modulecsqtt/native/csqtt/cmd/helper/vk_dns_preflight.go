@@ -9,7 +9,7 @@ func logVkDNSHint(resolver *protectedResolver) {
 	if resolver == nil {
 		return
 	}
-	hosts := []string{"oauth.vk.com", "api.vk.com", "m.vk.com", "login.vk.com"}
+	hosts := []string{"oauth.vk.com", "api.vk.com", "id.vk.ru", "login.vk.com", "m.vk.com"}
 	parts := make([]string, 0, len(hosts))
 	for _, h := range hosts {
 		ips, err := resolver.LookupHost(h)
