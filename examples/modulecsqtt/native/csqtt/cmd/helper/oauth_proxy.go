@@ -298,7 +298,8 @@ func startVkOAuthProxyServer() (startURLs []string, doneURL string, stop func(),
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		if path == "/" || path == "" {
-			http.Redirect(w, r, loginPath, http.StatusFound)
+			// Never 302 here — AntiNet treats Location as a full navigation and remounts the SPA.
+			p.softServeRoot(w, r)
 			return
 		}
 		if strings.HasPrefix(path, vkOAuthProxyPrefix) {
@@ -345,6 +346,20 @@ func cloneURLWithPath(u *url.URL, path string) *url.URL {
 	out.Path = path
 	out.RawPath = ""
 	return &out
+}
+
+// softServeRoot remaps GET / → /v/<host>/ without a 302. A Location bounce remounts the
+// AntiNet WebView document and storms coalesce HIT / recover-miss forever.
+func (p *vkOAuthProxy) softServeRoot(w http.ResponseWriter, r *http.Request) {
+	host, via := p.resolveMissHost("/", r.Header.Get("Referer"))
+	if host == "" {
+		host = vkOAuthLoginHost
+		via = "default"
+	}
+	r2 := r.Clone(r.Context())
+	r2.URL = cloneURLWithPath(r.URL, vkOAuthProxyPrefix+host+"/")
+	emitLog("CSQTT OAuth proxy: soft-root → /v/%s/ (%s)", host, via)
+	p.serve(w, r2)
 }
 
 // proxyHostFromReferer recovers /v/<host>/… from a loopback Referer so root-relative
@@ -1604,5 +1619,7 @@ func vkOAuthProxyInjectJS(base, doneURL string) string {
 	// cannot resolve oauth.vk.com (VPN DNS), so pages are mirrored under /v/ — but we do
 	// NOT rewrite Location/Navigation (that caused remount storms). After remixsid the
 	// helper scrapes authorize off-TUN; inject only polls status and hoists #access_token.
-	return `(function(){if(window.__csqttOauthProxy)return;window.__csqttOauthProxy=1;var base=` + string(b) + `;var done=` + string(d) + `;var marker=` + string(marker) + `;var status=` + string(status) + `;function hoist(){try{var href=String(location.href||'');if(href.indexOf(marker)>=0)return;var h=String(location.hash||'');var s=String(location.search||'');var q='';if(h.indexOf('access_token=')>=0||h.indexOf('error=')>=0){q=h.replace(/^#/,'');}else if(s.indexOf('access_token=')>=0||s.indexOf('error=')>=0){q=s.replace(/^\?/,'');}else{return;}var sep=done.indexOf('?')>=0?'&':'?';location.replace(done+sep+q);}catch(e){}}function pollStatus(){try{if(window.__csqttOauthDone)return;var x=new XMLHttpRequest();x.open('GET',status,true);x.withCredentials=true;x.timeout=15000;x.onload=function(){try{var j=JSON.parse(x.responseText||'{}');if(j&&j.state==='ok'&&j.url){window.__csqttOauthDone=1;location.replace(j.url);}}catch(e){}};x.send();}catch(e){}}hoist();pollStatus();window.addEventListener('hashchange',hoist);setInterval(function(){hoist();pollStatus();},1000);})();`
+	// pinBase keeps <base href="/v/<host>/"> alive — VK SPA clears/rewrites empty <base id="base">
+	// and then root-relative /images/… hit 127.0.0.1/images (recover-miss storm).
+	return `(function(){if(window.__csqttOauthProxy)return;window.__csqttOauthProxy=1;var base=` + string(b) + `;var done=` + string(d) + `;var marker=` + string(marker) + `;var status=` + string(status) + `;function proxyBaseHref(){try{var m=String(location.pathname||'').match(/^\/v\/([^\/]+)\//);return m?'/v/'+m[1]+'/':'';}catch(e){return '';}}function pinBase(){try{var href=proxyBaseHref();if(!href)return;var el=document.getElementById('base')||document.querySelector('base');if(!el){el=document.createElement('base');el.id='base';var h=document.head||document.documentElement;if(h)h.insertBefore(el,h.firstChild);}if(el.getAttribute('href')!==href)el.setAttribute('href',href);}catch(e){}}function hoist(){try{var href=String(location.href||'');if(href.indexOf(marker)>=0)return;var h=String(location.hash||'');var s=String(location.search||'');var q='';if(h.indexOf('access_token=')>=0||h.indexOf('error=')>=0){q=h.replace(/^#/,'');}else if(s.indexOf('access_token=')>=0||s.indexOf('error=')>=0){q=s.replace(/^\?/,'');}else{return;}var sep=done.indexOf('?')>=0?'&':'?';location.replace(done+sep+q);}catch(e){}}function pollStatus(){try{if(window.__csqttOauthDone)return;var x=new XMLHttpRequest();x.open('GET',status,true);x.withCredentials=true;x.timeout=15000;x.onload=function(){try{var j=JSON.parse(x.responseText||'{}');if(j&&j.state==='ok'&&j.url){window.__csqttOauthDone=1;location.replace(j.url);}}catch(e){}};x.send();}catch(e){}}pinBase();hoist();pollStatus();try{var mo=new MutationObserver(function(){pinBase();});mo.observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:['href']});}catch(e){}window.addEventListener('hashchange',hoist);setInterval(function(){pinBase();hoist();pollStatus();},1000);})();`
 }

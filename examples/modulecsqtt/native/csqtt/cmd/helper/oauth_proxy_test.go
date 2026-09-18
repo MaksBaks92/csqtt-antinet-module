@@ -509,6 +509,54 @@ func TestSoftShellAssetCoalesceSurvivesCancel(t *testing.T) {
 	}
 }
 
+// GET / must soft-serve /v/m.vk.ru/ (200) — a 302 remounts the AntiNet WebView forever.
+func TestSoftRootNo302(t *testing.T) {
+	var hits []string
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		hits = append(hits, r.URL.Host+r.URL.Path)
+		if r.URL.Host == "m.vk.ru" && r.URL.Path == "/" {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
+				Body:       io.NopCloser(strings.NewReader("<html><head></head><body>soft-root</body></html>")),
+				Request:    r,
+			}, nil
+		}
+		t.Fatalf("unexpected upstream %s", r.URL.String())
+		return nil, nil
+	})
+	p := &vkOAuthProxy{
+		base: "http://127.0.0.1:9",
+		client: &http.Client{
+			Transport: rt,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9/", nil)
+	req.Header.Set("Referer", "http://127.0.0.1:9/v/m.vk.ru/")
+	rr := httptest.NewRecorder()
+	p.softServeRoot(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("soft-root want 200, got code=%d loc=%q body=%s hits=%v",
+			rr.Code, rr.Header().Get("Location"), rr.Body.String(), hits)
+	}
+	if loc := rr.Header().Get("Location"); loc != "" {
+		t.Fatalf("soft-root must not 302, Location=%q hits=%v", loc, hits)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, `href="/v/m.vk.ru/"`) {
+		t.Fatalf("want <base> for m.vk.ru, body=%s hits=%v", body, hits)
+	}
+	if !strings.Contains(body, "soft-root") {
+		t.Fatalf("want soft-root body, got %s hits=%v", body, hits)
+	}
+	if len(hits) != 1 || hits[0] != "m.vk.ru/" {
+		t.Fatalf("hits=%v want [m.vk.ru/]", hits)
+	}
+}
+
 func TestResolveMissHostPreferReferer(t *testing.T) {
 	p := &vkOAuthProxy{base: "http://127.0.0.1:9"}
 	p.rememberHost("vk.ru")
@@ -563,7 +611,7 @@ func TestOAuthProxyHopComToRuAuthorize(t *testing.T) {
 
 func TestVkOAuthProxyInjectJSMinimal(t *testing.T) {
 	js := vkOAuthProxyInjectJS("http://127.0.0.1:9", "http://127.0.0.1:9/csqtt-vk-oauth-done")
-	for _, needle := range []string{"pollStatus", "hoist", "access_token=", vkOAuthStatusPath} {
+	for _, needle := range []string{"pollStatus", "hoist", "pinBase", "MutationObserver", "access_token=", vkOAuthStatusPath} {
 		if !strings.Contains(js, needle) {
 			t.Fatalf("inject missing %q", needle)
 		}
