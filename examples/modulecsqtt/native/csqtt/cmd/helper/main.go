@@ -405,13 +405,6 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 
 	resolver := newProtectedResolver(cfg["DNS_SERVERS"], protectPath)
 	configureVkHTTP(protectPath, resolver)
-	proxyURL, stopProxy, perr := startProtectHTTPProxy(protectPath, resolver)
-	if perr != nil {
-		emitLog("CSQTT: off-TUN HTTP proxy: %v", perr)
-		stopProxy = func() {}
-	} else {
-		defer stopProxy()
-	}
 
 	hashMode, authMode := normalizeVkModes(cfg["SETTING_hashMode"], cfg["SETTING_vkAuthMode"])
 	if normalizeHashMode(cfg["SETTING_hashMode"]) == "manual" && normalizeVkAuthMode(cfg["SETTING_vkAuthMode"]) == "auto_js" {
@@ -422,6 +415,7 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	allowRedistrib := false
 	var hashes []string
 	seedHashes := uniqHashes(append(collectManualHashes(cfg, link.Hashes), persisted.ManualHashes...))
+	// Token FIRST (native CSQTT order): login → remixsid → scrape → save. Engine/SOCKS later.
 	if needsVkOAuth(hashMode, authMode) {
 		tok, terr := ensureVkToken(cfg["MODULE_STATE"], profileDir, s, resolver)
 		if terr != nil {
@@ -511,6 +505,15 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	} else if hashMode == "manual" {
 		persisted.ManualHashes = hashes
 		persistState()
+	}
+
+	// Engine off-TUN CONNECT proxy only AFTER token/hashes are ready.
+	proxyURL, stopProxy, perr := startProtectHTTPProxy(protectPath, resolver)
+	if perr != nil {
+		emitLog("CSQTT: off-TUN HTTP proxy: %v", perr)
+		stopProxy = func() {}
+	} else {
+		defer stopProxy()
 	}
 
 	dialTimeout := settingDuration(cfg, "SETTING_dialTimeoutSec", defaultDialSec)
@@ -936,7 +939,7 @@ func requestVkAccessToken(profileDir string) (string, error) {
 	if i := strings.Index(doneURL, vkOAuthCallbackPath); i > 0 {
 		base = doneURL[:i]
 	}
-	emitLog("CSQTT: VK OAuth через localhost-прокси (WebView не ходит на oauth.vk.com напрямую)")
+	emitLog("CSQTT: VK OAuth — login в WebView, токен через scrape (как CSQTT VkTokenScraper); loopback /v/ только из‑за DNS VPN")
 
 	id := fmt.Sprintf("vk-oauth-%d", time.Now().UnixNano())
 	res, cancelled := runAction(profileDir, id, map[string]any{

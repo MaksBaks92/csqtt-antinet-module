@@ -114,10 +114,12 @@ func TestResolveUpstreamLocationAlreadyProxied(t *testing.T) {
 	}
 }
 
-func TestVkOAuthProxyInjectJSSkipsProxiedRootRel(t *testing.T) {
+func TestVkOAuthProxyInjectJSNoSPAHooks(t *testing.T) {
 	js := vkOAuthProxyInjectJS("http://127.0.0.1:50999", "http://127.0.0.1:50999/csqtt-vk-oauth-done")
-	if !strings.Contains(js, "u.indexOf(prefix)===0") {
-		t.Fatal("inject JS rootProxy must skip already-proxied /v/ paths")
+	for _, bad := range []string{"rootProxy", "toProxy", "hookLocation", "hookNet", "preferLogin"} {
+		if strings.Contains(js, bad) {
+			t.Fatalf("inject must not contain SPA proxy hook %q", bad)
+		}
 	}
 }
 
@@ -134,10 +136,13 @@ func TestResolveUpstreamLocation(t *testing.T) {
 
 func TestVkOAuthProxyInjectJS(t *testing.T) {
 	js := vkOAuthProxyInjectJS("http://127.0.0.1:50999", "http://127.0.0.1:50999/csqtt-vk-oauth-done")
-	for _, part := range []string{vkOAuthCallbackPath, vkOAuthProxyPrefix, "access_token=", "127.0.0.1:50999", "toProxy", "rootProxy", vkOAuthStatusPath, "pollStatus", "fixBase", "preferLogin", "alreadyHere", "allowFullNav", "shellFreezeUntil", "hookLocation", "hookNavigation", "pathKey(toProxy"} {
+	for _, part := range []string{vkOAuthCallbackPath, "access_token=", "127.0.0.1:50999", vkOAuthStatusPath, "pollStatus", "hoist"} {
 		if !strings.Contains(js, part) {
 			t.Fatalf("inject JS missing %q", part)
 		}
+	}
+	if strings.Contains(js, "hookNavigation") || strings.Contains(js, "allowFullNav") || strings.Contains(js, "Location.prototype") {
+		t.Fatal("inject must not hook Location/Navigation (SPA remount storm)")
 	}
 }
 
@@ -429,12 +434,15 @@ func TestOAuthProxyHopComToRuAuthorize(t *testing.T) {
 	}
 }
 
-func TestVkOAuthProxyInjectJSHooksNet(t *testing.T) {
+func TestVkOAuthProxyInjectJSMinimal(t *testing.T) {
 	js := vkOAuthProxyInjectJS("http://127.0.0.1:9", "http://127.0.0.1:9/csqtt-vk-oauth-done")
-	for _, needle := range []string{"hookNet", "window.fetch", "XMLHttpRequest.prototype.open", "toProxy"} {
+	for _, needle := range []string{"pollStatus", "hoist", "access_token=", vkOAuthStatusPath} {
 		if !strings.Contains(js, needle) {
 			t.Fatalf("inject missing %q", needle)
 		}
+	}
+	if strings.Contains(js, "window.fetch") || strings.Contains(js, "XMLHttpRequest.prototype.open") {
+		t.Fatal("inject must not hook fetch/XHR (native CSQTT scrapes server-side)")
 	}
 	if strings.Contains(js, ".replace(/.vk.ru$/i,'.vk.com')") || strings.Contains(js, "replace(/\\.vk\\.ru$/i,'.vk.com')") {
 		t.Fatal("inject must not force .vk.ru → .vk.com (breaks id.vk.ru cookies)")
@@ -457,7 +465,7 @@ func TestInjectProxyScriptIntoHTML(t *testing.T) {
 	p := &vkOAuthProxy{base: "http://127.0.0.1:9", doneURL: "http://127.0.0.1:9/csqtt-vk-oauth-done"}
 	in := `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body>hi</body></html>`
 	out := p.injectProxyScript(in)
-	if !strings.Contains(out, "__csqttOauthProxy") || !strings.Contains(out, "hookNet") {
+	if !strings.Contains(out, "__csqttOauthProxy") || !strings.Contains(out, "pollStatus") {
 		t.Fatalf("script not injected: %s", out)
 	}
 	if i := strings.Index(out, "__csqttOauthProxy"); i < 0 || i > strings.Index(out, "</head>") {

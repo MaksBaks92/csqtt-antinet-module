@@ -28,10 +28,10 @@ const (
 	vkOAuthStartPath    = "/csqtt-vk-oauth-start"
 	vkOAuthStatusPath   = "/csqtt-vk-oauth-status"
 	vkOAuthProxyMaxBody = 2 << 20
-	// Mobile login shell (same family as CSQTT vk.ru → m.vk.ru). Avoid bare vk.ru:
-	// hop→WebView bounce vk.ru↔m.vk.ru loops and leaves a white WebView.
-	vkOAuthLoginHost = "m.vk.ru"
-	vkOAuthLoginPath = "/login"
+	// Mobile/desktop VK login shell. Native CSQTT opens https://vk.ru/ then scrapes
+	// oauth authorize after remixsid — we mirror that (loopback /v/ only for AntiNet DNS).
+	vkOAuthLoginHost = "vk.ru"
+	vkOAuthLoginPath = "/"
 )
 
 // newVkOAuthHTTPTransport clones protect DialContext from vkHTTP but with long
@@ -590,6 +590,36 @@ func (p *vkOAuthProxy) ingestRequestCookies(r *http.Request) {
 		}
 		p.client.Jar.SetCookies(u, cookies)
 	}
+	p.maybeKickScrape()
+}
+
+// maybeKickScrape starts VkTokenScraper-style authorize after remixsid — same as native
+// CSQTT switchToTokenPhase. Does not drive the SPA; WebView only needed for login cookies.
+func (p *vkOAuthProxy) maybeKickScrape() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	if p.tokenDoneURL != "" || p.scrapeBusy || !p.jarHasRemixSID() {
+		p.mu.Unlock()
+		return
+	}
+	p.scrapeBusy = true
+	p.mu.Unlock()
+	go func() {
+		emitLog("CSQTT OAuth: remixsid — scrape access_token (VkTokenScraper)")
+		done, err := p.scrapeAccessToken()
+		p.mu.Lock()
+		p.scrapeBusy = false
+		if err != nil {
+			p.mu.Unlock()
+			emitLog("CSQTT OAuth scrape: %v", err)
+			return
+		}
+		p.tokenDoneURL = done
+		p.mu.Unlock()
+		emitLog("CSQTT OAuth scrape: access_token ready")
+	}()
 }
 
 // Mirror helper jar cookies onto WebView (in-proxy hops never exposed Set-Cookie to the browser).
@@ -1544,13 +1574,11 @@ func copyHopHeaders(src, dst http.Header) {
 func vkOAuthProxyInjectJS(base, doneURL string) string {
 	b, _ := json.Marshal(strings.TrimRight(base, "/"))
 	d, _ := json.Marshal(strings.TrimSpace(doneURL))
-	prefix, _ := json.Marshal(vkOAuthProxyPrefix)
 	marker, _ := json.Marshal(vkOAuthCallbackPath)
 	status, _ := json.Marshal(strings.TrimRight(base, "/") + vkOAuthStatusPath)
-	// Injected first in <head>. Must install Location hooks before VK SPA runs:
-	// rewriteAbsoluteURL turns canonical https://m.vk.ru/login into the loopback
-	// proxy URL; assigning location.href to the current page reloads forever and
-	// leaves a blank WebView (v1.2.27). v1.2.30: freeze login-shell remounts and
-	// never turn Navigation API rewrites into location.assign full reloads.
-	return `(function(){if(window.__csqttOauthProxy)return;window.__csqttOauthProxy=1;var base=` + string(b) + `;var prefix=` + string(prefix) + `;var done=` + string(d) + `;var marker=` + string(marker) + `;var status=` + string(status) + `;var navStamp=0;var shellFreezeUntil=Date.now()+8000;function normPath(p){p=String(p||'');if(p.length>1&&p.charAt(p.length-1)==='/')p=p.slice(0,-1);return p;}function pathKey(u){try{var a=document.createElement('a');a.href=u;return normPath(a.pathname);}catch(e){return '';}}function isLoginShell(pk){pk=String(pk||'');return /\/m\.vk\.(ru|com)(\/login)?$/.test(pk)||/\/v\/vk\.(ru|com)$/.test(pk);}function alreadyHere(u){try{return pathKey(toProxy(String(u||'')))===pathKey(location.href||location.pathname||'');}catch(e){return false;} }function allowFullNav(u){try{var n=toProxy(String(u||''));if(alreadyHere(n))return false;var cur=pathKey(location.href),nxt=pathKey(n);var now=Date.now();if(cur===nxt)return false;if(/\/v\/vk\.(ru|com)$/.test(cur)&&/\/login$/.test(nxt)){navStamp=now;return true;}if(isLoginShell(cur)&&isLoginShell(nxt)&&now<shellFreezeUntil)return false;if(isLoginShell(cur)&&isLoginShell(nxt)&&now-navStamp<8000)return false;navStamp=now;return true;}catch(e){return true;}}function fixBase(){try{var m=String(location.pathname||'').match(/^\/v\/([^\/]+)/);if(!m)return;var want=prefix+m[1]+'/';var b=document.getElementById('base')||document.querySelector('base');if(!b){b=document.createElement('base');b.id='base';(document.head||document.documentElement).insertBefore(b,(document.head||document.documentElement).firstChild);}if(b.getAttribute('href')!==want)b.setAttribute('href',want);}catch(e){}}function preferLogin(){try{var path=String(location.pathname||'');if(/^\/v\/vk\.(ru|com)\/?$/.test(path)){var dest=base+prefix+'m.vk.ru/login';if(!alreadyHere(dest)){navStamp=Date.now();location.replace(dest);}return true;}return false;}catch(e){return false;}}function rootProxy(u){try{if(!u||u.charAt(0)!=='/'||u.charAt(1)==='/')return u;if(u.indexOf(prefix)===0)return u;var m=String(location.pathname||'').match(/^\/v\/([^\/]+)/);if(!m)return u;return prefix+m[1]+u;}catch(e){return u;}}function toProxy(u){try{u=String(u||'');if(u.charAt(0)==='/'&&u.charAt(1)!=='/'){var rp=rootProxy(u);if(rp!==u)return rp;}var a=document.createElement('a');a.href=u;var h=String(a.hostname||'').toLowerCase();if(!h||h==='127.0.0.1'||h==='localhost')return String(u);if(!(/(^|\.)vk\.(com|ru)$/.test(h)||/(^|\.)userapi\.com$/.test(h)||h.indexOf('vk-cdn')>=0||h.indexOf('vkuseraudio')>=0||h.indexOf('vkcc.net')>=0))return String(u);if((h==='vk.ru'||h==='vk.com')&&(!a.pathname||a.pathname==='/')){return base+prefix+'m.'+h+'/login'+(a.search||'')+(a.hash||'');}return base+prefix+h+(a.pathname||'/')+(a.search||'')+(a.hash||'');}catch(e){return String(u);}}function navTo(u,replace){try{var n=toProxy(String(u||''));if(!allowFullNav(n))return false;if(replace)location.replace(n);else location.assign(n);return n!==String(u);}catch(e){return false;}}function hoist(){try{if(preferLogin())return;var href=String(location.href||'');if(href.indexOf(marker)>=0)return;if(/^https?:/i.test(href)&&href.indexOf('127.0.0.1')<0&&href.indexOf('localhost')<0){var p=toProxy(href);if(p!==href&&allowFullNav(p)){location.replace(p);return;}}var h=String(location.hash||'');var s=String(location.search||'');if(h.indexOf('payload=')>=0&&/silent_token/.test(h)){return;}var q='';if(h.indexOf('access_token=')>=0||h.indexOf('error=')>=0){q=h.replace(/^#/,'');}else if(s.indexOf('access_token=')>=0||s.indexOf('error=')>=0){q=s.replace(/^\?/,'');}else{return;}var sep=done.indexOf('?')>=0?'&':'?';location.replace(done+sep+q);}catch(e){}}function pollStatus(){try{if(window.__csqttOauthDone)return;var x=new XMLHttpRequest();x.open('GET',status,true);x.withCredentials=true;x.timeout=10000;x.onload=function(){try{var j=JSON.parse(x.responseText||'{}');if(j&&j.state==='ok'&&j.url){window.__csqttOauthDone=1;location.replace(j.url);}}catch(e){}};x.send();}catch(e){}}function rewriteAttrs(){try{var nodes=document.querySelectorAll('a[href],form[action],link[href],script[src],img[src],iframe[src]');for(var i=0;i<nodes.length;i++){var el=nodes[i];var attr='href';if(el.tagName==='FORM')attr='action';else if(el.tagName==='SCRIPT'||el.tagName==='IMG'||el.tagName==='IFRAME')attr='src';var cur=el.getAttribute(attr);if(!cur)continue;var n=toProxy(cur);if(n!==cur)el.setAttribute(attr,n);}}catch(e){}}function hookLocation(){try{var _as=Location.prototype.assign,_rp=Location.prototype.replace;Location.prototype.assign=function(u){var n=toProxy(String(u));if(!allowFullNav(n))return;return _as.call(this,n);};Location.prototype.replace=function(u){var n=toProxy(String(u));if(!allowFullNav(n))return;return _rp.call(this,n);};try{Location.prototype.reload=function(){};}catch(e){}var desc=Object.getOwnPropertyDescriptor(Location.prototype,'href');if(desc&&desc.set&&desc.get){Object.defineProperty(Location.prototype,'href',{configurable:true,enumerable:true,get:function(){return desc.get.call(this);},set:function(v){var n=toProxy(String(v));if(!allowFullNav(n))return;desc.set.call(this,n);}});}}catch(e){}try{var _ps=history.pushState,_rs=history.replaceState;history.pushState=function(s,t,u){if(u!=null&&u!==''){var n=toProxy(String(u));if(alreadyHere(n))return;if(n!==String(u))u=n;}return _ps.call(this,s,t,u);};history.replaceState=function(s,t,u){if(u!=null&&u!==''){var n=toProxy(String(u));if(alreadyHere(n))return;if(n!==String(u))u=n;}return _rs.call(this,s,t,u);};}catch(e){}}function hookNavigation(){try{if(!window.navigation||typeof navigation.addEventListener!=='function')return;navigation.addEventListener('navigate',function(e){try{var dest=e.destination&&e.destination.url;if(!dest)return;var n=toProxy(String(dest));if(alreadyHere(n)||pathKey(n)===pathKey(location.href)||!allowFullNav(n)){e.preventDefault();return;}if(n===String(dest))return;if(typeof e.intercept==='function'){e.intercept({handler:function(){if(e.navigationType==='replace')location.replace(n);else location.assign(n);}});return;}e.preventDefault();if(e.navigationType==='replace')location.replace(n);else location.assign(n);}catch(err){}});}catch(e){}}document.addEventListener('click',function(e){var t=e.target;while(t&&t.tagName!=='A')t=t.parentNode;if(!t||!t.href)return;var raw=t.getAttribute('href')||t.href;var n=toProxy(raw);if(n!==raw){e.preventDefault();if(allowFullNav(n))location.assign(n);}},true);document.addEventListener('submit',function(e){try{var f=e.target;if(!f||!f.action)return;var n=toProxy(f.getAttribute('action')||f.action);if(n!==(f.getAttribute('action')||f.action))f.action=n;}catch(err){}},true);function hookNet(){try{var of=window.fetch;if(typeof of==='function'){window.fetch=function(input,init){try{var u=(typeof input==='string')?input:(input&&input.url);if(u){var n=toProxy(String(u));if(n!==String(u)){if(typeof input==='string')input=n;else if(typeof Request!=='undefined')input=new Request(n,input);}}}catch(e){}return of.call(this,input,init);};}}catch(e){}try{var XO=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(){try{if(typeof arguments[1]==='string')arguments[1]=toProxy(arguments[1]);}catch(e){}return XO.apply(this,arguments);};}catch(e){}}hookLocation();hookNavigation();hookNet();fixBase();hoist();rewriteAttrs();pollStatus();window.addEventListener('hashchange',hoist);setInterval(function(){fixBase();hoist();rewriteAttrs();pollStatus();},800);})();`
+	// Native CSQTT: WebView only for login cookies → VkTokenScraper. Here AntiNet WebView
+	// cannot resolve oauth.vk.com (VPN DNS), so pages are mirrored under /v/ — but we do
+	// NOT rewrite Location/Navigation (that caused remount storms). After remixsid the
+	// helper scrapes authorize off-TUN; inject only polls status and hoists #access_token.
+	return `(function(){if(window.__csqttOauthProxy)return;window.__csqttOauthProxy=1;var base=` + string(b) + `;var done=` + string(d) + `;var marker=` + string(marker) + `;var status=` + string(status) + `;function hoist(){try{var href=String(location.href||'');if(href.indexOf(marker)>=0)return;var h=String(location.hash||'');var s=String(location.search||'');var q='';if(h.indexOf('access_token=')>=0||h.indexOf('error=')>=0){q=h.replace(/^#/,'');}else if(s.indexOf('access_token=')>=0||s.indexOf('error=')>=0){q=s.replace(/^\?/,'');}else{return;}var sep=done.indexOf('?')>=0?'&':'?';location.replace(done+sep+q);}catch(e){}}function pollStatus(){try{if(window.__csqttOauthDone)return;var x=new XMLHttpRequest();x.open('GET',status,true);x.withCredentials=true;x.timeout=15000;x.onload=function(){try{var j=JSON.parse(x.responseText||'{}');if(j&&j.state==='ok'&&j.url){window.__csqttOauthDone=1;location.replace(j.url);}}catch(e){}};x.send();}catch(e){}}hoist();pollStatus();window.addEventListener('hashchange',hoist);setInterval(function(){hoist();pollStatus();},1000);})();`
 }
