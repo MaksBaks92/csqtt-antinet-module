@@ -28,9 +28,9 @@ const (
 	vkOAuthStartPath    = "/csqtt-vk-oauth-start"
 	vkOAuthStatusPath   = "/csqtt-vk-oauth-status"
 	vkOAuthProxyMaxBody = 2 << 20
-	// Mobile/desktop VK login shell. Native CSQTT opens https://vk.ru/ then scrapes
-	// oauth authorize after remixsid — we mirror that (loopback /v/ only for AntiNet DNS).
-	vkOAuthLoginHost = "vk.ru"
+	// Mobile login shell. Opening vk.ru/ used to 302→m.vk.ru and hop→WebView (remount storm);
+	// start on m.vk.ru so the document URL matches the body without a bounce.
+	vkOAuthLoginHost = "m.vk.ru"
 	vkOAuthLoginPath = "/"
 )
 
@@ -101,7 +101,9 @@ type htmlFlight struct {
 	ok   bool // false if leader failed / was canceled — waiters fetch themselves
 }
 
-const htmlCoalesceTTL = 2500 * time.Millisecond
+// Sticky HTML coalesce: short TTL re-fetched every SPA remount and re-injected the shell.
+const htmlCoalesceTTL = 20 * time.Second
+const htmlUpstreamTimeout = 45 * time.Second
 const assetCoalesceTTL = 30 * time.Second
 const assetUpstreamTimeout = 45 * time.Second
 
@@ -145,6 +147,17 @@ func isVkStaticCDNHost(host string) bool {
 		return true
 	}
 	return false
+}
+
+// isSoftVkShellHost is the public mobile/desktop login shell (vk.ru ↔ m.vk.ru).
+// Soft-serving a 302 body under the request /v/ path avoids hop→WebView remounts.
+func isSoftVkShellHost(host string) bool {
+	switch normalizeVkProxyHost(host) {
+	case "vk.ru", "vk.com", "m.vk.ru", "m.vk.com":
+		return true
+	default:
+		return false
+	}
 }
 
 // isHTMLNavPath is true for SPA/document routes (no static file extension).
@@ -360,18 +373,16 @@ func truncateForLog(s string, max int) string {
 }
 
 // resolveMissHost picks a proxied host for root-relative misses.
-// /images/… always maps to the login site host — CDN lastHost would 404 those paths.
+// Prefer Referer / lastHost so /images/… stay on the document host (m.vk.ru), not a
+// hard-coded vk.ru (that caused recover-miss storms while the SPA was on m.vk.ru).
 func (p *vkOAuthProxy) resolveMissHost(reqPath, referer string) (host, via string) {
-	if strings.HasPrefix(reqPath, "/images/") {
-		return vkOAuthLoginHost, "images"
-	}
 	if h := proxyHostFromReferer(referer); h != "" && !isVkStaticCDNHost(h) {
 		return h, "referer"
 	}
 	if h := p.cachedLastHost(); h != "" && !isVkStaticCDNHost(h) {
 		return h, "last"
 	}
-	if strings.HasPrefix(reqPath, "/css/") || strings.HasPrefix(reqPath, "/js/") {
+	if strings.HasPrefix(reqPath, "/images/") || strings.HasPrefix(reqPath, "/css/") || strings.HasPrefix(reqPath, "/js/") {
 		return vkOAuthLoginHost, "static"
 	}
 	return "", ""
@@ -1049,10 +1060,10 @@ func (p *vkOAuthProxy) serve(w http.ResponseWriter, r *http.Request) {
 				p.serveHTMLCoalesced(w, r, host, docPath)
 				return
 			}
-			if isVkStaticCDNHost(host) {
-				p.serveAssetCoalesced(w, r, host, docPath)
-				return
-			}
+			// Soft-shell hosts (vk.ru/m.vk.ru) serve /images/… logos too — WebView cancel
+			// used to abort serveOnce and restart the recover-miss → cancel storm.
+			p.serveAssetCoalesced(w, r, host, docPath)
+			return
 		}
 	}
 	p.serveOnce(w, r)
@@ -1088,19 +1099,25 @@ func (p *vkOAuthProxy) serveHTMLCoalesced(w http.ResponseWriter, r *http.Request
 	p.htmlFlights[key] = f
 	p.mu.Unlock()
 
+	// Detached upstream: WebView remount cancel must not abort the VK fetch / cache fill.
+	ctx, cancel := context.WithTimeout(context.Background(), htmlUpstreamTimeout)
+	defer cancel()
 	rec := httptest.NewRecorder()
-	p.serveOnce(rec, r)
+	p.serveOnce(rec, r.Clone(ctx))
 
 	f.code = rec.Code
 	f.hdr = rec.Header().Clone()
 	f.body = append([]byte(nil), rec.Body.Bytes()...)
-	f.ok = r.Context().Err() == nil && f.code >= 200 && f.code < 500 && len(f.body) > 0
+	// hop→WebView is a bare 302 (Location, empty body) — still a successful flight.
+	f.ok = f.code >= 200 && f.code < 500 && (len(f.body) > 0 || (f.code >= 300 && f.code < 400))
 	close(f.done)
 
-	if r.Context().Err() == nil {
+	if r.Context().Err() == nil && f.ok {
 		copyHTTPHeader(w.Header(), f.hdr)
 		w.WriteHeader(f.code)
 		_, _ = w.Write(f.body)
+	} else if r.Context().Err() == nil && !f.ok {
+		http.Error(w, "html upstream error", http.StatusBadGateway)
 	}
 
 	time.AfterFunc(htmlCoalesceTTL, func() {
@@ -1112,8 +1129,8 @@ func (p *vkOAuthProxy) serveHTMLCoalesced(w http.ResponseWriter, r *http.Request
 	})
 }
 
-// serveAssetCoalesced fills CDN bytes with a detached upstream context so a WebView
-// remount abort does not cancel the VK fetch; the next remount hits the cache.
+// serveAssetCoalesced fills static/CDN bytes with a detached upstream context so a
+// WebView remount abort does not cancel the VK fetch; the next remount hits the cache.
 func (p *vkOAuthProxy) serveAssetCoalesced(w http.ResponseWriter, r *http.Request, host, assetPath string) {
 	key := normalizeVkProxyHost(host) + "|" + assetPath + "|" + r.URL.RawQuery
 	p.mu.Lock()
@@ -1159,7 +1176,7 @@ func (p *vkOAuthProxy) serveAssetCoalesced(w http.ResponseWriter, r *http.Reques
 		w.WriteHeader(f.code)
 		_, _ = w.Write(f.body)
 	} else if r.Context().Err() == nil && !f.ok {
-		http.Error(w, "cdn upstream error", http.StatusBadGateway)
+		http.Error(w, "asset upstream error", http.StatusBadGateway)
 	}
 
 	time.AfterFunc(assetCoalesceTTL, func() {
@@ -1480,27 +1497,34 @@ func (p *vkOAuthProxy) serveOnce(w http.ResponseWriter, r *http.Request) {
 	// After in-proxy follow, WebView URL still shows the first hop (e.g. /v/oauth…/authorize)
 	// while the body is id.vk.ru. Relative + XHR/fetch then miss the proxy. Bounce once
 	// to the final host as-is (.ru stays .ru) so cookies match the document origin.
+	// Exception: vk.ru ↔ m.vk.ru shell 302s — hop→WebView remounts the SPA endlessly; soft-serve
+	// the final HTML under the request path with <base> pointed at the final host.
 	reqKey := upstreamURLKey((&url.URL{Scheme: "https", Host: normalizeVkProxyHost(up.Host), Path: up.Path, RawQuery: up.RawQuery}).String())
 	finalKey := upstreamURLKey((&url.URL{Scheme: "https", Host: normalizeVkProxyHost(host), Path: path, RawQuery: rawQuery}).String())
 	if reqKey != finalKey {
-		writeProxiedSetCookies(w, resp.Header)
-		p.writeJarCookiesToWebView(w)
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-		_ = resp.Body.Close()
-		bounce := (&url.URL{Scheme: "https", Host: normalizeVkProxyHost(host), Path: path, RawQuery: rawQuery}).String()
-		loc := p.rewriteLocation(bounce)
-		baseTrim := strings.TrimRight(p.base, "/")
-		if strings.HasPrefix(loc, baseTrim) {
-			loc = strings.TrimPrefix(loc, baseTrim)
-			if loc == "" || loc[0] != '/' {
-				loc = "/" + loc
+		if isSoftVkShellHost(up.Host) && isSoftVkShellHost(host) {
+			emitLog("CSQTT OAuth proxy: soft-serve %s → %s%s (no WebView hop)", up.Host+up.Path, host, path)
+			// fall through: rewrite body with final host + ensureProxyBase(final)
+		} else {
+			writeProxiedSetCookies(w, resp.Header)
+			p.writeJarCookiesToWebView(w)
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+			_ = resp.Body.Close()
+			bounce := (&url.URL{Scheme: "https", Host: normalizeVkProxyHost(host), Path: path, RawQuery: rawQuery}).String()
+			loc := p.rewriteLocation(bounce)
+			baseTrim := strings.TrimRight(p.base, "/")
+			if strings.HasPrefix(loc, baseTrim) {
+				loc = strings.TrimPrefix(loc, baseTrim)
+				if loc == "" || loc[0] != '/' {
+					loc = "/" + loc
+				}
 			}
+			emitLog("CSQTT OAuth proxy: hop→WebView 302 %s → %s", up.Host+up.Path, loc)
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("Location", loc)
+			w.WriteHeader(http.StatusFound)
+			return
 		}
-		emitLog("CSQTT OAuth proxy: hop→WebView 302 %s → %s", up.Host+up.Path, loc)
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Location", loc)
-		w.WriteHeader(http.StatusFound)
-		return
 	}
 
 	defer resp.Body.Close()

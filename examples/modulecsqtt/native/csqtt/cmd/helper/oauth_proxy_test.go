@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -388,6 +390,131 @@ func TestOAuthProxyHopToWebView(t *testing.T) {
 	}
 	if len(hits) < 2 {
 		t.Fatalf("expected follow, hits=%v", hits)
+	}
+}
+
+func TestOAuthProxySoftServeNoHop(t *testing.T) {
+	var hits []string
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		hits = append(hits, r.URL.Host+r.URL.Path)
+		switch {
+		case r.URL.Host == "vk.ru" && r.URL.Path == "/":
+			return &http.Response{
+				StatusCode: http.StatusFound,
+				Header:     http.Header{"Location": []string{"https://m.vk.ru/"}},
+				Body:       io.NopCloser(strings.NewReader("")),
+				Request:    r,
+			}, nil
+		case r.URL.Host == "m.vk.ru" && r.URL.Path == "/":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
+				Body:       io.NopCloser(strings.NewReader("<html><head></head><body>mobile</body></html>")),
+				Request:    r,
+			}, nil
+		default:
+			t.Fatalf("unexpected upstream %s", r.URL.String())
+			return nil, nil
+		}
+	})
+	p := &vkOAuthProxy{
+		base: "http://127.0.0.1:9",
+		client: &http.Client{
+			Transport: rt,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9/v/vk.ru/", nil)
+	rr := httptest.NewRecorder()
+	p.serve(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("soft-serve want 200, got code=%d loc=%q body=%s hits=%v",
+			rr.Code, rr.Header().Get("Location"), rr.Body.String(), hits)
+	}
+	if loc := rr.Header().Get("Location"); loc != "" {
+		t.Fatalf("soft-serve must not hop WebView, Location=%q hits=%v", loc, hits)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, `href="/v/m.vk.ru/"`) {
+		t.Fatalf("want <base> for m.vk.ru, body=%s hits=%v", body, hits)
+	}
+	if len(hits) < 2 {
+		t.Fatalf("expected follow vk.ru→m.vk.ru, hits=%v", hits)
+	}
+}
+
+// Soft-shell logos (vk.ru/images/…) must survive WebView cancel via asset coalesce —
+// otherwise recover-miss → cancel remounts forever (device logs on 1.2.32).
+func TestSoftShellAssetCoalesceSurvivesCancel(t *testing.T) {
+	var upstreamHits atomic.Int32
+	started := make(chan struct{})
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Host != "vk.ru" || !strings.HasPrefix(r.URL.Path, "/images/") {
+			t.Fatalf("unexpected upstream %s", r.URL.String())
+			return nil, nil
+		}
+		upstreamHits.Add(1)
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		time.Sleep(80 * time.Millisecond)
+		png := []byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"image/png"}},
+			Body:       io.NopCloser(strings.NewReader(string(png))),
+			Request:    r,
+		}, nil
+	})
+	p := &vkOAuthProxy{
+		base: "http://127.0.0.1:9",
+		client: &http.Client{
+			Transport: rt,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+	}
+	logoURL := "http://127.0.0.1:9/v/vk.ru/images/mobile/icons/vk_logo_color_32_2x.png"
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	req1 := httptest.NewRequestWithContext(ctx1, http.MethodGet, logoURL, nil)
+	rr1 := httptest.NewRecorder()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		p.serve(rr1, req1)
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream never started")
+	}
+	cancel1() // WebView abort mid-flight
+	wg.Wait()
+
+	req2 := httptest.NewRequest(http.MethodGet, logoURL, nil)
+	rr2 := httptest.NewRecorder()
+	p.serve(rr2, req2)
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("coalesce hit want 200, got %d body=%s", rr2.Code, rr2.Body.String())
+	}
+	if upstreamHits.Load() != 1 {
+		t.Fatalf("want single upstream fetch after cancel, hits=%d", upstreamHits.Load())
+	}
+}
+
+func TestResolveMissHostPreferReferer(t *testing.T) {
+	p := &vkOAuthProxy{base: "http://127.0.0.1:9"}
+	p.rememberHost("vk.ru")
+	host, via := p.resolveMissHost("/images/mobile/icons/vk_logo_color_32_2x.png", "http://127.0.0.1:9/v/m.vk.ru/")
+	if host != "m.vk.ru" || via != "referer" {
+		t.Fatalf("host=%q via=%q want m.vk.ru/referer", host, via)
 	}
 }
 

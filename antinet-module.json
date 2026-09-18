@@ -1,15 +1,15 @@
 {
-  "version": "1.2.32",
+  "version": "1.2.34",
   "android": {
-    "arm64-v8a": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.32/csqtt-android-arm64-v8a.zip",
-    "armeabi-v7a": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.32/csqtt-android-armeabi-v7a.zip",
-    "x86": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.32/csqtt-android-x86.zip",
-    "x86_64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.32/csqtt-android-x86_64.zip"
+    "arm64-v8a": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.34/csqtt-android-arm64-v8a.zip",
+    "armeabi-v7a": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.34/csqtt-android-armeabi-v7a.zip",
+    "x86": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.34/csqtt-android-x86.zip",
+    "x86_64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.34/csqtt-android-x86_64.zip"
   },
   "desktop": {
     "windows_amd64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.0.0/csqtt-windows_amd64.zip",
     "linux_amd64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.0.0/csqtt-linux_amd64.zip",
     "darwin_amd64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.0.0/csqtt-darwin_amd64.zip"
   },
-  "changelog": "1.2.32: VK OAuth like native CSQTT — login first, remixsid scrape for token, then engine settings; drop SPA Location/Navigation hooks. 1.2.31: restore manual hash mode."
+  "changelog": "1.2.34: soft-shell asset coalesce (vk.ru/m.vk.ru /images survive WebView cancel). 1.2.33: soft-serve vk.ru→m.vk.ru (no WebView hop remount storm); recover-miss prefers Referer host; sticky HTML coalesce. 1.2.32: VK OAuth like native CSQTT — login first, remixsid scrape for token, then engine settings; drop SPA Location/Navigation hooks. 1.2.31: restore manual hash mode."
 }
