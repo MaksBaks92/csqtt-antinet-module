@@ -77,11 +77,23 @@ func TestVkOAuthRuleTargetsUpstreamVK(t *testing.T) {
 			t.Fatalf("authorize URL без %q", part)
 		}
 	}
+	if vkLoginURL != "https://vk.ru/" {
+		t.Fatalf("LOGIN URL=%q want https://vk.ru/", vkLoginURL)
+	}
 	if strings.Contains(vkOAuthAuthURL, "127.0.0.1") || strings.Contains(vkLoginURL, "127.0.0.1") {
 		t.Fatal("в правило просочился loopback")
 	}
 	if vkOAuthRedirectMark != "blank.html" {
 		t.Fatalf("urlPattern=%q, а VK уводит на blank.html", vkOAuthRedirectMark)
+	}
+	js := vkOAuthLoginThenTokenJS(vkOAuthAuthURL)
+	for _, part := range []string{"remixsid", "/feed", "Лента", "location.replace", "oauth.vk.ru/authorize", "client_id=7793118"} {
+		if !strings.Contains(js, part) {
+			t.Fatalf("injectJs без %q", part)
+		}
+	}
+	if strings.Contains(js, "127.0.0.1") {
+		t.Fatal("injectJs с loopback")
 	}
 }
 

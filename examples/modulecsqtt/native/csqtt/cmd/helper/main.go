@@ -942,29 +942,22 @@ func requestVkAccessToken(profileDir string) (string, error) {
 	if profileDir == "" {
 		return "", fmt.Errorf("profileDir not set")
 	}
-	// Апстримная модель входа (`VkAuthWebViewManager.kt`): WebView грузит authorize-URL, VK сам
-	// показывает форму входа, если сессии нет, и по завершении уводит на `blank.html` с
-	// `#access_token=…`; апстрим ловит этот переход (`uri.lastPathSegment == "blank.html"`) и берёт
-	// параметр из фрагмента. Здесь то же самое выражено декларативным правилом §2.7: перехват
-	// перехода делает хост, модулю не нужен ни свой webview, ни свой HTTP-слой.
+	// Апстрим (`VkAuthWebViewManager`): фаза LOGIN на vk.ru/ → remixsid/лента → фаза TOKEN
+	// (authorize → blank.html#access_token). Один ACTION_REQUIRED: стартуем с VK_LOGIN_URL,
+	// injectJs после входа сам уводит на authorize; хост ловит blank.html (§2.7 navigation).
 	//
-	// ⛔ Своего reverse-proxy на loopback тут быть не должно. Он заводился под предпосылку «WebView
-	// AntiNet не резолвит oauth.vk.*», которая не подтверждается: `moduleqwdtt` открывает в том же
-	// webview хоста реальный `https://m.vk.ru/call/join/<hash>` без единого обхода DNS. Проксирование
-	// же тянуло за собой перезагрузку страницы по кругу (в логе 1.2.34 — 175 успешных загрузок против
-	// 4336 схлопываний и 1226 отмен), из-за чего вход не доходил до конца и токен оставался пустым.
-	//
-	// Два кандидата в `url` — расширение контракта «список URL: не сработало за urlTimeoutSec →
-	// следующий». Первый совпадает с апстримным VK_OAUTH_AUTH_URL, второй (`vk.ru/`) повторяет
-	// апстримный VK_LOGIN_URL и нужен там, где VK требует сначала завести сессию.
+	// Стартовать сразу с authorize нельзя: без сессии пользователь логинится в id.vk.ru, окно
+	// часто не доходит до blank.html (Back → CANCELLED), а повторный коннект уже с cookie
+	// «магически» срабатывает — именно это видно в логе 1.2.43.
 	id := fmt.Sprintf("vk-oauth-%d", time.Now().UnixNano())
 	res, cancelled := runAction(profileDir, id, map[string]any{
 		"type":          "webview",
 		"mode":          "navigation",
-		"url":           []string{vkOAuthAuthURL, vkLoginURL},
+		"url":           vkLoginURL,
 		"urlPattern":    vkOAuthRedirectMark,
 		"param":         "access_token",
 		"urlTimeoutSec": int(vkOAuthURLHop / time.Second),
+		"injectJs":      vkOAuthLoginThenTokenJS(vkOAuthAuthURL),
 	})
 	if cancelled {
 		return "", fmt.Errorf("VK login cancelled (закройте окно только после входа и редиректа)")
@@ -972,13 +965,42 @@ func requestVkAccessToken(profileDir string) (string, error) {
 	if strings.TrimSpace(res) == "" {
 		return "", fmt.Errorf("VK login empty (AntiNet не передал токен — обновите модуль ≥1.2.16)")
 	}
-	// Хост отдаёт значение `param`, но `parseVkAccessToken` принимает и голый токен, и целый URL с
-	// фрагментом — это оставляет правило совместимым со старым хостом, который вернул бы URL.
 	tok, err := parseVkAccessToken(res)
 	if err != nil {
 		return "", err
 	}
 	return tok, nil
+}
+
+// vkOAuthLoginThenTokenJS — монитор как у апстрима: remixsid / /feed / «Лента» → authorize.
+// Пока пользователь на id.vk.ru без cookie сессии — не трогаем (иначе сорвём SMS/2FA).
+func vkOAuthLoginThenTokenJS(authURL string) string {
+	authJSON, _ := json.Marshal(authURL)
+	return `(function(){
+if(window.__csqttVkOAuth)return;
+window.__csqttVkOAuth=1;
+var AUTH=` + string(authJSON) + `;
+var switched=false;
+function cookie(){try{return document.cookie||""}catch(e){return""}}
+function remix(){var c=cookie();return c.indexOf("remixsid")>=0||c.indexOf("remixnsid")>=0}
+function pathFeed(){var p=(location.pathname||"");return p.indexOf("/feed")===0}
+function feedUI(){try{var t=(document.body&&document.body.innerText)||"";return t.indexOf("Лента")>=0||t.indexOf("Мессенджер")>=0||t.indexOf("News feed")>=0}catch(e){return false}}
+function loggedIn(){return remix()||pathFeed()||feedUI()}
+function onBlank(){return (location.href||"").indexOf("blank.html")>=0}
+function onOAuth(){var h=(location.hostname||"");return h.indexOf("oauth.vk.")===0}
+function goAuth(){
+  if(switched||onBlank()||onOAuth())return;
+  switched=true;
+  try{location.replace(AUTH)}catch(e){location.href=AUTH}
+}
+function tick(){
+  if(onBlank())return;
+  if(onOAuth())return;
+  if(loggedIn())goAuth();
+}
+setInterval(tick,500);
+setTimeout(tick,200);
+})();`
 }
 
 func parseVkAccessToken(res string) (string, error) {
