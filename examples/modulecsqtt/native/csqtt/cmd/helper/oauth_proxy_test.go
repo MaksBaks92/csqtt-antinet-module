@@ -569,8 +569,10 @@ func TestResolveMissHostPreferReferer(t *testing.T) {
 	}
 }
 
-func TestOAuthProxyHopComToRuAuthorize(t *testing.T) {
+func TestOAuthProxySoftServeComToRuAuthorize(t *testing.T) {
+	var hits []string
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		hits = append(hits, r.URL.Host+r.URL.Path)
 		if r.URL.Host == "oauth.vk.com" && r.URL.Path == "/authorize" {
 			return &http.Response{
 				StatusCode: http.StatusMovedPermanently,
@@ -583,7 +585,7 @@ func TestOAuthProxyHopComToRuAuthorize(t *testing.T) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
-				Body:       io.NopCloser(strings.NewReader("<html><body>ok</body></html>")),
+				Body:       io.NopCloser(strings.NewReader("<html><body>ok-ru</body></html>")),
 				Request:    r,
 			}, nil
 		}
@@ -602,13 +604,118 @@ func TestOAuthProxyHopComToRuAuthorize(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9/v/oauth.vk.com/authorize?client_id=1", nil)
 	rr := httptest.NewRecorder()
 	p.serve(rr, req)
-	// Bounce WebView onto the final .ru host so Set-Cookie domain matches document URL.
-	if rr.Code != http.StatusFound {
-		t.Fatalf("code=%d loc=%q body=%s", rr.Code, rr.Header().Get("Location"), rr.Body.String())
+	if rr.Code != http.StatusOK {
+		t.Fatalf("oauth.com↔.ru must soft-serve, code=%d loc=%q body=%s hits=%v",
+			rr.Code, rr.Header().Get("Location"), rr.Body.String(), hits)
 	}
-	loc := rr.Header().Get("Location")
-	if !strings.Contains(loc, "/v/oauth.vk.ru/authorize") {
-		t.Fatalf("loc=%q", loc)
+	if rr.Header().Get("Location") != "" {
+		t.Fatalf("must not hop WebView, loc=%q", rr.Header().Get("Location"))
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "ok-ru") || !strings.Contains(body, "__csqttOauthProxy") {
+		t.Fatalf("body=%s", body)
+	}
+	if !strings.Contains(body, "/v/oauth.vk.ru/authorize") {
+		t.Fatalf("syncURI must target oauth.vk.ru, body len=%d", len(body))
+	}
+}
+
+func TestOAuthProxy429FollowUsesCachedIDAuth(t *testing.T) {
+	var hits []string
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		hits = append(hits, r.URL.Host+r.URL.Path)
+		switch {
+		case r.URL.Host == "oauth.vk.com" && r.URL.Path == "/authorize":
+			return &http.Response{
+				StatusCode: http.StatusFound,
+				Header:     http.Header{"Location": []string{"https://oauth.vk.ru/authorize?client_id=1"}},
+				Body:       io.NopCloser(strings.NewReader("")),
+				Request:    r,
+			}, nil
+		case r.URL.Host == "oauth.vk.ru" && r.URL.Path == "/authorize":
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Header:     http.Header{"Retry-After": []string{"12"}},
+				Body:       io.NopCloser(strings.NewReader("rate")),
+				Request:    r,
+			}, nil
+		case r.URL.Host == "id.vk.ru" && r.URL.Path == "/auth":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
+				Body:       io.NopCloser(strings.NewReader("<html><body>cached-auth</body></html>")),
+				Request:    r,
+			}, nil
+		default:
+			t.Fatalf("unexpected upstream %s", r.URL.String())
+			return nil, nil
+		}
+	})
+	p := &vkOAuthProxy{
+		base: "http://127.0.0.1:9",
+		client: &http.Client{
+			Transport: rt,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+	}
+	p.rememberIDAuthURL("https://id.vk.ru/auth?return_auth_hash=abc")
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9/v/oauth.vk.com/authorize?client_id=1", nil)
+	rr := httptest.NewRecorder()
+	p.serve(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s hits=%v", rr.Code, rr.Body.String(), hits)
+	}
+	if !strings.Contains(rr.Body.String(), "cached-auth") {
+		t.Fatalf("expected cached id.auth HTML, body=%s hits=%v", rr.Body.String(), hits)
+	}
+	ruHits := 0
+	idHits := 0
+	for _, h := range hits {
+		if h == "oauth.vk.ru/authorize" {
+			ruHits++
+		}
+		if h == "id.vk.ru/auth" {
+			idHits++
+		}
+	}
+	if ruHits != 1 || idHits != 1 {
+		t.Fatalf("hits=%v want one oauth.ru 429 then one id.auth", hits)
+	}
+}
+
+func TestOAuthProxyCooldownAsset204(t *testing.T) {
+	p := &vkOAuthProxy{
+		base: "http://127.0.0.1:9",
+		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			t.Fatalf("must not hit upstream during cooldown: %s", r.URL.String())
+			return nil, nil
+		})},
+	}
+	p.markRateLimited(20)
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9/v/oauth.vk.com/favicon.ico", nil)
+	rr := httptest.NewRecorder()
+	p.serve(rr, req)
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("code=%d want 204", rr.Code)
+	}
+}
+
+func TestRememberIDAuthURL(t *testing.T) {
+	p := &vkOAuthProxy{base: "http://127.0.0.1:9"}
+	p.rememberIDAuthURL("https://oauth.vk.ru/authorize?x=1")
+	if p.cachedIDAuthURL() != "" {
+		t.Fatal("must ignore non-id.auth")
+	}
+	p.rememberIDAuthURL("https://id.vk.ru/auth?h=1")
+	got := p.cachedIDAuthURL()
+	if got != "https://id.vk.ru/auth?h=1" {
+		t.Fatalf("got %q", got)
+	}
+	p.idAuthUntil = time.Now().Add(-time.Second)
+	if p.cachedIDAuthURL() != "" {
+		t.Fatal("expired cache must be empty")
 	}
 }
 

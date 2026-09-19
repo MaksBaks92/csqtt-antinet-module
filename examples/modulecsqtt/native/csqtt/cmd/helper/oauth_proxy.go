@@ -110,12 +110,45 @@ type vkOAuthProxy struct {
 	scrapeBusy   bool
 	tokenDoneURL string // cached http://127.0.0.1/…/done?access_token=…
 	lastHost     string // last successfully proxied VK host (miss recovery)
+	// Last successful authorize→id.vk.ru/auth absolute URL (same client_id keeps
+	// return_auth_hash stable). Used to soft-fetch login when authorize is 429'd.
+	idAuthURL    string
+	idAuthUntil  time.Time
 	// htmlFlights coalesces concurrent GET HTML document fetches (same host+path)
 	// so SPA remount storms do not re-hit VK and re-inject for every overlapping load.
 	htmlFlights map[string]*htmlFlight
 	// assetFlights coalesces CDN GETs with a detached upstream context so brief
 	// WebView aborts during remounts do not cancel the upstream fetch / cache fill.
 	assetFlights map[string]*htmlFlight
+}
+
+const idAuthURLTTL = 30 * time.Minute
+
+func (p *vkOAuthProxy) rememberIDAuthURL(abs string) {
+	abs = strings.TrimSpace(abs)
+	if abs == "" {
+		return
+	}
+	u, err := url.Parse(abs)
+	if err != nil || u.Host == "" {
+		return
+	}
+	if !isVkIDHost(u.Hostname()) || !strings.HasPrefix(u.Path, "/auth") {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.idAuthURL = abs
+	p.idAuthUntil = time.Now().Add(idAuthURLTTL)
+}
+
+func (p *vkOAuthProxy) cachedIDAuthURL() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.idAuthURL == "" || time.Now().After(p.idAuthUntil) {
+		return ""
+	}
+	return p.idAuthURL
 }
 
 // htmlFlight is one in-flight or short-TTL cached HTML document response.
@@ -1100,6 +1133,54 @@ func (p *vkOAuthProxy) writeRateLimitPage(w http.ResponseWriter, retryURL string
 	p.writeRetryPage(w, "Слишком много запросов к VK", detail, retryURL, waitSec)
 }
 
+func sleepCtx(ctx context.Context, sec int) bool {
+	if sec < 1 {
+		sec = 1
+	}
+	t := time.NewTimer(time.Duration(sec) * time.Second)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// tryServeCachedIDAuth soft-fetches the last successful id.vk.ru/auth URL when
+// authorize is rate-limited. Returns true if a response was written.
+func (p *vkOAuthProxy) tryServeCachedIDAuth(w http.ResponseWriter, r *http.Request) bool {
+	if h, path, ok := unwrapVkProxyPath(r.URL.Path); ok && isVkIDHost(h) && strings.HasPrefix(path, "/auth") {
+		return false
+	}
+	abs := p.cachedIDAuthURL()
+	if abs == "" {
+		return false
+	}
+	u, err := url.Parse(abs)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	emitLog("CSQTT OAuth proxy: 429 fallback → cached %s%s", u.Hostname(), u.Path)
+	p.mu.Lock()
+	savedUntil := p.coolUntil
+	p.coolUntil = time.Time{}
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		if savedUntil.After(p.coolUntil) {
+			p.coolUntil = savedUntil
+		}
+		p.mu.Unlock()
+	}()
+	r2 := r.Clone(r.Context())
+	r2.URL.Path = vkOAuthProxyPrefix + normalizeVkProxyHost(u.Hostname()) + u.Path
+	r2.URL.RawQuery = u.RawQuery
+	r2.URL.RawPath = ""
+	p.serveOnce(w, r2)
+	return true
+}
+
 func (p *vkOAuthProxy) writeRetryPage(w http.ResponseWriter, title, detail, retryURL string, waitSec int) {
 	if waitSec < 2 {
 		waitSec = 4
@@ -1263,7 +1344,9 @@ func (p *vkOAuthProxy) serveAssetCoalesced(w http.ResponseWriter, r *http.Reques
 	f.code = rec.Code
 	f.hdr = rec.Header().Clone()
 	f.body = append([]byte(nil), rec.Body.Bytes()...)
-	f.ok = f.code >= 200 && f.code < 500 && len(f.body) > 0
+	// 204 during cooldown (favicon/assets) has an empty body — still a successful flight.
+	f.ok = f.code >= 200 && f.code < 500 && (len(f.body) > 0 ||
+		f.code == http.StatusNoContent || f.code == http.StatusNotModified)
 	close(f.done)
 
 	if r.Context().Err() == nil && f.ok {
@@ -1321,6 +1404,14 @@ func (p *vkOAuthProxy) serveOnce(w http.ResponseWriter, r *http.Request) {
 	// Local cooldown after 429: do not hit VK again while WebView refreshes.
 	if wait, cooling := p.rateLimitRemaining(); cooling {
 		emitLog("CSQTT OAuth proxy: cooldown %ds — skip upstream %s %s", wait, r.Method, up.Host+up.Path)
+		if isHTMLNavPath(path) && isOAuthAuthorizeHost(host) && p.tryServeCachedIDAuth(w, r) {
+			return
+		}
+		if !isHTMLNavPath(path) {
+			// Favicon / assets during cooldown must not replace the auth document.
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		p.writeRateLimitPage(w, retrySelf, wait)
 		return
 	}
@@ -1373,6 +1464,17 @@ func (p *vkOAuthProxy) serveOnce(w http.ResponseWriter, r *http.Request) {
 			p.markRateLimited(waitSec)
 			emitLog("CSQTT OAuth proxy: 429 %s %s wait=%ds after %s",
 				r.Method, up.Host+up.Path, waitSec, time.Since(started).Round(time.Millisecond))
+			if isHTMLNavPath(path) && isOAuthAuthorizeHost(host) && p.tryServeCachedIDAuth(w, r) {
+				return
+			}
+			// One in-request sleep+retry (ACTION_REQUIRED urlTimeoutSec=300).
+			if isHTMLNavPath(path) && attempt == 1 {
+				emitLog("CSQTT OAuth proxy: 429 sleep %ds then retry %s", waitSec, up.Host+up.Path)
+				if !sleepCtx(r.Context(), waitSec) {
+					return
+				}
+				continue
+			}
 			if isHTMLNavPath(path) {
 				p.writeRateLimitPage(w, retrySelf, waitSec)
 			} else {
@@ -1448,6 +1550,7 @@ func (p *vkOAuthProxy) serveOnce(w http.ResponseWriter, r *http.Request) {
 		}
 		emitLog("CSQTT OAuth proxy: OK %s %s → %d Location=%s (%s)",
 			method, host+path, redirStatus, shortLoc, time.Since(started).Round(time.Millisecond))
+		p.rememberIDAuthURL(absLoc)
 
 		if isOAuthTerminalLocation(absLoc) {
 			for k, vv := range resp.Header {
@@ -1543,10 +1646,61 @@ func (p *vkOAuthProxy) serveOnce(w http.ResponseWriter, r *http.Request) {
 			waitSec := parseRetryAfterSec(resp.Header, vkOAuth429DefaultWaitSec)
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 			_ = resp.Body.Close()
+			resp = nil
 			p.markRateLimited(waitSec)
 			emitLog("CSQTT OAuth proxy: 429 on follow %s %s wait=%ds", nextMethod, nextHost+followURL.Path, waitSec)
-			p.writeRateLimitPage(w, retrySelf, waitSec)
-			return
+			if isHTMLNavPath(path) && (isOAuthAuthorizeHost(host) || isOAuthAuthorizeHost(nextHost)) &&
+				p.tryServeCachedIDAuth(w, r) {
+				return
+			}
+			// Sleep once in this follow hop, then re-GET the same Location.
+			if isHTMLNavPath(path) {
+				emitLog("CSQTT OAuth proxy: 429 sleep %ds then retry follow %s", waitSec, nextHost+followURL.Path)
+				if !sleepCtx(r.Context(), waitSec) {
+					return
+				}
+				var body2 io.Reader
+				if len(bodyBytes) > 0 && nextMethod != http.MethodGet && nextMethod != http.MethodHead {
+					body2 = strings.NewReader(string(bodyBytes))
+				}
+				req2, err2 := http.NewRequestWithContext(r.Context(), nextMethod, followURL.String(), body2)
+				if err2 != nil {
+					p.writeRateLimitPage(w, retrySelf, waitSec)
+					return
+				}
+				copyHopHeaders(r.Header, req2.Header)
+				req2.Header.Del("Accept-Encoding")
+				req2.Header.Set("Accept-Encoding", "identity")
+				if req2.Header.Get("User-Agent") == "" {
+					req2.Header.Set("User-Agent", vkBrowserUA)
+				}
+				req2.Header.Set("Referer", "https://"+host+path)
+				req2.Header.Set("Origin", "https://"+nextHost)
+				req2.Host = nextHost
+				if body2 != nil {
+					req2.ContentLength = int64(len(bodyBytes))
+				}
+				resp, lastErr = p.client.Do(req2)
+				if lastErr != nil {
+					emitLog("CSQTT OAuth proxy: follow retry FAIL %s %s: %v", nextMethod, nextHost+followURL.Path, lastErr)
+					p.writeRetryPage(w, "VK не ответил вовремя", lastErr.Error(), retrySelf, 5)
+					return
+				}
+				if resp != nil && resp.StatusCode == http.StatusTooManyRequests {
+					waitSec2 := parseRetryAfterSec(resp.Header, vkOAuth429DefaultWaitSec)
+					_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+					_ = resp.Body.Close()
+					resp = nil
+					p.markRateLimited(waitSec2)
+					emitLog("CSQTT OAuth proxy: 429 on follow retry %s %s wait=%ds", nextMethod, nextHost+followURL.Path, waitSec2)
+					p.writeRateLimitPage(w, retrySelf, waitSec2)
+					return
+				}
+				// Fall through: update host/path from successful retry.
+			} else {
+				http.Error(w, "rate limited", http.StatusTooManyRequests)
+				return
+			}
 		}
 		host = nextHost
 		path = followURL.Path
@@ -1590,15 +1744,19 @@ func (p *vkOAuthProxy) serveOnce(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// After in-proxy follow, WebView URL still shows the first hop (e.g. /v/oauth…/authorize)
-	// while the body is id.vk.ru. Soft-serve shell↔shell and oauth→id.vk.ru/auth (inject
-	// history.replaceState + location.href/pathname facade). Hop only for other host changes
-	// (e.g. oauth.vk.com → oauth.vk.ru/authorize) so Set-Cookie Domain matches.
+	// while the body is id.vk.ru. Soft-serve shell↔shell, oauth→id.vk.ru/auth, and
+	// oauth.vk.com↔oauth.vk.ru/authorize (inject history.replaceState + location facade).
+	// Hop only for other host changes so Set-Cookie Domain matches.
 	reqKey := upstreamURLKey((&url.URL{Scheme: "https", Host: normalizeVkProxyHost(up.Host), Path: up.Path, RawQuery: up.RawQuery}).String())
 	finalKey := upstreamURLKey((&url.URL{Scheme: "https", Host: normalizeVkProxyHost(host), Path: path, RawQuery: rawQuery}).String())
 	if reqKey != finalKey {
 		softServe := (isSoftVkShellHost(up.Host) && isSoftVkShellHost(host)) ||
-			(isOAuthAuthorizeHost(up.Host) && isVkIDHost(host) && strings.HasPrefix(path, "/auth"))
+			(isOAuthAuthorizeHost(up.Host) && isVkIDHost(host) && strings.HasPrefix(path, "/auth")) ||
+			(isOAuthAuthorizeHost(up.Host) && isOAuthAuthorizeHost(host))
 		if softServe {
+			if isVkIDHost(host) && strings.HasPrefix(path, "/auth") {
+				p.rememberIDAuthURL((&url.URL{Scheme: "https", Host: normalizeVkProxyHost(host), Path: path, RawQuery: rawQuery}).String())
+			}
 			emitLog("CSQTT OAuth proxy: soft-serve %s → %s%s (no WebView hop)", up.Host+up.Path, host, path)
 			// fall through: rewrite body with final host + ensureProxyBase(final) + syncURI
 		} else {
@@ -1607,6 +1765,7 @@ func (p *vkOAuthProxy) serveOnce(w http.ResponseWriter, r *http.Request) {
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 			_ = resp.Body.Close()
 			bounce := (&url.URL{Scheme: "https", Host: normalizeVkProxyHost(host), Path: path, RawQuery: rawQuery}).String()
+			p.rememberIDAuthURL(bounce)
 			loc := p.rewriteLocation(bounce)
 			baseTrim := strings.TrimRight(p.base, "/")
 			if strings.HasPrefix(loc, baseTrim) {
@@ -1661,8 +1820,15 @@ func (p *vkOAuthProxy) serveOnce(w http.ResponseWriter, r *http.Request) {
 	if resp.StatusCode == http.StatusOK && (strings.Contains(bodyStr, "429 Too Many Requests") || strings.Contains(strings.ToLower(bodyStr), "kittenx")) {
 		waitSec := parseRetryAfterSec(resp.Header, vkOAuth429DefaultWaitSec)
 		p.markRateLimited(waitSec)
+		emitLog("CSQTT OAuth proxy: 429 in body %s wait=%ds", host+path, waitSec)
+		if isHTMLNavPath(path) && isOAuthAuthorizeHost(host) && p.tryServeCachedIDAuth(w, r) {
+			return
+		}
 		p.writeRateLimitPage(w, retrySelf, waitSec)
 		return
+	}
+	if resp.StatusCode == http.StatusOK && isVkIDHost(host) && strings.HasPrefix(path, "/auth") {
+		p.rememberIDAuthURL((&url.URL{Scheme: "https", Host: normalizeVkProxyHost(host), Path: path, RawQuery: rawQuery}).String())
 	}
 	out := p.rewriteHTML(bodyStr, host)
 	if strings.Contains(ct, "text/html") {
