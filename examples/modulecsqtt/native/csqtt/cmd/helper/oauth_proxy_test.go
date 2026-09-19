@@ -180,12 +180,8 @@ func TestStartVkOAuthProxyServerLocalOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer stop()
-	authPath := vkOAuthAuthorizeProxyPath("mobile")
-	if len(starts) != 1 || !strings.Contains(starts[0], "/v/oauth.vk.com/authorize?") {
-		t.Fatalf("starts=%v want …/v/oauth.vk.com/authorize?…", starts)
-	}
-	if !strings.Contains(starts[0], "client_id=7793118") || !strings.Contains(starts[0], "response_type=token") {
-		t.Fatalf("starts=%v missing authorize query", starts)
+	if len(starts) != 1 || !strings.Contains(starts[0], "/v/vk.ru/") {
+		t.Fatalf("starts=%v want …/v/vk.ru/", starts)
 	}
 	if !strings.Contains(done, vkOAuthCallbackPath) {
 		t.Fatalf("done=%q", done)
@@ -214,8 +210,11 @@ func TestStartVkOAuthProxyServerLocalOnly(t *testing.T) {
 		t.Fatalf("done status=%d body=%q", res.StatusCode, body)
 	}
 
-	// Legacy start path redirects into proxied authorize (no intermediate placeholder HTML).
-	base := strings.TrimSuffix(starts[0], authPath)
+	// Legacy start path redirects into LOGIN (vk.ru/), matching native VK_LOGIN_URL.
+	base := starts[0]
+	if i := strings.Index(base, "/v/"); i > 0 {
+		base = base[:i]
+	}
 	res, err = client.Get(base + vkOAuthStartPath)
 	if err != nil {
 		t.Fatalf("start path: %v", err)
@@ -225,8 +224,8 @@ func TestStartVkOAuthProxyServerLocalOnly(t *testing.T) {
 	if res.StatusCode != http.StatusFound {
 		t.Fatalf("start path want 302, got %d body=%q", res.StatusCode, body)
 	}
-	if loc := res.Header.Get("Location"); !strings.Contains(loc, "/v/oauth.vk.com/authorize") {
-		t.Fatalf("start Location=%q want authorize", loc)
+	if loc := res.Header.Get("Location"); !strings.Contains(loc, "/v/vk.ru/") {
+		t.Fatalf("start Location=%q want /v/vk.ru/", loc)
 	}
 
 	statusURL := strings.Replace(done, vkOAuthCallbackPath, vkOAuthStatusPath, 1)
@@ -402,27 +401,19 @@ func TestOAuthProxyHopToWebView(t *testing.T) {
 	}
 }
 
-func TestOAuthProxySoftShellSPABypassToAuthorize(t *testing.T) {
+func TestOAuthProxySoftShellLoginServed(t *testing.T) {
 	var hits []string
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		hits = append(hits, r.URL.Host+r.URL.Path)
-		if r.URL.Host == "oauth.vk.com" && r.URL.Path == "/authorize" {
-			return &http.Response{
-				StatusCode: http.StatusFound,
-				Header:     http.Header{"Location": []string{"https://id.vk.ru/auth?app_id=7793118"}},
-				Body:       io.NopCloser(strings.NewReader("")),
-				Request:    r,
-			}, nil
-		}
-		if r.URL.Host == "id.vk.ru" && r.URL.Path == "/auth" {
+		if r.URL.Host == "m.vk.ru" && (r.URL.Path == "/" || r.URL.Path == "") {
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
-				Body:       io.NopCloser(strings.NewReader("<html><head></head><body>vk-auth</body></html>")),
+				Body:       io.NopCloser(strings.NewReader("<html><head></head><body>vk-login-shell</body></html>")),
 				Request:    r,
 			}, nil
 		}
-		t.Fatalf("unexpected upstream %s (soft-shell SPA must not be fetched)", r.URL.String())
+		t.Fatalf("unexpected upstream %s (LOGIN must be soft-shell, not authorize SPA)", r.URL.String())
 		return nil, nil
 	})
 	p := &vkOAuthProxy{
@@ -437,17 +428,15 @@ func TestOAuthProxySoftShellSPABypassToAuthorize(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9/v/m.vk.ru/", nil)
 	rr := httptest.NewRecorder()
 	p.serve(rr, req)
-	// Bypass opens authorize → hop WebView onto id.vk.ru/auth (login form, not /about/id).
-	if rr.Code != http.StatusFound {
-		t.Fatalf("bypass want hop 302, got code=%d loc=%q body=%s hits=%v",
+	if rr.Code != http.StatusOK {
+		t.Fatalf("soft-shell LOGIN want 200, got code=%d loc=%q body=%s hits=%v",
 			rr.Code, rr.Header().Get("Location"), rr.Body.String(), hits)
 	}
-	loc := rr.Header().Get("Location")
-	if !strings.Contains(loc, "/v/id.vk.ru/auth") {
-		t.Fatalf("bypass Location=%q want /v/id.vk.ru/auth hits=%v", loc, hits)
+	if !strings.Contains(rr.Body.String(), "vk-login-shell") {
+		t.Fatalf("body=%q hits=%v", rr.Body.String(), hits)
 	}
-	if len(hits) < 2 || hits[0] != "oauth.vk.com/authorize" {
-		t.Fatalf("hits=%v want authorize then id.vk.ru/auth", hits)
+	if len(hits) != 1 || hits[0] != "m.vk.ru/" {
+		t.Fatalf("hits=%v want m.vk.ru/", hits)
 	}
 }
 
@@ -515,24 +504,16 @@ func TestSoftShellAssetCoalesceSurvivesCancel(t *testing.T) {
 	}
 }
 
-// GET / must soft-serve authorize (hop to auth) — never the m.vk.ru SPA, and never a bare id.vk.ru/ promo.
+// GET / must soft-serve LOGIN (vk.ru/ or referer host) — never bare id.vk.ru/ promo, never authorize SPA.
 func TestSoftRootNo302(t *testing.T) {
 	var hits []string
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		hits = append(hits, r.URL.Host+r.URL.Path)
-		if r.URL.Host == "oauth.vk.com" && r.URL.Path == "/authorize" {
-			return &http.Response{
-				StatusCode: http.StatusFound,
-				Header:     http.Header{"Location": []string{"https://id.vk.ru/auth?app_id=7793118"}},
-				Body:       io.NopCloser(strings.NewReader("")),
-				Request:    r,
-			}, nil
-		}
-		if r.URL.Host == "id.vk.ru" && r.URL.Path == "/auth" {
+		if r.URL.Host == "m.vk.ru" && (r.URL.Path == "/" || r.URL.Path == "") {
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
-				Body:       io.NopCloser(strings.NewReader("<html><head></head><body>soft-root-auth</body></html>")),
+				Body:       io.NopCloser(strings.NewReader("<html><head></head><body>soft-root-login</body></html>")),
 				Request:    r,
 			}, nil
 		}
@@ -552,18 +533,15 @@ func TestSoftRootNo302(t *testing.T) {
 	req.Header.Set("Referer", "http://127.0.0.1:9/v/m.vk.ru/")
 	rr := httptest.NewRecorder()
 	p.softServeRoot(rr, req)
-	// Soft-root rewrites to authorize in-process; authorize→auth is a hop→WebView 302
-	// (relative Location under loopback — not a remount onto m.vk.ru).
-	if rr.Code != http.StatusFound {
-		t.Fatalf("soft-root want hop 302, got code=%d loc=%q body=%s hits=%v",
+	if rr.Code != http.StatusOK {
+		t.Fatalf("soft-root want 200 LOGIN, got code=%d loc=%q body=%s hits=%v",
 			rr.Code, rr.Header().Get("Location"), rr.Body.String(), hits)
 	}
-	loc := rr.Header().Get("Location")
-	if !strings.Contains(loc, "/v/id.vk.ru/auth") {
-		t.Fatalf("soft-root Location=%q want /v/id.vk.ru/auth hits=%v", loc, hits)
+	if !strings.Contains(rr.Body.String(), "soft-root-login") {
+		t.Fatalf("body=%q hits=%v", rr.Body.String(), hits)
 	}
-	if len(hits) < 2 || hits[0] != "oauth.vk.com/authorize" {
-		t.Fatalf("hits=%v want authorize then auth", hits)
+	if len(hits) != 1 || hits[0] != "m.vk.ru/" {
+		t.Fatalf("hits=%v want m.vk.ru/", hits)
 	}
 }
 

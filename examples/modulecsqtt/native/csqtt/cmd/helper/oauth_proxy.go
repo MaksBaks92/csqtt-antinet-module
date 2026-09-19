@@ -28,14 +28,21 @@ const (
 	vkOAuthStartPath    = "/csqtt-vk-oauth-start"
 	vkOAuthStatusPath   = "/csqtt-vk-oauth-status"
 	vkOAuthProxyMaxBody = 2 << 20
-	// Native CSQTT (VkAuthSession / Constants.VkAutoHash): WebView token phase opens
-	// oauth.vk.*/authorize; unauthenticated users land on id.vk.ru/auth (login form).
-	// Bare id.vk.ru/ is a marketing promo (/about/id) — see 1.2.36 device log.
+	// Native CSQTT (VkAuthSession): LOGIN opens https://vk.ru/ (VK_LOGIN_URL); after remixsid
+	// TOKEN phase scrapes oauth authorize via HTTP (VkTokenScraper) — not the id.vk.ru SPA.
+	// Then the app opens the TURN/socket. Under AntiNet VPN we mirror that order on loopback:
+	// WebView → /v/vk.ru/ → remixsid in jar → scrapeAccessToken → done → helper raises TURN.
+	vkOAuthLoginHost     = "vk.ru"
 	vkOAuthAuthorizeHost = "oauth.vk.com"
 	vkOAuthAuthorizePath = "/authorize"
 	// Fallback host for root-relative recover-miss when Referer/lastHost are empty.
-	vkOAuthFallbackHost = "id.vk.ru"
+	vkOAuthFallbackHost = "vk.ru"
 )
+
+// vkOAuthLoginProxyPath is the loopback LOGIN URL (native VK_LOGIN_URL).
+func vkOAuthLoginProxyPath() string {
+	return vkOAuthProxyPrefix + vkOAuthLoginHost + "/"
+}
 
 // vkOAuthAuthorizeQuery matches CSQTT VkTokenScraper / VK_OAUTH_AUTH_URL params.
 func vkOAuthAuthorizeQuery(display string) string {
@@ -171,7 +178,6 @@ func isVkStaticCDNHost(host string) bool {
 
 // isSoftVkShellHost is the public mobile/desktop feed SPA (vk.ru ↔ m.vk.ru).
 // Soft-serving a 302 body under the request /v/ path avoids hop→WebView remounts.
-// Document roots on these hosts are bypassed to oauth authorize (see softServeLogin).
 func isSoftVkShellHost(host string) bool {
 	switch normalizeVkProxyHost(host) {
 	case "vk.ru", "vk.com", "m.vk.ru", "m.vk.com":
@@ -317,10 +323,10 @@ func startVkOAuthProxyServer() (startURLs []string, doneURL string, stop func(),
 			`<body style="font-family:sans-serif;padding:24px;background:#111;color:#eee"><p>Авторизация VK… окно закроется автоматически.</p></body></html>`)
 	})
 	mux.HandleFunc(vkOAuthStatusPath, p.handleOAuthStatus)
-	// Open oauth authorize (native CSQTT) — intermediate start page stayed on screen when SPA looped.
-	authStart := vkOAuthAuthorizeProxyPath("mobile")
+	// Native LOGIN URL (vk.ru/) — token scrape happens after remixsid, not via id.vk.ru SPA APIs.
+	loginStart := vkOAuthLoginProxyPath()
 	mux.HandleFunc(vkOAuthStartPath, func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, authStart, http.StatusFound)
+		http.Redirect(w, r, loginStart, http.StatusFound)
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
@@ -353,7 +359,7 @@ func startVkOAuthProxyServer() (startURLs []string, doneURL string, stop func(),
 		_ = ln.Close()
 	}
 
-	startURLs = []string{base + authStart}
+	startURLs = []string{base + loginStart}
 	return startURLs, doneURL, stop, nil
 }
 
@@ -375,35 +381,20 @@ func cloneURLWithPath(u *url.URL, path string) *url.URL {
 	return &out
 }
 
-// softServeRoot remaps GET / → oauth authorize without a 302. A Location bounce remounts the
+// softServeRoot remaps GET / → LOGIN (vk.ru/) without a 302. A Location bounce remounts the
 // AntiNet WebView document and storms coalesce HIT / recover-miss forever.
 func (p *vkOAuthProxy) softServeRoot(w http.ResponseWriter, r *http.Request) {
 	host, via := p.resolveMissHost("/", r.Header.Get("Referer"))
-	if host == "" || isSoftVkShellHost(host) || host == vkOAuthFallbackHost {
-		// Never soft-root into the feed SPA or id.vk.ru promo — open authorize like native CSQTT.
-		r2 := r.Clone(r.Context())
-		r2.URL = cloneURLWithPath(r.URL, vkOAuthProxyPrefix+vkOAuthAuthorizeHost+vkOAuthAuthorizePath)
-		r2.URL.RawQuery = vkOAuthAuthorizeQuery("mobile")
-		reason := via
-		if reason == "" {
-			reason = "login"
+	if host == "" || host == "id.vk.ru" || host == "id.vk.com" {
+		// Bare id.vk.ru/ is a marketing promo — LOGIN is vk.ru/ (native VK_LOGIN_URL).
+		host = vkOAuthLoginHost
+		if via == "" {
+			via = "login"
 		}
-		emitLog("CSQTT OAuth proxy: soft-root → authorize (%s)", reason)
-		p.serve(w, r2)
-		return
 	}
 	r2 := r.Clone(r.Context())
 	r2.URL = cloneURLWithPath(r.URL, vkOAuthProxyPrefix+host+"/")
 	emitLog("CSQTT OAuth proxy: soft-root → /v/%s/ (%s)", host, via)
-	p.serve(w, r2)
-}
-
-// softServeLogin remaps soft-shell SPA document roots to oauth authorize (native CSQTT).
-func (p *vkOAuthProxy) softServeLogin(w http.ResponseWriter, r *http.Request, fromHost string) {
-	r2 := r.Clone(r.Context())
-	r2.URL = cloneURLWithPath(r.URL, vkOAuthProxyPrefix+vkOAuthAuthorizeHost+vkOAuthAuthorizePath)
-	r2.URL.RawQuery = vkOAuthAuthorizeQuery("mobile")
-	emitLog("CSQTT OAuth proxy: soft-shell SPA bypass %s → oauth authorize", fromHost)
 	p.serve(w, r2)
 }
 
@@ -1114,11 +1105,6 @@ func (p *vkOAuthProxy) rememberHost(host string) {
 func (p *vkOAuthProxy) serve(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		if host, docPath, ok := unwrapVkProxyPath(r.URL.Path); ok {
-			// Do not ship the m.vk.ru/vk.ru feed SPA under loopback — it remounts forever.
-			if isHTMLNavPath(docPath) && isSoftVkShellHost(host) && softShellDocumentRoot(docPath) {
-				p.softServeLogin(w, r, host)
-				return
-			}
 			if isHTMLNavPath(docPath) {
 				p.serveHTMLCoalesced(w, r, host, docPath)
 				return
