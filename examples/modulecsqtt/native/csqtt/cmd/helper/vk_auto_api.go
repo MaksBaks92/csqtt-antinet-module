@@ -40,8 +40,10 @@ var (
 )
 
 func configureVkHTTP(protectPath string, resolver *protectedResolver) {
-	if resolver == nil || len(resolver.servers) == 0 {
-		resolver = newProtectedResolver("77.88.8.8,77.88.8.1", protectPath)
+	// Empty DNS_SERVERS → systemResolver under protect (dnsshim). Never hardcode public DNS
+	// and never fall through to net.DefaultResolver (MODULE_API §4 — DNS и protect).
+	if resolver == nil {
+		resolver = newProtectedResolver("", protectPath)
 	}
 	dialer := &net.Dialer{
 		Timeout:   8 * time.Second,

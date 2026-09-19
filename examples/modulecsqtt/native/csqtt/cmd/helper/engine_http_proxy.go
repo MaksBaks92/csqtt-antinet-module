@@ -16,12 +16,9 @@ import (
 )
 
 func startProtectHTTPProxy(protectPath string, resolver *protectedResolver) (string, func(), error) {
+	// Empty list → LookupHost uses systemResolver under protect (no public-DNS hardcode).
 	if resolver == nil {
 		resolver = newProtectedResolver("", protectPath)
-	}
-	if len(resolver.servers) == 0 {
-		// Same servers the rust engine already uses when the host did not pass DNS_SERVERS.
-		resolver = newProtectedResolver("77.88.8.8,77.88.8.1", protectPath)
 	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

@@ -117,7 +117,7 @@ func TestResolveUpstreamLocationAlreadyProxied(t *testing.T) {
 }
 
 func TestVkOAuthProxyInjectJSNoSPAHooks(t *testing.T) {
-	js := vkOAuthProxyInjectJS("http://127.0.0.1:50999", "http://127.0.0.1:50999/csqtt-vk-oauth-done")
+	js := vkOAuthProxyInjectJS("http://127.0.0.1:50999", "http://127.0.0.1:50999/csqtt-vk-oauth-done", "")
 	// Location navigation hooks remount the WebView; host/hostname getters are required
 	// so id.vk.ru/auth SPA does not treat document origin as 127.0.0.1 (white screen).
 	for _, bad := range []string{"hookLocation", "preferLogin", "hookNavigation", "allowFullNav"} {
@@ -125,7 +125,7 @@ func TestVkOAuthProxyInjectJSNoSPAHooks(t *testing.T) {
 			t.Fatalf("inject must not contain SPA navigation hook %q", bad)
 		}
 	}
-	for _, need := range []string{"toProxy", "hookNet", "rootProxy", "pinBase", "patchLoc", "__csqttLocHost", "Location.prototype"} {
+	for _, need := range []string{"toProxy", "hookNet", "rootProxy", "pinBase", "patchLoc", "__csqttLocHost", "Location.prototype", "syncDocURL", "proxyPathname"} {
 		if !strings.Contains(js, need) {
 			t.Fatalf("inject missing net/host proxy hook %q", need)
 		}
@@ -144,7 +144,7 @@ func TestResolveUpstreamLocation(t *testing.T) {
 }
 
 func TestVkOAuthProxyInjectJS(t *testing.T) {
-	js := vkOAuthProxyInjectJS("http://127.0.0.1:50999", "http://127.0.0.1:50999/csqtt-vk-oauth-done")
+	js := vkOAuthProxyInjectJS("http://127.0.0.1:50999", "http://127.0.0.1:50999/csqtt-vk-oauth-done", "")
 	for _, part := range []string{vkOAuthCallbackPath, "access_token=", "127.0.0.1:50999", vkOAuthStatusPath, "pollStatus", "hoist"} {
 		if !strings.Contains(js, part) {
 			t.Fatalf("inject JS missing %q", part)
@@ -155,6 +155,10 @@ func TestVkOAuthProxyInjectJS(t *testing.T) {
 	}
 	if !strings.Contains(js, "patchLoc") || !strings.Contains(js, "__csqttLocHost") {
 		t.Fatal("inject must patch Location.host for id.vk.ru SPA under loopback")
+	}
+	jsSync := vkOAuthProxyInjectJS("http://127.0.0.1:50999", "http://127.0.0.1:50999/csqtt-vk-oauth-done", "/v/id.vk.ru/auth")
+	if !strings.Contains(jsSync, "/v/id.vk.ru/auth") || !strings.Contains(jsSync, "syncDocURL") {
+		t.Fatal("inject must embed syncURI for soft-serve oauth→id.vk.ru/auth")
 	}
 }
 
@@ -357,7 +361,7 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
-func TestOAuthProxyHopToWebView(t *testing.T) {
+func TestOAuthProxySoftServeOAuthToIDAuth(t *testing.T) {
 	var hits []string
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		hits = append(hits, r.URL.Host+r.URL.Path)
@@ -393,12 +397,18 @@ func TestOAuthProxyHopToWebView(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9/v/oauth.vk.com/authorize?client_id=1", nil)
 	rr := httptest.NewRecorder()
 	p.serve(rr, req)
-	if rr.Code != http.StatusFound {
+	if rr.Code != http.StatusOK {
 		t.Fatalf("code=%d body=%s hits=%v", rr.Code, rr.Body.String(), hits)
 	}
-	loc := rr.Header().Get("Location")
-	if !strings.Contains(loc, "/v/id.vk.ru/auth") || !strings.Contains(loc, "h=1") {
-		t.Fatalf("loc=%q hits=%v", loc, hits)
+	body := rr.Body.String()
+	if strings.Contains(body, "Location:") || rr.Header().Get("Location") != "" {
+		t.Fatalf("must soft-serve (no WebView hop), loc=%q", rr.Header().Get("Location"))
+	}
+	if !strings.Contains(body, "login") || !strings.Contains(body, "__csqttOauthProxy") {
+		t.Fatalf("expected injected auth HTML, body=%s", body)
+	}
+	if !strings.Contains(body, "/v/id.vk.ru/auth") || !strings.Contains(body, "syncDocURL") {
+		t.Fatalf("inject must syncURI to id.vk.ru/auth, body len=%d", len(body))
 	}
 	if len(hits) < 2 {
 		t.Fatalf("expected follow, hits=%v", hits)
@@ -603,8 +613,8 @@ func TestOAuthProxyHopComToRuAuthorize(t *testing.T) {
 }
 
 func TestVkOAuthProxyInjectJSMinimal(t *testing.T) {
-	js := vkOAuthProxyInjectJS("http://127.0.0.1:9", "http://127.0.0.1:9/csqtt-vk-oauth-done")
-	for _, needle := range []string{"pollStatus", "hoist", "pinBase", "MutationObserver", "access_token=", vkOAuthStatusPath, "toProxy", "hookNet", "window.fetch", "XMLHttpRequest.prototype.open", "patchLoc", "__csqttLocHost", "Location.prototype"} {
+	js := vkOAuthProxyInjectJS("http://127.0.0.1:9", "http://127.0.0.1:9/csqtt-vk-oauth-done", "")
+	for _, needle := range []string{"pollStatus", "hoist", "pinBase", "MutationObserver", "access_token=", vkOAuthStatusPath, "toProxy", "hookNet", "window.fetch", "XMLHttpRequest.prototype.open", "patchLoc", "__csqttLocHost", "Location.prototype", "syncDocURL", "proxyPathname"} {
 		if !strings.Contains(js, needle) {
 			t.Fatalf("inject missing %q", needle)
 		}
@@ -634,14 +644,14 @@ func TestBrowserHeaderURLLoopbackOrigin(t *testing.T) {
 func TestInjectProxyScriptIntoHTML(t *testing.T) {
 	p := &vkOAuthProxy{base: "http://127.0.0.1:9", doneURL: "http://127.0.0.1:9/csqtt-vk-oauth-done"}
 	in := `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body>hi</body></html>`
-	out := p.injectProxyScript(in)
+	out := p.injectProxyScript(in, "")
 	if !strings.Contains(out, "__csqttOauthProxy") || !strings.Contains(out, "pollStatus") {
 		t.Fatalf("script not injected: %s", out)
 	}
 	if i := strings.Index(out, "__csqttOauthProxy"); i < 0 || i > strings.Index(out, "</head>") {
 		t.Fatal("inject must land inside <head>")
 	}
-	out2 := p.injectProxyScript(out)
+	out2 := p.injectProxyScript(out, "")
 	if strings.Count(out2, "<script>") != strings.Count(out, "<script>") {
 		t.Fatal("double inject")
 	}

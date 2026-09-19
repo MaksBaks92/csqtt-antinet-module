@@ -648,6 +648,7 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	log.Printf("csqtt helper: SOCKS5 on 127.0.0.1:%d tun=%s dns=%s pkt=%d", actualPort, tunIP, engineTunDNS(), pktPort)
 
 	setHostEventHandler(func(event string) {
+		// dns=<…> забирает канон hostproto→rememberHostDNSServers (подписка newProtectedResolver).
 		switch event {
 		case "handover", "netlost", "netback", "stall":
 			emitLog(s.handoverLog)
@@ -939,7 +940,7 @@ func requestVkAccessToken(profileDir string) (string, error) {
 	if i := strings.Index(doneURL, vkOAuthCallbackPath); i > 0 {
 		base = doneURL[:i]
 	}
-	emitLog("CSQTT: VK OAuth — authorize → id.vk.ru/auth (хеш/токен через scrape), потом TURN-сокет; loopback /v/ только из‑за DNS VPN")
+	emitLog("CSQTT: VK OAuth — authorize → id.vk.ru/auth (хеш через scrape), потом TURN; WebView→127.0.0.1, VK→helper protect")
 
 	id := fmt.Sprintf("vk-oauth-%d", time.Now().UnixNano())
 	res, cancelled := runAction(profileDir, id, map[string]any{
@@ -949,7 +950,7 @@ func requestVkAccessToken(profileDir string) (string, error) {
 		"urlPattern":    vkOAuthCallbackPattern(),
 		"param":         "access_token",
 		"urlTimeoutSec": int(vkOAuthURLHop / time.Second),
-		"injectJs":      vkOAuthProxyInjectJS(base, doneURL),
+		"injectJs":      vkOAuthProxyInjectJS(base, doneURL, ""),
 	})
 	if cancelled {
 		return "", fmt.Errorf("VK login cancelled (закройте окно только после входа и редиректа)")

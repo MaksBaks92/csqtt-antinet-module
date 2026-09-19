@@ -84,9 +84,15 @@ CANONS = (
     {"dir": SHARED_HOSTPROTO, "glob": "hostproto*.go", "label": "hostproto", "gate": None, "android": True},
     {"dir": SHARED_ENTRY, "glob": "entry_*.go", "label": "entry", "gate": None, "android": True},
     {"dir": SHARED_SOCKS5, "glob": "socks5shared*.go", "label": "socks5", "gate": "socks5", "android": True},
+    # Прокладка к резолверам ОС — БЕЗ гейта, как protect/offtun: это абстракция от платформы, а не
+    # опция. Модулю может не понадобиться кэширующий резолвер dial-таргетов (`dnsResolver`), но
+    # добраться до резолверов системы, не уходя в TUN, обязан мочь любой. Маски не пересекаются:
+    # `dns_*.go` требует `_` сразу после `dns`, которого у `dnsshim_` нет.
+    {"dir": SHARED_DNS, "glob": "dnsshim_*.go", "label": "dns-shim", "gate": None, "android": True},
     {"dir": SHARED_DNS, "glob": "dns_*.go", "label": "dns", "gate": "dnsResolver", "android": True},
 )
-SHARED_CANONS = tuple(c["dir"] for c in CANONS)
+# Каталоги канонов БЕЗ повторов: у `shared/dns` два входа в CANONS (разные маски/гейты, один dir).
+SHARED_CANONS = tuple(dict.fromkeys(c["dir"] for c in CANONS))
 
 RUST_ANDROID_TARGETS = {
     "arm64-v8a": "aarch64-linux-android",

@@ -196,9 +196,12 @@ func lookupPTRName(resolver *protectedResolver, ip netip.Addr) (string, error) {
 	if resolver == nil {
 		return "", fmt.Errorf("no resolver")
 	}
-	servers := resolver.servers
+	servers := resolver.currentServers()
 	if len(servers) == 0 {
-		servers = []string{"77.88.8.8:53", "77.88.8.1:53"}
+		servers = hostDNSServers()
+	}
+	if len(servers) == 0 {
+		return "", errNoDNSServers
 	}
 	qname := ptrName(ip)
 	var last error
