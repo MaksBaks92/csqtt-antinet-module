@@ -28,20 +28,20 @@ const (
 	vkOAuthStartPath    = "/csqtt-vk-oauth-start"
 	vkOAuthStatusPath   = "/csqtt-vk-oauth-status"
 	vkOAuthProxyMaxBody = 2 << 20
-	// Native CSQTT (VkAuthSession): LOGIN opens https://vk.ru/ (VK_LOGIN_URL); after remixsid
-	// TOKEN phase scrapes oauth authorize via HTTP (VkTokenScraper) — not the id.vk.ru SPA.
-	// Then the app opens the TURN/socket. Under AntiNet VPN we mirror that order on loopback:
-	// WebView → /v/vk.ru/ → remixsid in jar → scrapeAccessToken → done → helper raises TURN.
-	vkOAuthLoginHost     = "vk.ru"
+	// Under AntiNet VPN WebView only sees 127.0.0.1. Soft-shell (vk.ru/m.vk.ru) SPA remounts
+	// forever under loopback (1.2.39 black screen). Start at oauth authorize → hop once to
+	// id.vk.ru/auth (visible login like ≤1.2.36, not feed SPA). After remixsid, scrape token
+	// then raise TURN — same order as native CSQTT (hash first, socket second).
+	vkOAuthLoginHost     = "oauth.vk.com"
 	vkOAuthAuthorizeHost = "oauth.vk.com"
 	vkOAuthAuthorizePath = "/authorize"
 	// Fallback host for root-relative recover-miss when Referer/lastHost are empty.
-	vkOAuthFallbackHost = "vk.ru"
+	vkOAuthFallbackHost = "id.vk.ru"
 )
 
-// vkOAuthLoginProxyPath is the loopback LOGIN URL (native VK_LOGIN_URL).
+// vkOAuthLoginProxyPath is the loopback WebView entry (authorize → id.vk.ru/auth).
 func vkOAuthLoginProxyPath() string {
-	return vkOAuthProxyPrefix + vkOAuthLoginHost + "/"
+	return vkOAuthAuthorizeProxyPath("mobile")
 }
 
 // vkOAuthAuthorizeQuery matches CSQTT VkTokenScraper / VK_OAUTH_AUTH_URL params.
@@ -178,6 +178,7 @@ func isVkStaticCDNHost(host string) bool {
 
 // isSoftVkShellHost is the public mobile/desktop feed SPA (vk.ru ↔ m.vk.ru).
 // Soft-serving a 302 body under the request /v/ path avoids hop→WebView remounts.
+// Document roots on these hosts are bypassed to authorize (see softServeLogin).
 func isSoftVkShellHost(host string) bool {
 	switch normalizeVkProxyHost(host) {
 	case "vk.ru", "vk.com", "m.vk.ru", "m.vk.com":
@@ -323,7 +324,7 @@ func startVkOAuthProxyServer() (startURLs []string, doneURL string, stop func(),
 			`<body style="font-family:sans-serif;padding:24px;background:#111;color:#eee"><p>Авторизация VK… окно закроется автоматически.</p></body></html>`)
 	})
 	mux.HandleFunc(vkOAuthStatusPath, p.handleOAuthStatus)
-	// Native LOGIN URL (vk.ru/) — token scrape happens after remixsid, not via id.vk.ru SPA APIs.
+	// Authorize entry — soft-shell feed SPA under loopback remounts forever (1.2.39).
 	loginStart := vkOAuthLoginProxyPath()
 	mux.HandleFunc(vkOAuthStartPath, func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, loginStart, http.StatusFound)
@@ -381,21 +382,38 @@ func cloneURLWithPath(u *url.URL, path string) *url.URL {
 	return &out
 }
 
-// softServeRoot remaps GET / → LOGIN (vk.ru/) without a 302. A Location bounce remounts the
+// softServeRoot remaps GET / → authorize without a 302. A Location bounce remounts the
 // AntiNet WebView document and storms coalesce HIT / recover-miss forever.
 func (p *vkOAuthProxy) softServeRoot(w http.ResponseWriter, r *http.Request) {
 	host, via := p.resolveMissHost("/", r.Header.Get("Referer"))
-	if host == "" || host == "id.vk.ru" || host == "id.vk.com" {
-		// Bare id.vk.ru/ is a marketing promo — LOGIN is vk.ru/ (native VK_LOGIN_URL).
-		host = vkOAuthLoginHost
-		if via == "" {
-			via = "login"
-		}
+	if host == "" || isSoftVkShellHost(host) || host == "id.vk.ru" || host == "id.vk.com" {
+		// Never soft-root into feed SPA or bare id.vk.ru/ promo — authorize → /auth.
+		p.softServeLogin(w, r, host)
+		return
 	}
 	r2 := r.Clone(r.Context())
 	r2.URL = cloneURLWithPath(r.URL, vkOAuthProxyPrefix+host+"/")
 	emitLog("CSQTT OAuth proxy: soft-root → /v/%s/ (%s)", host, via)
 	p.serve(w, r2)
+}
+
+// softServeLogin remaps soft-shell SPA document roots to oauth authorize without a 302.
+func (p *vkOAuthProxy) softServeLogin(w http.ResponseWriter, r *http.Request, fromHost string) {
+	entry := vkOAuthLoginProxyPath() // /v/oauth.vk.com/authorize?...
+	r2 := r.Clone(r.Context())
+	if u, err := url.Parse(entry); err == nil {
+		r2.URL.Path = u.Path
+		r2.URL.RawQuery = u.RawQuery
+		r2.URL.RawPath = ""
+	} else {
+		r2.URL = cloneURLWithPath(r.URL, entry)
+	}
+	emitLog("CSQTT OAuth proxy: soft-shell SPA bypass %s → authorize", fromHost)
+	authHost, authPath, ok := unwrapVkProxyPath(r2.URL.Path)
+	if !ok {
+		authHost, authPath = vkOAuthAuthorizeHost, vkOAuthAuthorizePath
+	}
+	p.serveHTMLCoalesced(w, r2, authHost, authPath)
 }
 
 // proxyHostFromReferer recovers /v/<host>/… from a loopback Referer so root-relative
@@ -1105,6 +1123,11 @@ func (p *vkOAuthProxy) rememberHost(host string) {
 func (p *vkOAuthProxy) serve(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		if host, docPath, ok := unwrapVkProxyPath(r.URL.Path); ok {
+			// Do not ship the m.vk.ru/vk.ru feed SPA under loopback — it remounts forever.
+			if isHTMLNavPath(docPath) && isSoftVkShellHost(host) && softShellDocumentRoot(docPath) {
+				p.softServeLogin(w, r, host)
+				return
+			}
 			if isHTMLNavPath(docPath) {
 				p.serveHTMLCoalesced(w, r, host, docPath)
 				return
@@ -1651,8 +1674,9 @@ func vkOAuthProxyInjectJS(base, doneURL string) string {
 	marker, _ := json.Marshal(vkOAuthCallbackPath)
 	status, _ := json.Marshal(strings.TrimRight(base, "/") + vkOAuthStatusPath)
 	// AntiNet WebView cannot resolve VK hosts (VPN DNS) — pages live under /v/<host>/.
-	// id.vk.ru/auth SPA calls https://api.vk.ru / login.vk.* directly → white screen unless
-	// fetch/XHR are rewritten to loopback. Do NOT hook Location/Navigation (remount storms).
+	// id.vk.ru/auth SPA reads location.host (127.0.0.1) → white screen; patch host/hostname/
+	// protocol/origin/port to the /v/<host>/ document host. Do NOT hook Location navigation
+	// (href/assign/replace) — that remounts the WebView. fetch/XHR still go through toProxy.
 	// pinBase keeps <base href="/v/<host>/"> so root-relative /images stay under the proxy.
-	return `(function(){if(window.__csqttOauthProxy)return;window.__csqttOauthProxy=1;var base=` + string(b) + `;var prefix=` + string(prefix) + `;var done=` + string(d) + `;var marker=` + string(marker) + `;var status=` + string(status) + `;function proxyBaseHref(){try{var m=String(location.pathname||'').match(/^\/v\/([^\/]+)\//);return m?prefix+m[1]+'/':'';}catch(e){return '';}}function pinBase(){try{var href=proxyBaseHref();if(!href)return;var el=document.getElementById('base')||document.querySelector('base');if(!el){el=document.createElement('base');el.id='base';var h=document.head||document.documentElement;if(h)h.insertBefore(el,h.firstChild);}if(el.getAttribute('href')!==href)el.setAttribute('href',href);}catch(e){}}function rootProxy(u){try{if(!u||u.charAt(0)!=='/'||u.charAt(1)==='/')return u;if(u.indexOf(prefix)===0)return u;var m=String(location.pathname||'').match(/^\/v\/([^\/]+)/);if(!m)return u;return prefix+m[1]+u;}catch(e){return u;}}function toProxy(u){try{u=String(u||'');if(u.charAt(0)==='/'&&u.charAt(1)!=='/'){var rp=rootProxy(u);if(rp!==u)return rp;}var a=document.createElement('a');a.href=u;var h=String(a.hostname||'').toLowerCase();if(!h||h==='127.0.0.1'||h==='localhost')return String(u);if(!(/(^|\.)vk\.(com|ru)$/.test(h)||/(^|\.)userapi\.com$/.test(h)||/(^|\.)vkuserphoto\.ru$/.test(h)||h.indexOf('vk-cdn')>=0||h.indexOf('vkuseraudio')>=0||h.indexOf('vkcc.net')>=0))return String(u);return base+prefix+h+(a.pathname||'/')+(a.search||'')+(a.hash||'');}catch(e){return String(u);}}function hoist(){try{var href=String(location.href||'');if(href.indexOf(marker)>=0)return;var h=String(location.hash||'');var s=String(location.search||'');var q='';if(h.indexOf('access_token=')>=0||h.indexOf('error=')>=0){q=h.replace(/^#/,'');}else if(s.indexOf('access_token=')>=0||s.indexOf('error=')>=0){q=s.replace(/^\?/,'');}else{return;}var sep=done.indexOf('?')>=0?'&':'?';location.replace(done+sep+q);}catch(e){}}function pollStatus(){try{if(window.__csqttOauthDone)return;var x=new XMLHttpRequest();x.open('GET',status,true);x.withCredentials=true;x.timeout=15000;x.onload=function(){try{var j=JSON.parse(x.responseText||'{}');if(j&&j.state==='ok'&&j.url){window.__csqttOauthDone=1;location.replace(j.url);}}catch(e){}};x.send();}catch(e){}}function hookNet(){try{var of=window.fetch;if(typeof of==='function'){window.fetch=function(input,init){try{var u=(typeof input==='string')?input:(input&&input.url);if(u){var n=toProxy(String(u));if(n!==String(u)){if(typeof input==='string')input=n;else if(typeof Request!=='undefined')input=new Request(n,input);}}}catch(e){}return of.call(this,input,init);};}}catch(e){}try{var XO=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(){try{if(typeof arguments[1]==='string')arguments[1]=toProxy(arguments[1]);}catch(e){}return XO.apply(this,arguments);};}catch(e){}}document.addEventListener('submit',function(e){try{var f=e.target;if(!f||!f.action)return;var n=toProxy(f.getAttribute('action')||f.action);if(n!==(f.getAttribute('action')||f.action))f.action=n;}catch(err){}},true);hookNet();pinBase();hoist();pollStatus();try{var mo=new MutationObserver(function(){pinBase();});mo.observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:['href']});}catch(e){}window.addEventListener('hashchange',hoist);setInterval(function(){pinBase();hoist();pollStatus();},1000);})();`
+	return `(function(){if(window.__csqttOauthProxy)return;window.__csqttOauthProxy=1;var base=` + string(b) + `;var prefix=` + string(prefix) + `;var done=` + string(d) + `;var marker=` + string(marker) + `;var status=` + string(status) + `;function proxyHost(){try{var m=String(location.pathname||'').match(/^\/v\/([^\/]+)/);return m?m[1]:'';}catch(e){return '';}}function proxyBaseHref(){try{var h=proxyHost();return h?prefix+h+'/':'';}catch(e){return '';}}function pinBase(){try{var href=proxyBaseHref();if(!href)return;var el=document.getElementById('base')||document.querySelector('base');if(!el){el=document.createElement('base');el.id='base';var h=document.head||document.documentElement;if(h)h.insertBefore(el,h.firstChild);}if(el.getAttribute('href')!==href)el.setAttribute('href',href);}catch(e){}}function patchLoc(){try{var h=proxyHost();if(!h||window.__csqttLocHost===h)return;window.__csqttLocHost=h;var proto='https:';function gd(g){return{configurable:true,enumerable:true,get:g};}try{Object.defineProperty(Location.prototype,'hostname',gd(function(){return window.__csqttLocHost||'';}));Object.defineProperty(Location.prototype,'host',gd(function(){return window.__csqttLocHost||'';}));Object.defineProperty(Location.prototype,'protocol',gd(function(){return proto;}));Object.defineProperty(Location.prototype,'origin',gd(function(){return proto+'//'+(window.__csqttLocHost||'');}));Object.defineProperty(Location.prototype,'port',gd(function(){return '';}));}catch(e){}}catch(e){}}function rootProxy(u){try{if(!u||u.charAt(0)!=='/'||u.charAt(1)==='/')return u;if(u.indexOf(prefix)===0)return u;var m=String(location.pathname||'').match(/^\/v\/([^\/]+)/);if(!m)return u;return prefix+m[1]+u;}catch(e){return u;}}function toProxy(u){try{u=String(u||'');if(u.charAt(0)==='/'&&u.charAt(1)!=='/'){var rp=rootProxy(u);if(rp!==u)return rp;}var a=document.createElement('a');a.href=u;var h=String(a.hostname||'').toLowerCase();if(!h||h==='127.0.0.1'||h==='localhost')return String(u);if(!(/(^|\.)vk\.(com|ru)$/.test(h)||/(^|\.)userapi\.com$/.test(h)||/(^|\.)vkuserphoto\.ru$/.test(h)||h.indexOf('vk-cdn')>=0||h.indexOf('vkuseraudio')>=0||h.indexOf('vkcc.net')>=0))return String(u);return base+prefix+h+(a.pathname||'/')+(a.search||'')+(a.hash||'');}catch(e){return String(u);}}function hoist(){try{var href=String(location.href||'');if(href.indexOf(marker)>=0)return;var h=String(location.hash||'');var s=String(location.search||'');var q='';if(h.indexOf('access_token=')>=0||h.indexOf('error=')>=0){q=h.replace(/^#/,'');}else if(s.indexOf('access_token=')>=0||s.indexOf('error=')>=0){q=s.replace(/^\?/,'');}else{return;}var sep=done.indexOf('?')>=0?'&':'?';location.replace(done+sep+q);}catch(e){}}function pollStatus(){try{if(window.__csqttOauthDone)return;var x=new XMLHttpRequest();x.open('GET',status,true);x.withCredentials=true;x.timeout=15000;x.onload=function(){try{var j=JSON.parse(x.responseText||'{}');if(j&&j.state==='ok'&&j.url){window.__csqttOauthDone=1;location.replace(j.url);}}catch(e){}};x.send();}catch(e){}}function hookNet(){try{var of=window.fetch;if(typeof of==='function'){window.fetch=function(input,init){try{var u=(typeof input==='string')?input:(input&&input.url);if(u){var n=toProxy(String(u));if(n!==String(u)){if(typeof input==='string')input=n;else if(typeof Request!=='undefined')input=new Request(n,input);}}}catch(e){}return of.call(this,input,init);};}}catch(e){}try{var XO=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(){try{if(typeof arguments[1]==='string')arguments[1]=toProxy(arguments[1]);}catch(e){}return XO.apply(this,arguments);};}catch(e){}}document.addEventListener('submit',function(e){try{var f=e.target;if(!f||!f.action)return;var n=toProxy(f.getAttribute('action')||f.action);if(n!==(f.getAttribute('action')||f.action))f.action=n;}catch(err){}},true);patchLoc();hookNet();pinBase();hoist();pollStatus();try{var mo=new MutationObserver(function(){pinBase();patchLoc();});mo.observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:['href']});}catch(e){}window.addEventListener('hashchange',hoist);setInterval(function(){pinBase();patchLoc();hoist();pollStatus();},1000);})();`
 }

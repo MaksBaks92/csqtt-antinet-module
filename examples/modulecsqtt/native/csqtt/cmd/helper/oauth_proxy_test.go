@@ -118,15 +118,16 @@ func TestResolveUpstreamLocationAlreadyProxied(t *testing.T) {
 
 func TestVkOAuthProxyInjectJSNoSPAHooks(t *testing.T) {
 	js := vkOAuthProxyInjectJS("http://127.0.0.1:50999", "http://127.0.0.1:50999/csqtt-vk-oauth-done")
-	// Location/Navigation hooks remount the WebView; fetch/XHR hooks are required for id.vk.ru/auth.
-	for _, bad := range []string{"hookLocation", "preferLogin", "hookNavigation", "allowFullNav", "Location.prototype"} {
+	// Location navigation hooks remount the WebView; host/hostname getters are required
+	// so id.vk.ru/auth SPA does not treat document origin as 127.0.0.1 (white screen).
+	for _, bad := range []string{"hookLocation", "preferLogin", "hookNavigation", "allowFullNav"} {
 		if strings.Contains(js, bad) {
 			t.Fatalf("inject must not contain SPA navigation hook %q", bad)
 		}
 	}
-	for _, need := range []string{"toProxy", "hookNet", "rootProxy", "pinBase"} {
+	for _, need := range []string{"toProxy", "hookNet", "rootProxy", "pinBase", "patchLoc", "__csqttLocHost", "Location.prototype"} {
 		if !strings.Contains(js, need) {
-			t.Fatalf("inject missing net proxy hook %q", need)
+			t.Fatalf("inject missing net/host proxy hook %q", need)
 		}
 	}
 }
@@ -149,8 +150,11 @@ func TestVkOAuthProxyInjectJS(t *testing.T) {
 			t.Fatalf("inject JS missing %q", part)
 		}
 	}
-	if strings.Contains(js, "hookNavigation") || strings.Contains(js, "allowFullNav") || strings.Contains(js, "Location.prototype") {
+	if strings.Contains(js, "hookNavigation") || strings.Contains(js, "allowFullNav") || strings.Contains(js, "hookLocation") {
 		t.Fatal("inject must not hook Location/Navigation (SPA remount storm)")
+	}
+	if !strings.Contains(js, "patchLoc") || !strings.Contains(js, "__csqttLocHost") {
+		t.Fatal("inject must patch Location.host for id.vk.ru SPA under loopback")
 	}
 }
 
@@ -180,8 +184,8 @@ func TestStartVkOAuthProxyServerLocalOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer stop()
-	if len(starts) != 1 || !strings.Contains(starts[0], "/v/vk.ru/") {
-		t.Fatalf("starts=%v want …/v/vk.ru/", starts)
+	if len(starts) != 1 || !strings.Contains(starts[0], "/v/oauth.vk.com/authorize") {
+		t.Fatalf("starts=%v want …/v/oauth.vk.com/authorize", starts)
 	}
 	if !strings.Contains(done, vkOAuthCallbackPath) {
 		t.Fatalf("done=%q", done)
@@ -210,7 +214,7 @@ func TestStartVkOAuthProxyServerLocalOnly(t *testing.T) {
 		t.Fatalf("done status=%d body=%q", res.StatusCode, body)
 	}
 
-	// Legacy start path redirects into LOGIN (vk.ru/), matching native VK_LOGIN_URL.
+	// Legacy start path redirects into authorize (→ id.vk.ru/auth hop), not feed SPA.
 	base := starts[0]
 	if i := strings.Index(base, "/v/"); i > 0 {
 		base = base[:i]
@@ -224,8 +228,8 @@ func TestStartVkOAuthProxyServerLocalOnly(t *testing.T) {
 	if res.StatusCode != http.StatusFound {
 		t.Fatalf("start path want 302, got %d body=%q", res.StatusCode, body)
 	}
-	if loc := res.Header.Get("Location"); !strings.Contains(loc, "/v/vk.ru/") {
-		t.Fatalf("start Location=%q want /v/vk.ru/", loc)
+	if loc := res.Header.Get("Location"); !strings.Contains(loc, "/v/oauth.vk.com/authorize") {
+		t.Fatalf("start Location=%q want /v/oauth.vk.com/authorize", loc)
 	}
 
 	statusURL := strings.Replace(done, vkOAuthCallbackPath, vkOAuthStatusPath, 1)
@@ -405,15 +409,16 @@ func TestOAuthProxySoftShellLoginServed(t *testing.T) {
 	var hits []string
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		hits = append(hits, r.URL.Host+r.URL.Path)
-		if r.URL.Host == "m.vk.ru" && (r.URL.Path == "/" || r.URL.Path == "") {
+		// Soft-shell document roots bypass to oauth authorize (not m.vk.ru feed SPA).
+		if r.URL.Host == "oauth.vk.com" && r.URL.Path == "/authorize" {
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
-				Body:       io.NopCloser(strings.NewReader("<html><head></head><body>vk-login-shell</body></html>")),
+				Body:       io.NopCloser(strings.NewReader("<html><head></head><body>vk-authorize</body></html>")),
 				Request:    r,
 			}, nil
 		}
-		t.Fatalf("unexpected upstream %s (LOGIN must be soft-shell, not authorize SPA)", r.URL.String())
+		t.Fatalf("unexpected upstream %s (soft-shell must bypass to authorize)", r.URL.String())
 		return nil, nil
 	})
 	p := &vkOAuthProxy{
@@ -429,14 +434,14 @@ func TestOAuthProxySoftShellLoginServed(t *testing.T) {
 	rr := httptest.NewRecorder()
 	p.serve(rr, req)
 	if rr.Code != http.StatusOK {
-		t.Fatalf("soft-shell LOGIN want 200, got code=%d loc=%q body=%s hits=%v",
+		t.Fatalf("soft-shell→authorize want 200, got code=%d loc=%q body=%s hits=%v",
 			rr.Code, rr.Header().Get("Location"), rr.Body.String(), hits)
 	}
-	if !strings.Contains(rr.Body.String(), "vk-login-shell") {
+	if !strings.Contains(rr.Body.String(), "vk-authorize") {
 		t.Fatalf("body=%q hits=%v", rr.Body.String(), hits)
 	}
-	if len(hits) != 1 || hits[0] != "m.vk.ru/" {
-		t.Fatalf("hits=%v want m.vk.ru/", hits)
+	if len(hits) != 1 || hits[0] != "oauth.vk.com/authorize" {
+		t.Fatalf("hits=%v want oauth.vk.com/authorize", hits)
 	}
 }
 
@@ -504,16 +509,16 @@ func TestSoftShellAssetCoalesceSurvivesCancel(t *testing.T) {
 	}
 }
 
-// GET / must soft-serve LOGIN (vk.ru/ or referer host) — never bare id.vk.ru/ promo, never authorize SPA.
+// GET / must soft-serve authorize (bypass feed SPA / bare id.vk.ru/ promo) without a 302.
 func TestSoftRootNo302(t *testing.T) {
 	var hits []string
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		hits = append(hits, r.URL.Host+r.URL.Path)
-		if r.URL.Host == "m.vk.ru" && (r.URL.Path == "/" || r.URL.Path == "") {
+		if r.URL.Host == "oauth.vk.com" && r.URL.Path == "/authorize" {
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
-				Body:       io.NopCloser(strings.NewReader("<html><head></head><body>soft-root-login</body></html>")),
+				Body:       io.NopCloser(strings.NewReader("<html><head></head><body>soft-root-authorize</body></html>")),
 				Request:    r,
 			}, nil
 		}
@@ -534,14 +539,14 @@ func TestSoftRootNo302(t *testing.T) {
 	rr := httptest.NewRecorder()
 	p.softServeRoot(rr, req)
 	if rr.Code != http.StatusOK {
-		t.Fatalf("soft-root want 200 LOGIN, got code=%d loc=%q body=%s hits=%v",
+		t.Fatalf("soft-root want 200 authorize, got code=%d loc=%q body=%s hits=%v",
 			rr.Code, rr.Header().Get("Location"), rr.Body.String(), hits)
 	}
-	if !strings.Contains(rr.Body.String(), "soft-root-login") {
+	if !strings.Contains(rr.Body.String(), "soft-root-authorize") {
 		t.Fatalf("body=%q hits=%v", rr.Body.String(), hits)
 	}
-	if len(hits) != 1 || hits[0] != "m.vk.ru/" {
-		t.Fatalf("hits=%v want m.vk.ru/", hits)
+	if len(hits) != 1 || hits[0] != "oauth.vk.com/authorize" {
+		t.Fatalf("hits=%v want oauth.vk.com/authorize", hits)
 	}
 }
 
@@ -599,13 +604,15 @@ func TestOAuthProxyHopComToRuAuthorize(t *testing.T) {
 
 func TestVkOAuthProxyInjectJSMinimal(t *testing.T) {
 	js := vkOAuthProxyInjectJS("http://127.0.0.1:9", "http://127.0.0.1:9/csqtt-vk-oauth-done")
-	for _, needle := range []string{"pollStatus", "hoist", "pinBase", "MutationObserver", "access_token=", vkOAuthStatusPath, "toProxy", "hookNet", "window.fetch", "XMLHttpRequest.prototype.open"} {
+	for _, needle := range []string{"pollStatus", "hoist", "pinBase", "MutationObserver", "access_token=", vkOAuthStatusPath, "toProxy", "hookNet", "window.fetch", "XMLHttpRequest.prototype.open", "patchLoc", "__csqttLocHost", "Location.prototype"} {
 		if !strings.Contains(js, needle) {
 			t.Fatalf("inject missing %q", needle)
 		}
 	}
-	if strings.Contains(js, "Location.prototype") || strings.Contains(js, "hookNavigation") {
-		t.Fatal("inject must not hook Location/Navigation (SPA remount storm)")
+	for _, bad := range []string{"hookLocation", "hookNavigation", "allowFullNav"} {
+		if strings.Contains(js, bad) {
+			t.Fatalf("inject must not contain SPA navigation hook %q", bad)
+		}
 	}
 	if strings.Contains(js, ".replace(/.vk.ru$/i,'.vk.com')") || strings.Contains(js, "replace(/\\.vk\\.ru$/i,'.vk.com')") {
 		t.Fatal("inject must not force .vk.ru → .vk.com (breaks id.vk.ru cookies)")

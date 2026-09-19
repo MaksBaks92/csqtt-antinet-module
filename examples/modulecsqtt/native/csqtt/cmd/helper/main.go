@@ -939,7 +939,7 @@ func requestVkAccessToken(profileDir string) (string, error) {
 	if i := strings.Index(doneURL, vkOAuthCallbackPath); i > 0 {
 		base = doneURL[:i]
 	}
-	emitLog("CSQTT: VK OAuth — как нативный CSQTT: сначала вход на vk.ru/ (хеш/токен через scrape), потом TURN-сокет; loopback /v/ только из‑за DNS VPN")
+	emitLog("CSQTT: VK OAuth — authorize → id.vk.ru/auth (хеш/токен через scrape), потом TURN-сокет; loopback /v/ только из‑за DNS VPN")
 
 	id := fmt.Sprintf("vk-oauth-%d", time.Now().UnixNano())
 	res, cancelled := runAction(profileDir, id, map[string]any{
