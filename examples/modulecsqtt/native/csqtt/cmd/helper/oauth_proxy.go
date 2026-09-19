@@ -77,8 +77,8 @@ func newVkOAuthHTTPTransport() http.RoundTripper {
 }
 
 var (
-	reAbsVKURL = regexp.MustCompile(`(?i)(https?:)?//((?:[a-z0-9-]+\.)*(?:vk\.(?:com|ru)|userapi\.com|vkuseraudio\.net|vk-cdn\.net|vkcc\.net))(/[^"'>\s]*)?`)
-	reHostAttr = regexp.MustCompile(`(?i)(https://|http://|//)((?:[a-z0-9-]+\.)*(?:vk\.(?:com|ru)|userapi\.com|vkuseraudio\.net|vk-cdn\.net|vkcc\.net))`)
+	reAbsVKURL = regexp.MustCompile(`(?i)(https?:)?//((?:[a-z0-9-]+\.)*(?:vk\.(?:com|ru)|userapi\.com|vkuserphoto\.ru|vkuseraudio\.net|vk-cdn\.net|vkcc\.net))(/[^"'>\s]*)?`)
+	reHostAttr = regexp.MustCompile(`(?i)(https://|http://|//)((?:[a-z0-9-]+\.)*(?:vk\.(?:com|ru)|userapi\.com|vkuserphoto\.ru|vkuseraudio\.net|vk-cdn\.net|vkcc\.net))`)
 	// Root-relative "/css/…" on a proxied page would hit 127.0.0.1/css (404). Map to /v/<host>/…
 	reRootRelAttr = regexp.MustCompile(`(?i)(\s(?:href|src|action|poster|data|formaction)=)(["'])(/[^"']*)(["'])`)
 	reRootRelCSS  = regexp.MustCompile(`(?i)(url\(\s*)(['"]?)(/[^)'"]*)(['"]?\s*\))`)
@@ -146,6 +146,8 @@ func isProxiedVkHost(host string) bool {
 	case h == "vk.ru", strings.HasSuffix(h, ".vk.ru"):
 		return true
 	case h == "userapi.com", strings.HasSuffix(h, ".userapi.com"):
+		return true
+	case h == "vkuserphoto.ru", strings.HasSuffix(h, ".vkuserphoto.ru"):
 		return true
 	case strings.HasSuffix(h, ".vkuseraudio.net"), strings.HasSuffix(h, ".vk-cdn.net"), strings.HasSuffix(h, ".vkcc.net"):
 		return true
@@ -780,9 +782,9 @@ func (p *vkOAuthProxy) browserHeaderURL(raw, upstreamHost string) string {
 	return out
 }
 
-// injectProxyScript embeds hoist/fetch hooks into every HTML page the proxy
+// injectProxyScript embeds hoist/fetch/XHR hooks into every HTML page the proxy
 // serves. AntiNet injectJs may run only on the first navigation; after hop→
-// id.vk.ru the SPA otherwise has no rootProxy and APIs die on 127.0.0.1/….
+// id.vk.ru the SPA otherwise has no toProxy and APIs die on VPN DNS.
 func (p *vkOAuthProxy) injectProxyScript(htmlBody string) string {
 	if strings.Contains(htmlBody, "__csqttOauthProxy") {
 		return htmlBody
@@ -1659,13 +1661,12 @@ func copyHopHeaders(src, dst http.Header) {
 func vkOAuthProxyInjectJS(base, doneURL string) string {
 	b, _ := json.Marshal(strings.TrimRight(base, "/"))
 	d, _ := json.Marshal(strings.TrimSpace(doneURL))
+	prefix, _ := json.Marshal(vkOAuthProxyPrefix)
 	marker, _ := json.Marshal(vkOAuthCallbackPath)
 	status, _ := json.Marshal(strings.TrimRight(base, "/") + vkOAuthStatusPath)
-	// Native CSQTT: WebView only for login cookies → VkTokenScraper. Here AntiNet WebView
-	// cannot resolve oauth.vk.com (VPN DNS), so pages are mirrored under /v/ — but we do
-	// NOT rewrite Location/Navigation (that caused remount storms). After remixsid the
-	// helper scrapes authorize off-TUN; inject only polls status and hoists #access_token.
-	// pinBase keeps <base href="/v/<host>/"> alive — VK SPA clears/rewrites empty <base id="base">
-	// and then root-relative /images/… hit 127.0.0.1/images (recover-miss storm).
-	return `(function(){if(window.__csqttOauthProxy)return;window.__csqttOauthProxy=1;var base=` + string(b) + `;var done=` + string(d) + `;var marker=` + string(marker) + `;var status=` + string(status) + `;function proxyBaseHref(){try{var m=String(location.pathname||'').match(/^\/v\/([^\/]+)\//);return m?'/v/'+m[1]+'/':'';}catch(e){return '';}}function pinBase(){try{var href=proxyBaseHref();if(!href)return;var el=document.getElementById('base')||document.querySelector('base');if(!el){el=document.createElement('base');el.id='base';var h=document.head||document.documentElement;if(h)h.insertBefore(el,h.firstChild);}if(el.getAttribute('href')!==href)el.setAttribute('href',href);}catch(e){}}function hoist(){try{var href=String(location.href||'');if(href.indexOf(marker)>=0)return;var h=String(location.hash||'');var s=String(location.search||'');var q='';if(h.indexOf('access_token=')>=0||h.indexOf('error=')>=0){q=h.replace(/^#/,'');}else if(s.indexOf('access_token=')>=0||s.indexOf('error=')>=0){q=s.replace(/^\?/,'');}else{return;}var sep=done.indexOf('?')>=0?'&':'?';location.replace(done+sep+q);}catch(e){}}function pollStatus(){try{if(window.__csqttOauthDone)return;var x=new XMLHttpRequest();x.open('GET',status,true);x.withCredentials=true;x.timeout=15000;x.onload=function(){try{var j=JSON.parse(x.responseText||'{}');if(j&&j.state==='ok'&&j.url){window.__csqttOauthDone=1;location.replace(j.url);}}catch(e){}};x.send();}catch(e){}}pinBase();hoist();pollStatus();try{var mo=new MutationObserver(function(){pinBase();});mo.observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:['href']});}catch(e){}window.addEventListener('hashchange',hoist);setInterval(function(){pinBase();hoist();pollStatus();},1000);})();`
+	// AntiNet WebView cannot resolve VK hosts (VPN DNS) — pages live under /v/<host>/.
+	// id.vk.ru/auth SPA calls https://api.vk.ru / login.vk.* directly → white screen unless
+	// fetch/XHR are rewritten to loopback. Do NOT hook Location/Navigation (remount storms).
+	// pinBase keeps <base href="/v/<host>/"> so root-relative /images stay under the proxy.
+	return `(function(){if(window.__csqttOauthProxy)return;window.__csqttOauthProxy=1;var base=` + string(b) + `;var prefix=` + string(prefix) + `;var done=` + string(d) + `;var marker=` + string(marker) + `;var status=` + string(status) + `;function proxyBaseHref(){try{var m=String(location.pathname||'').match(/^\/v\/([^\/]+)\//);return m?prefix+m[1]+'/':'';}catch(e){return '';}}function pinBase(){try{var href=proxyBaseHref();if(!href)return;var el=document.getElementById('base')||document.querySelector('base');if(!el){el=document.createElement('base');el.id='base';var h=document.head||document.documentElement;if(h)h.insertBefore(el,h.firstChild);}if(el.getAttribute('href')!==href)el.setAttribute('href',href);}catch(e){}}function rootProxy(u){try{if(!u||u.charAt(0)!=='/'||u.charAt(1)==='/')return u;if(u.indexOf(prefix)===0)return u;var m=String(location.pathname||'').match(/^\/v\/([^\/]+)/);if(!m)return u;return prefix+m[1]+u;}catch(e){return u;}}function toProxy(u){try{u=String(u||'');if(u.charAt(0)==='/'&&u.charAt(1)!=='/'){var rp=rootProxy(u);if(rp!==u)return rp;}var a=document.createElement('a');a.href=u;var h=String(a.hostname||'').toLowerCase();if(!h||h==='127.0.0.1'||h==='localhost')return String(u);if(!(/(^|\.)vk\.(com|ru)$/.test(h)||/(^|\.)userapi\.com$/.test(h)||/(^|\.)vkuserphoto\.ru$/.test(h)||h.indexOf('vk-cdn')>=0||h.indexOf('vkuseraudio')>=0||h.indexOf('vkcc.net')>=0))return String(u);return base+prefix+h+(a.pathname||'/')+(a.search||'')+(a.hash||'');}catch(e){return String(u);}}function hoist(){try{var href=String(location.href||'');if(href.indexOf(marker)>=0)return;var h=String(location.hash||'');var s=String(location.search||'');var q='';if(h.indexOf('access_token=')>=0||h.indexOf('error=')>=0){q=h.replace(/^#/,'');}else if(s.indexOf('access_token=')>=0||s.indexOf('error=')>=0){q=s.replace(/^\?/,'');}else{return;}var sep=done.indexOf('?')>=0?'&':'?';location.replace(done+sep+q);}catch(e){}}function pollStatus(){try{if(window.__csqttOauthDone)return;var x=new XMLHttpRequest();x.open('GET',status,true);x.withCredentials=true;x.timeout=15000;x.onload=function(){try{var j=JSON.parse(x.responseText||'{}');if(j&&j.state==='ok'&&j.url){window.__csqttOauthDone=1;location.replace(j.url);}}catch(e){}};x.send();}catch(e){}}function hookNet(){try{var of=window.fetch;if(typeof of==='function'){window.fetch=function(input,init){try{var u=(typeof input==='string')?input:(input&&input.url);if(u){var n=toProxy(String(u));if(n!==String(u)){if(typeof input==='string')input=n;else if(typeof Request!=='undefined')input=new Request(n,input);}}}catch(e){}return of.call(this,input,init);};}}catch(e){}try{var XO=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(){try{if(typeof arguments[1]==='string')arguments[1]=toProxy(arguments[1]);}catch(e){}return XO.apply(this,arguments);};}catch(e){}}document.addEventListener('submit',function(e){try{var f=e.target;if(!f||!f.action)return;var n=toProxy(f.getAttribute('action')||f.action);if(n!==(f.getAttribute('action')||f.action))f.action=n;}catch(err){}},true);hookNet();pinBase();hoist();pollStatus();try{var mo=new MutationObserver(function(){pinBase();});mo.observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:['href']});}catch(e){}window.addEventListener('hashchange',hoist);setInterval(function(){pinBase();hoist();pollStatus();},1000);})();`
 }

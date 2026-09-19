@@ -118,9 +118,15 @@ func TestResolveUpstreamLocationAlreadyProxied(t *testing.T) {
 
 func TestVkOAuthProxyInjectJSNoSPAHooks(t *testing.T) {
 	js := vkOAuthProxyInjectJS("http://127.0.0.1:50999", "http://127.0.0.1:50999/csqtt-vk-oauth-done")
-	for _, bad := range []string{"rootProxy", "toProxy", "hookLocation", "hookNet", "preferLogin"} {
+	// Location/Navigation hooks remount the WebView; fetch/XHR hooks are required for id.vk.ru/auth.
+	for _, bad := range []string{"hookLocation", "preferLogin", "hookNavigation", "allowFullNav", "Location.prototype"} {
 		if strings.Contains(js, bad) {
-			t.Fatalf("inject must not contain SPA proxy hook %q", bad)
+			t.Fatalf("inject must not contain SPA navigation hook %q", bad)
+		}
+	}
+	for _, need := range []string{"toProxy", "hookNet", "rootProxy", "pinBase"} {
+		if !strings.Contains(js, need) {
+			t.Fatalf("inject missing net proxy hook %q", need)
 		}
 	}
 }
@@ -615,13 +621,13 @@ func TestOAuthProxyHopComToRuAuthorize(t *testing.T) {
 
 func TestVkOAuthProxyInjectJSMinimal(t *testing.T) {
 	js := vkOAuthProxyInjectJS("http://127.0.0.1:9", "http://127.0.0.1:9/csqtt-vk-oauth-done")
-	for _, needle := range []string{"pollStatus", "hoist", "pinBase", "MutationObserver", "access_token=", vkOAuthStatusPath} {
+	for _, needle := range []string{"pollStatus", "hoist", "pinBase", "MutationObserver", "access_token=", vkOAuthStatusPath, "toProxy", "hookNet", "window.fetch", "XMLHttpRequest.prototype.open"} {
 		if !strings.Contains(js, needle) {
 			t.Fatalf("inject missing %q", needle)
 		}
 	}
-	if strings.Contains(js, "window.fetch") || strings.Contains(js, "XMLHttpRequest.prototype.open") {
-		t.Fatal("inject must not hook fetch/XHR (native CSQTT scrapes server-side)")
+	if strings.Contains(js, "Location.prototype") || strings.Contains(js, "hookNavigation") {
+		t.Fatal("inject must not hook Location/Navigation (SPA remount storm)")
 	}
 	if strings.Contains(js, ".replace(/.vk.ru$/i,'.vk.com')") || strings.Contains(js, "replace(/\\.vk\\.ru$/i,'.vk.com')") {
 		t.Fatal("inject must not force .vk.ru → .vk.com (breaks id.vk.ru cookies)")
