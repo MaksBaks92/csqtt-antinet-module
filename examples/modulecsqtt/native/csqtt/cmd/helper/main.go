@@ -36,12 +36,25 @@ const (
 	defaultDialSec  = 20
 	readyWaitBudget = 90 * time.Second
 	maxVkHashes     = 4
+	// Апстримный AUTH_TIMEOUT_MS = 300_000 (Constants.kt): столько же даём на вход с SMS/2FA.
 	vkOAuthTimeout = 5 * time.Minute
-	// AntiNet closes the WebView when urlPattern is not hit within urlTimeoutSec.
-	// 90s was shorter than a typical VK ID login (phone → SMS/2FA) and produced
-	// false "VK login cancelled" after hop+static with no further proxy traffic.
-	vkOAuthURLHop = vkOAuthTimeout
-	// VK OAuth: WebView только 127.0.0.1 (oauth_proxy.go); token → /csqtt-vk-oauth-done.
+	vkOAuthURLHop  = vkOAuthTimeout
+
+	// Константы VK OAuth — дословно апстримные (`Constants.kt`: VK_OAUTH_AUTH_URL,
+	// VK_OAUTH_REDIRECT_URI, VK_LOGIN_URL). Менять их здесь нельзя: `client_id`/`scope` привязаны к
+	// приложению CSQTT, а домен — `vk.ru`, не `vk.com`.
+	vkOAuthAuthURL = "https://oauth.vk.ru/authorize" +
+		"?client_id=7793118" +
+		"&scope=1073737727" +
+		"&redirect_uri=https%3A%2F%2Foauth.vk.ru%2Fblank.html" +
+		"&display=page" +
+		"&response_type=token" +
+		"&revoke=1" +
+		"&v=5.199"
+	vkLoginURL = "https://vk.ru/"
+	// Хвост `VK_OAUTH_REDIRECT_URI`: на него VK уводит с `#access_token=…`, и именно его ловит
+	// хост (§2.7, режим `navigation`).
+	vkOAuthRedirectMark = "blank.html"
 )
 
 type csqttStrings struct {
@@ -929,28 +942,29 @@ func requestVkAccessToken(profileDir string) (string, error) {
 	if profileDir == "" {
 		return "", fmt.Errorf("profileDir not set")
 	}
-	// WebView не резолвит oauth.vk.com под VPN AntiNet — весь вход через localhost reverse-proxy (protect).
-	startURLs, doneURL, stopProxy, err := startVkOAuthProxyServer()
-	if err != nil {
-		return "", fmt.Errorf("oauth proxy: %w", err)
-	}
-	defer stopProxy()
-
-	base := doneURL
-	if i := strings.Index(doneURL, vkOAuthCallbackPath); i > 0 {
-		base = doneURL[:i]
-	}
-	emitLog("CSQTT: VK OAuth — authorize → id.vk.ru/auth (хеш через scrape), потом TURN; WebView→127.0.0.1, VK→helper protect")
-
+	// Апстримная модель входа (`VkAuthWebViewManager.kt`): WebView грузит authorize-URL, VK сам
+	// показывает форму входа, если сессии нет, и по завершении уводит на `blank.html` с
+	// `#access_token=…`; апстрим ловит этот переход (`uri.lastPathSegment == "blank.html"`) и берёт
+	// параметр из фрагмента. Здесь то же самое выражено декларативным правилом §2.7: перехват
+	// перехода делает хост, модулю не нужен ни свой webview, ни свой HTTP-слой.
+	//
+	// ⛔ Своего reverse-proxy на loopback тут быть не должно. Он заводился под предпосылку «WebView
+	// AntiNet не резолвит oauth.vk.*», которая не подтверждается: `moduleqwdtt` открывает в том же
+	// webview хоста реальный `https://m.vk.ru/call/join/<hash>` без единого обхода DNS. Проксирование
+	// же тянуло за собой перезагрузку страницы по кругу (в логе 1.2.34 — 175 успешных загрузок против
+	// 4336 схлопываний и 1226 отмен), из-за чего вход не доходил до конца и токен оставался пустым.
+	//
+	// Два кандидата в `url` — расширение контракта «список URL: не сработало за urlTimeoutSec →
+	// следующий». Первый совпадает с апстримным VK_OAUTH_AUTH_URL, второй (`vk.ru/`) повторяет
+	// апстримный VK_LOGIN_URL и нужен там, где VK требует сначала завести сессию.
 	id := fmt.Sprintf("vk-oauth-%d", time.Now().UnixNano())
 	res, cancelled := runAction(profileDir, id, map[string]any{
 		"type":          "webview",
 		"mode":          "navigation",
-		"url":           startURLs,
-		"urlPattern":    vkOAuthCallbackPattern(),
+		"url":           []string{vkOAuthAuthURL, vkLoginURL},
+		"urlPattern":    vkOAuthRedirectMark,
 		"param":         "access_token",
 		"urlTimeoutSec": int(vkOAuthURLHop / time.Second),
-		"injectJs":      vkOAuthProxyInjectJS(base, doneURL, ""),
 	})
 	if cancelled {
 		return "", fmt.Errorf("VK login cancelled (закройте окно только после входа и редиректа)")
@@ -958,7 +972,9 @@ func requestVkAccessToken(profileDir string) (string, error) {
 	if strings.TrimSpace(res) == "" {
 		return "", fmt.Errorf("VK login empty (AntiNet не передал токен — обновите модуль ≥1.2.16)")
 	}
-	tok, err := parseVkAccessTokenFromCallbackURL(res)
+	// Хост отдаёт значение `param`, но `parseVkAccessToken` принимает и голый токен, и целый URL с
+	// фрагментом — это оставляет правило совместимым со старым хостом, который вернул бы URL.
+	tok, err := parseVkAccessToken(res)
 	if err != nil {
 		return "", err
 	}
@@ -969,6 +985,15 @@ func parseVkAccessToken(res string) (string, error) {
 	res = strings.TrimSpace(res)
 	if res == "" || strings.EqualFold(res, "CANCELLED") {
 		return "", fmt.Errorf("VK login cancelled")
+	}
+	// Ответ действия приходит КОНВЕРТОМ (`{"type":"webview","value":…}`) — разворачиваем ПЕРВЫМ
+	// шагом, чтобы дальше разбор шёл над голым значением и был одинаков для обеих форм ответа.
+	// Без этого токен доезжал и молча выбрасывался: подстроки `access_token=` в конверте нет,
+	// ключа `access_token` тоже, а `looksLikeVkToken` отвергает JSON из-за кавычек — вход в VK
+	// уходил на новый круг с «empty access_token» при полностью успешной авторизации.
+	res = actionResultString(res, "value")
+	if res == "" {
+		return "", fmt.Errorf("empty access_token")
 	}
 	if strings.HasPrefix(strings.ToLower(res), "error:") {
 		return "", fmt.Errorf("VK login failed: %s", res)

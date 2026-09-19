@@ -359,6 +359,36 @@ func runAction(profileDir, id string, payload map[string]any) (string, bool) {
 	return s, false // не-base64 — отдаём как есть (агностично)
 }
 
+// actionResultEnvelope разворачивает КОНВЕРТ ответа действия. Хост отдаёт результат любого типа
+// объектом `{"type":"<тип>", …}`: `{"value":…}` у `webview`, `{"values":{…}}` у `form`, `{"id":…}`
+// у `choice`, `{"ok":true}` у `confirm`/`display`. Ответ, который конвертом не является (голая
+// строка от escape-hatch со своей страницей), даёт `nil` — это не ошибка, а вторая законная форма.
+//
+// ⛔ Знание о конверте живёт ЗДЕСЬ, а не у каждого модуля. Модуль, разбирающий ответ сам, получает
+// «значения нет» вместо значения — и это не теория: 19.09 `{"value":"<токен>","type":"webview"}`
+// читался модулем как пустой токен, вход в VK шёл по кругу без единого сообщения о причине.
+func actionResultEnvelope(res string) map[string]any {
+	var obj map[string]any
+	if json.Unmarshal([]byte(strings.TrimSpace(res)), &obj) != nil {
+		return nil
+	}
+	return obj
+}
+
+// actionResultString — СКАЛЯРНОЕ поле конверта (`value` у `webview`, `id` у `choice`). Ответ без
+// конверта отдаётся как есть: там голая строка и есть значение. Конверт без запрошенного поля —
+// пусто: поле не пришло, и догадываться, какое из остальных имелось в виду, нельзя.
+func actionResultString(res, key string) string {
+	env := actionResultEnvelope(res)
+	if env == nil {
+		return strings.TrimSpace(res)
+	}
+	if v, ok := env[key]; ok && v != nil {
+		return strings.TrimSpace(fmt.Sprint(v))
+	}
+	return ""
+}
+
 // emitActionClose — ACTION_CLOSE|<id>: закрыть окно действия САМОМУ, не дожидаясь клика. Ради этого
 // и существует тип `display` отдельно от `confirm` (device-code, push-подтверждение).
 func emitActionClose(id string) {

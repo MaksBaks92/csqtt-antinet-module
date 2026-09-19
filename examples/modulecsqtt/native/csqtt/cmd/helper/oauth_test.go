@@ -5,10 +5,13 @@ import (
 	"testing"
 )
 
-func TestParseVkAccessTokenFromLoopbackCallback(t *testing.T) {
+// Форма, которой VK завершает implicit flow: редирект на VK_OAUTH_REDIRECT_URI с токеном во
+// ФРАГМЕНТЕ. Её ловит апстримный VkAuthWebViewManager, её же ловит правило §2.7 (`urlPattern`
+// blank.html + `param` access_token), поэтому разбирать её модуль обязан.
+func TestParseVkAccessTokenFromRedirectFragment(t *testing.T) {
 	const tok = "vk1.a.abcdefghijklmnopqrstuvwxyz0123456789ABCDEF"
-	raw := vkOAuthDoneURLForTest(41217) + "?access_token=" + tok + "&expires_in=0"
-	got, err := parseVkAccessTokenFromCallbackURL(raw)
+	raw := "https://oauth.vk.ru/blank.html#access_token=" + tok + "&expires_in=0&user_id=1"
+	got, err := parseVkAccessToken(raw)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -17,9 +20,9 @@ func TestParseVkAccessTokenFromLoopbackCallback(t *testing.T) {
 	}
 }
 
-func TestParseVkAccessTokenFromHoistedURL(t *testing.T) {
+func TestParseVkAccessTokenFromQuery(t *testing.T) {
 	const tok = "vk1.a.abcdefghijklmnopqrstuvwxyz0123456789ABCDEF"
-	got, err := parseVkAccessToken("https://oauth.vk.com/blank.html?csqtt_ok=1&access_token=" + tok + "&expires_in=0")
+	got, err := parseVkAccessToken("https://oauth.vk.ru/blank.html?access_token=" + tok + "&expires_in=0")
 	if err != nil || got != tok {
 		t.Fatalf("got %q err %v", got, err)
 	}
@@ -33,6 +36,27 @@ func TestParseVkAccessTokenBare(t *testing.T) {
 	}
 }
 
+// РЕАЛЬНАЯ форма ответа хоста: результат действия приходит конвертом своего типа, а не голым
+// значением. Ради этого теста фикс и существует — без него токен доезжал и молча выбрасывался
+// («empty access_token» при успешной авторизации), а вход в VK шёл по кругу бесконечно.
+func TestParseVkAccessTokenFromHostEnvelope(t *testing.T) {
+	const tok = "vk1.a.abcdefghijklmnopqrstuvwxyz0123456789ABCDEF"
+	got, err := parseVkAccessToken(`{"value":"` + tok + `","type":"webview"}`)
+	if err != nil || got != tok {
+		t.Fatalf("got %q err %v", got, err)
+	}
+	// Конверт, где хост отдал не голый параметр, а весь адрес редиректа (совместимость правила с
+	// хостом, извлекающим URL целиком): разбор обязан вытащить токен и отсюда.
+	got, err = parseVkAccessToken(`{"value":"https://oauth.vk.ru/blank.html#access_token=` + tok + `&user_id=1","type":"webview"}`)
+	if err != nil || got != tok {
+		t.Fatalf("url-in-envelope: got %q err %v", got, err)
+	}
+	// Конверт без значения — это отсутствие токена, а не токен: молчаливого успеха быть не должно.
+	if _, err := parseVkAccessToken(`{"value":"","type":"webview"}`); err == nil {
+		t.Fatal("пустой value обязан быть ошибкой")
+	}
+}
+
 func TestParseVkAccessTokenCancelled(t *testing.T) {
 	if _, err := parseVkAccessToken("CANCELLED"); err == nil {
 		t.Fatal("expected error")
@@ -42,24 +66,22 @@ func TestParseVkAccessTokenCancelled(t *testing.T) {
 	}
 }
 
-func TestVkOAuthProxyJSHasLoopbackMarker(t *testing.T) {
-	done := vkOAuthDoneURLForTest(50999)
-	js := vkOAuthProxyInjectJS("http://127.0.0.1:50999", done, "")
-	for _, part := range []string{vkOAuthCallbackPath, "access_token=", "127.0.0.1:50999", "pollStatus"} {
-		if !strings.Contains(js, part) {
-			t.Fatalf("oauth inject JS missing %q", part)
+// Правило, которое модуль отдаёт хосту, обязано вести на НАСТОЯЩИЙ VK и ловить апстримный
+// redirect_uri: именно подмена этих двух значений на loopback и делала вход непроходимым.
+func TestVkOAuthRuleTargetsUpstreamVK(t *testing.T) {
+	if !strings.HasPrefix(vkOAuthAuthURL, "https://oauth.vk.ru/authorize?") {
+		t.Fatalf("authorize URL не апстримный: %q", vkOAuthAuthURL)
+	}
+	for _, part := range []string{"client_id=7793118", "scope=1073737727", "response_type=token", "oauth.vk.ru%2Fblank.html"} {
+		if !strings.Contains(vkOAuthAuthURL, part) {
+			t.Fatalf("authorize URL без %q", part)
 		}
 	}
-}
-
-func TestStartVkOAuthCallbackServer(t *testing.T) {
-	doneURL, stop, err := startVkOAuthCallbackServer()
-	if err != nil {
-		t.Fatal(err)
+	if strings.Contains(vkOAuthAuthURL, "127.0.0.1") || strings.Contains(vkLoginURL, "127.0.0.1") {
+		t.Fatal("в правило просочился loopback")
 	}
-	defer stop()
-	if !strings.Contains(doneURL, vkOAuthCallbackPath) {
-		t.Fatalf("doneURL=%q", doneURL)
+	if vkOAuthRedirectMark != "blank.html" {
+		t.Fatalf("urlPattern=%q, а VK уводит на blank.html", vkOAuthRedirectMark)
 	}
 }
 
