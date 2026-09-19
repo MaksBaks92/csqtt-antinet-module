@@ -48,7 +48,9 @@ pub fn parse_config_response(response: &[u8]) -> Result<ConfigResponse> {
             "wrong_password" => bail!("FATAL_AUTH: неверный пароль подключения"),
             "expired" => bail!("FATAL_AUTH: срок действия пароля истёк"),
             "device_mismatch" => {
-                bail!("FATAL_AUTH: пароль привязан к другому устройству")
+                bail!(
+                    "FATAL_AUTH: пароль привязан к другому устройству — «Отвязать» в панели сервера CSQTT или вставьте Device ID этого клиента в настройку модуля"
+                )
             }
             "protocol_mismatch" | "invalid_worker_count" => bail!(
                 "FATAL_PROTOCOL: клиент и сервер используют разные версии протокола; выполните деплой из этой версии приложения"

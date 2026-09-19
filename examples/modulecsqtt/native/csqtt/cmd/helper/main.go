@@ -81,7 +81,8 @@ type csqttStrings struct {
 	hashFormCancelled    string
 	hashFormOk           string
 	hashFormProgress     string
-	deviceBoundFmt       string
+	deviceIDFmt          string
+	deviceAuthOKFmt      string
 }
 
 var csqttStringsRU = csqttStrings{
@@ -108,7 +109,8 @@ var csqttStringsRU = csqttStrings{
 	hashFormCancelled:    "CSQTT: ввод хешей отменён",
 	hashFormOk:           "Подключить",
 	hashFormProgress:     "CSQTT: укажите до 4 VK-хешей",
-	deviceBoundFmt:       "CSQTT: GETCONF device_id=%s (%s). Если FATAL_AUTH «пароль привязан к другому устройству» — «Отвязать» в панели сервера CSQTT или вставьте Device ID из лога приложения CSQTT в настройку модуля",
+	deviceIDFmt:          "CSQTT: Device ID=%s (%s)",
+	deviceAuthOKFmt:      "CSQTT: авторизовано · Device ID=%s",
 }
 
 var csqttStringsEN = csqttStrings{
@@ -135,7 +137,8 @@ var csqttStringsEN = csqttStrings{
 	hashFormCancelled:    "CSQTT: hash entry cancelled",
 	hashFormOk:           "Connect",
 	hashFormProgress:     "CSQTT: enter up to 4 VK hashes",
-	deviceBoundFmt:       "CSQTT: GETCONF device_id=%s (%s). If FATAL_AUTH says the password is bound to another device — Unbind it in the CSQTT server panel, or paste the CSQTT app Device ID into module settings",
+	deviceIDFmt:          "CSQTT: Device ID=%s (%s)",
+	deviceAuthOKFmt:      "CSQTT: authorized · Device ID=%s",
 }
 
 func csqttStringsFor(lang string) csqttStrings {
@@ -399,7 +402,7 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	persisted = restoreSavedState(cfg["MODULE_STATE"])
 	deviceID, generation, sessionSalt := nextEngineIdentity(cfg, &persisted)
 	persistState()
-	emitLog(s.deviceBoundFmt, deviceID, persistedDeviceSource(cfg, deviceID))
+	emitLog(s.deviceIDFmt, deviceID, persistedDeviceSource(cfg, deviceID))
 	port, _ := strconv.Atoi(cfg["LISTEN_PORT"])
 	user := cfg["SOCKS_USER"]
 	pass := cfg["SOCKS_PASS"]
@@ -657,6 +660,7 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 		log.Fatalf("write ready marker: %v", err)
 	}
 	emitProgress(s.socksUpFmt, actualPort)
+	emitLog(s.deviceAuthOKFmt, deviceID)
 	emitStatus(statusOK, "")
 	log.Printf("csqtt helper: SOCKS5 on 127.0.0.1:%d tun=%s dns=%s pkt=%d", actualPort, tunIP, engineTunDNS(), pktPort)
 

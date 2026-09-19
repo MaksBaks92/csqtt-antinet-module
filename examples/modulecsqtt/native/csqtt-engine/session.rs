@@ -917,12 +917,25 @@ async fn request_configuration(
                 }
             }
         };
-        let response = parse_config_response(packet.as_slice()).inspect_err(|error| {
-            let message = error.to_string();
-            if config.get_config && message.contains("FATAL_") {
-                events.error("handshake_rejected", &message, true);
-            }
-        })?;
+        let response = parse_config_response(packet.as_slice())
+            .map_err(|error| {
+                let message = error.to_string();
+                if message.contains("привязан к другому устройству") {
+                    anyhow::anyhow!(
+                        "{message} · Device ID этого клиента: {}",
+                        config.device_id
+                    )
+                } else {
+                    error
+                }
+            })
+            .inspect_err(|error| {
+                let message = error.to_string();
+                if config.get_config && message.contains("FATAL_") {
+                    events.error("handshake_rejected", &message, true);
+                    crate::log_error!("[ВОРКЕР #{}] {message}", config.id);
+                }
+            })?;
         match response {
             ConfigResponse::NoConfig => return Ok(false),
             ConfigResponse::Config(value) => {
