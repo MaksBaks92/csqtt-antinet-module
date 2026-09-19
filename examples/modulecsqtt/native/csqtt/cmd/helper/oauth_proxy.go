@@ -28,11 +28,29 @@ const (
 	vkOAuthStartPath    = "/csqtt-vk-oauth-start"
 	vkOAuthStatusPath   = "/csqtt-vk-oauth-status"
 	vkOAuthProxyMaxBody = 2 << 20
-	// Start on VK ID (not m.vk.ru SPA). Soft-shell m.vk.ru/ under loopback remounts forever
-	// (coalesce HIT + recover-miss images) even with soft-root and <base> pin — see 1.2.35 logs.
-	vkOAuthLoginHost = "id.vk.ru"
-	vkOAuthLoginPath = "/"
+	// Native CSQTT (VkAuthSession / Constants.VkAutoHash): WebView token phase opens
+	// oauth.vk.*/authorize; unauthenticated users land on id.vk.ru/auth (login form).
+	// Bare id.vk.ru/ is a marketing promo (/about/id) — see 1.2.36 device log.
+	vkOAuthAuthorizeHost = "oauth.vk.com"
+	vkOAuthAuthorizePath = "/authorize"
+	// Fallback host for root-relative recover-miss when Referer/lastHost are empty.
+	vkOAuthFallbackHost = "id.vk.ru"
 )
+
+// vkOAuthAuthorizeQuery matches CSQTT VkTokenScraper / VK_OAUTH_AUTH_URL params.
+func vkOAuthAuthorizeQuery(display string) string {
+	if display == "" {
+		display = "mobile"
+	}
+	redirect := url.QueryEscape("https://oauth.vk.ru/blank.html")
+	return fmt.Sprintf("client_id=7793118&scope=1073737727&redirect_uri=%s&display=%s&response_type=token&revoke=1&v=5.199",
+		redirect, display)
+}
+
+// vkOAuthAuthorizeProxyPath is the loopback path+query WebView should open.
+func vkOAuthAuthorizeProxyPath(display string) string {
+	return vkOAuthProxyPrefix + vkOAuthAuthorizeHost + vkOAuthAuthorizePath + "?" + vkOAuthAuthorizeQuery(display)
+}
 
 // newVkOAuthHTTPTransport clones protect DialContext from vkHTTP but with long
 // ResponseHeaderTimeout — shared vkHTTP uses 8s which breaks oauth.vk.com under load.
@@ -151,7 +169,7 @@ func isVkStaticCDNHost(host string) bool {
 
 // isSoftVkShellHost is the public mobile/desktop feed SPA (vk.ru ↔ m.vk.ru).
 // Soft-serving a 302 body under the request /v/ path avoids hop→WebView remounts.
-// Document roots on these hosts are bypassed to id.vk.ru (see softServeLogin).
+// Document roots on these hosts are bypassed to oauth authorize (see softServeLogin).
 func isSoftVkShellHost(host string) bool {
 	switch normalizeVkProxyHost(host) {
 	case "vk.ru", "vk.com", "m.vk.ru", "m.vk.com":
@@ -297,10 +315,10 @@ func startVkOAuthProxyServer() (startURLs []string, doneURL string, stop func(),
 			`<body style="font-family:sans-serif;padding:24px;background:#111;color:#eee"><p>Авторизация VK… окно закроется автоматически.</p></body></html>`)
 	})
 	mux.HandleFunc(vkOAuthStatusPath, p.handleOAuthStatus)
-	// Open login HTML directly — intermediate start page stayed on screen when SPA looped.
-	loginPath := vkOAuthProxyPrefix + vkOAuthLoginHost + vkOAuthLoginPath
+	// Open oauth authorize (native CSQTT) — intermediate start page stayed on screen when SPA looped.
+	authStart := vkOAuthAuthorizeProxyPath("mobile")
 	mux.HandleFunc(vkOAuthStartPath, func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, loginPath, http.StatusFound)
+		http.Redirect(w, r, authStart, http.StatusFound)
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
@@ -333,7 +351,7 @@ func startVkOAuthProxyServer() (startURLs []string, doneURL string, stop func(),
 		_ = ln.Close()
 	}
 
-	startURLs = []string{base + loginPath}
+	startURLs = []string{base + authStart}
 	return startURLs, doneURL, stop, nil
 }
 
@@ -355,14 +373,22 @@ func cloneURLWithPath(u *url.URL, path string) *url.URL {
 	return &out
 }
 
-// softServeRoot remaps GET / → /v/<host>/ without a 302. A Location bounce remounts the
+// softServeRoot remaps GET / → oauth authorize without a 302. A Location bounce remounts the
 // AntiNet WebView document and storms coalesce HIT / recover-miss forever.
 func (p *vkOAuthProxy) softServeRoot(w http.ResponseWriter, r *http.Request) {
 	host, via := p.resolveMissHost("/", r.Header.Get("Referer"))
-	if host == "" || isSoftVkShellHost(host) {
-		// Never soft-root into the feed SPA — it remounts under loopback.
-		host = vkOAuthLoginHost
-		via = "login"
+	if host == "" || isSoftVkShellHost(host) || host == vkOAuthFallbackHost {
+		// Never soft-root into the feed SPA or id.vk.ru promo — open authorize like native CSQTT.
+		r2 := r.Clone(r.Context())
+		r2.URL = cloneURLWithPath(r.URL, vkOAuthProxyPrefix+vkOAuthAuthorizeHost+vkOAuthAuthorizePath)
+		r2.URL.RawQuery = vkOAuthAuthorizeQuery("mobile")
+		reason := via
+		if reason == "" {
+			reason = "login"
+		}
+		emitLog("CSQTT OAuth proxy: soft-root → authorize (%s)", reason)
+		p.serve(w, r2)
+		return
 	}
 	r2 := r.Clone(r.Context())
 	r2.URL = cloneURLWithPath(r.URL, vkOAuthProxyPrefix+host+"/")
@@ -370,12 +396,13 @@ func (p *vkOAuthProxy) softServeRoot(w http.ResponseWriter, r *http.Request) {
 	p.serve(w, r2)
 }
 
-// softServeLogin remaps soft-shell SPA document roots to id.vk.ru without a 302.
+// softServeLogin remaps soft-shell SPA document roots to oauth authorize (native CSQTT).
 func (p *vkOAuthProxy) softServeLogin(w http.ResponseWriter, r *http.Request, fromHost string) {
 	r2 := r.Clone(r.Context())
-	r2.URL = cloneURLWithPath(r.URL, vkOAuthProxyPrefix+vkOAuthLoginHost+vkOAuthLoginPath)
-	emitLog("CSQTT OAuth proxy: soft-shell SPA bypass %s → %s", fromHost, vkOAuthLoginHost)
-	p.serveHTMLCoalesced(w, r2, vkOAuthLoginHost, vkOAuthLoginPath)
+	r2.URL = cloneURLWithPath(r.URL, vkOAuthProxyPrefix+vkOAuthAuthorizeHost+vkOAuthAuthorizePath)
+	r2.URL.RawQuery = vkOAuthAuthorizeQuery("mobile")
+	emitLog("CSQTT OAuth proxy: soft-shell SPA bypass %s → oauth authorize", fromHost)
+	p.serve(w, r2)
 }
 
 // proxyHostFromReferer recovers /v/<host>/… from a loopback Referer so root-relative
@@ -414,15 +441,13 @@ func (p *vkOAuthProxy) resolveMissHost(reqPath, referer string) (host, via strin
 		return h, "last"
 	}
 	if strings.HasPrefix(reqPath, "/images/") || strings.HasPrefix(reqPath, "/css/") || strings.HasPrefix(reqPath, "/js/") {
-		return vkOAuthLoginHost, "static"
+		return vkOAuthFallbackHost, "static"
 	}
 	return "", ""
 }
 
 func (p *vkOAuthProxy) authorizeURL(display string) string {
-	redirect := url.QueryEscape("https://oauth.vk.ru/blank.html")
-	return fmt.Sprintf("%s%soauth.vk.com/authorize?client_id=7793118&scope=1073737727&redirect_uri=%s&display=%s&response_type=token&revoke=1&v=5.199",
-		p.base, vkOAuthProxyPrefix, redirect, display)
+	return p.base + vkOAuthAuthorizeProxyPath(display)
 }
 
 func (p *vkOAuthProxy) handleOAuthStatus(w http.ResponseWriter, r *http.Request) {
