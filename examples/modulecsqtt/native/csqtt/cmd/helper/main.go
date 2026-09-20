@@ -102,7 +102,7 @@ var csqttStringsRU = csqttStrings{
 	vkLoginFailedFmt:     "CSQTT: не удалось получить VK-токен: %v",
 	vkAutoAPIProgress:    "CSQTT: создаю звонки VK через API",
 	vkAutoAPIFailedFmt:   "CSQTT: не удалось создать звонки VK: %v",
-	handoverLog:          "хендовер: сменилась сеть — TURN-воркеры переподключатся сами",
+	handoverLog:          "хендовер: сменилась сеть — перезапускаю data path",
 	hashFormTitle:        "VK-хеши",
 	hashFormHint:         "До 4 хешей. Можно вставить ссылку звонка. Только для режима «Ручной».",
 	hashFormLabelFmt:     "VK-хеш %d",
@@ -130,7 +130,7 @@ var csqttStringsEN = csqttStrings{
 	vkLoginFailedFmt:     "CSQTT: failed to get VK token: %v",
 	vkAutoAPIProgress:    "CSQTT: creating VK calls via API",
 	vkAutoAPIFailedFmt:   "CSQTT: failed to create VK calls: %v",
-	handoverLog:          "handover: network changed, TURN workers will reconnect",
+	handoverLog:          "handover: network changed — recycling data path",
 	hashFormTitle:        "VK hashes",
 	hashFormHint:         "Up to 4 hashes. A call link is fine. Manual mode only.",
 	hashFormLabelFmt:     "VK hash %d",
@@ -612,7 +612,7 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 		emitStatus(statusFatal, "no packet port")
 		log.Fatalf("packet port %d", pktPort)
 	}
-	engineAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: pktPort}
+	guard := newDataPathGuard(string(engineCfg), readyWaitBudget, pktPort, tunIP.String())
 
 	bridge, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
 	if err != nil {
@@ -623,7 +623,11 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	defer bridge.Close()
 
 	tun, err := tunnel.NewIPTunnel(tunIP, func(pkt []byte) {
-		if _, werr := bridge.WriteToUDP(pkt, engineAddr); werr != nil && debug {
+		addr := guard.packetAddr()
+		if addr == nil {
+			return
+		}
+		if _, werr := bridge.WriteToUDP(pkt, addr); werr != nil && debug {
 			log.Printf("[BRIDGE] write: %v", werr)
 		}
 	})
@@ -668,13 +672,16 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 		// dns=<…> забирает канон hostproto→rememberHostDNSServers (подписка newProtectedResolver).
 		switch event {
 		case "handover", "netlost", "netback", "stall":
-			emitLog(s.handoverLog)
+			if event == "handover" {
+				emitLog(s.handoverLog)
+			}
+			guard.onHostEvent(event)
 		}
 	})
 
 	udpT := csqttUDPTransport{tun: tun, resolver: resolver}
 	serveSocksListener(ln, func(c net.Conn) {
-		handleConn(c, user, pass, tun, resolver, udpT, dialTimeout)
+		handleConn(c, user, pass, tun, resolver, udpT, dialTimeout, guard)
 	})
 	return 0
 }
@@ -722,7 +729,7 @@ func settingDuration(cfg map[string]string, key string, defSec int) time.Duratio
 	return time.Duration(defSec) * time.Second
 }
 
-func handleConn(c net.Conn, user, pass string, tun *tunnel.IPTunnel, resolver *protectedResolver, udpT csqttUDPTransport, dialTimeout time.Duration) {
+func handleConn(c net.Conn, user, pass string, tun *tunnel.IPTunnel, resolver *protectedResolver, udpT csqttUDPTransport, dialTimeout time.Duration, guard *dataPathGuard) {
 	defer c.Close()
 	br := bufio.NewReader(c)
 	req, ok := socksHandshake(c, br, user, pass)
@@ -730,6 +737,10 @@ func handleConn(c net.Conn, user, pass string, tun *tunnel.IPTunnel, resolver *p
 		return
 	}
 	if req.Cmd == socksCmdUDPAssociate {
+		if guard != nil && guard.rejecting() {
+			_, _ = c.Write(socksRep(0x01))
+			return
+		}
 		serveSocksUDPAssociate(c, br, udpT)
 		return
 	}
@@ -737,6 +748,13 @@ func handleConn(c net.Conn, user, pass string, tun *tunnel.IPTunnel, resolver *p
 	host := req.TargetLabel()
 	target := net.JoinHostPort(host, strconv.Itoa(int(req.Port)))
 	dialStart := time.Now()
+	if guard != nil && guard.rejecting() {
+		// Fast-fail while recycling/paused so host FIRE can accumulate rejects
+		// instead of hanging on 20s dials and 146-byte scraps.
+		log.Printf("[SOCKS] reject (data path recovering) target=%s", target)
+		_, _ = c.Write(socksRep(0x01))
+		return
+	}
 	ip, rerr := resolveV4(req, resolver)
 	if rerr != nil {
 		log.Printf("[SOCKS] resolve FAILED host=%s err=%v", host, rerr)
@@ -746,6 +764,9 @@ func handleConn(c net.Conn, user, pass string, tun *tunnel.IPTunnel, resolver *p
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	up, err := tun.DialTCP(ctx, ip, req.Port)
 	cancel()
+	if guard != nil {
+		guard.noteDialResult(err)
+	}
 	if err != nil {
 		log.Printf("[SOCKS] tunnel dial FAILED target=%s ip=%s elapsed=%v err=%v", target, ip, time.Since(dialStart), err)
 		_, _ = c.Write(socksRep(0x01))
