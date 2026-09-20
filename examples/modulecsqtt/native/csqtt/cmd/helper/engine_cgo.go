@@ -23,7 +23,7 @@ static void (*fn_set_packet_out)(void *);
 static int32_t (*fn_inject_packet)(const uint8_t *, int32_t);
 
 extern int32_t goProtectFd(int64_t fd);
-extern void goPacketOut(const uint8_t *data, int32_t n);
+extern void goPacketOut(uint8_t *data, int32_t n);
 
 static int csqtt_load(const char *path) {
 	eng = dlopen(path, RTLD_NOW);
@@ -66,7 +66,7 @@ static int32_t csqtt_tun_ip(char *b, int32_t n) { return fn_tun_ip ? fn_tun_ip(b
 static int32_t csqtt_tun_dns(char *b, int32_t n) { return fn_tun_dns ? fn_tun_dns(b, n) : -1; }
 static void csqtt_stop(void) { if (fn_stop) fn_stop(); }
 static int32_t csqtt_inject(const uint8_t *d, int32_t n) {
-	return fn_inject_packet ? fn_inject_packet(d, n) : -1;
+	return fn_inject_packet ? fn_inject_packet((uint8_t *)d, n) : -1;
 }
 */
 import "C"
