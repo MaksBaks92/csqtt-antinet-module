@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 
@@ -13,16 +14,20 @@ import (
 )
 
 var (
-	engineDLL        *windows.LazyDLL
-	procSetProtect   *windows.LazyProc
-	procStart        *windows.LazyProc
-	procWaitReady    *windows.LazyProc
-	procPacketPort   *windows.LazyProc
-	procTunIP        *windows.LazyProc
-	procTunDNS       *windows.LazyProc
-	procStop         *windows.LazyProc
-	protectImpl      func(int64) bool
-	protectCallback  uintptr
+	engineDLL         *windows.LazyDLL
+	procSetProtect    *windows.LazyProc
+	procStart         *windows.LazyProc
+	procWaitReady     *windows.LazyProc
+	procPacketPort    *windows.LazyProc
+	procTunIP         *windows.LazyProc
+	procTunDNS        *windows.LazyProc
+	procStop          *windows.LazyProc
+	procSetPacketOut  *windows.LazyProc
+	procInjectPacket  *windows.LazyProc
+	protectImpl       func(int64) bool
+	protectCallback   uintptr
+	packetOutSink     atomic.Pointer[func([]byte)]
+	packetOutCallback uintptr
 )
 
 func engineLibName() string { return "csqtt_engine.dll" }
@@ -43,6 +48,8 @@ func engineLoad(searchDirs ...string) error {
 	procTunIP = engineDLL.NewProc("csqtt_engine_tun_ip")
 	procTunDNS = engineDLL.NewProc("csqtt_engine_tun_dns")
 	procStop = engineDLL.NewProc("csqtt_engine_stop")
+	procSetPacketOut = engineDLL.NewProc("csqtt_engine_set_packet_out")
+	procInjectPacket = engineDLL.NewProc("csqtt_engine_inject_packet")
 	return nil
 }
 
@@ -58,6 +65,39 @@ func engineSetProtect(fn func(int64) bool) {
 		return 0
 	})
 	_, _, _ = procSetProtect.Call(protectCallback)
+}
+
+func engineSetPacketOut(fn func([]byte)) {
+	if fn == nil {
+		packetOutSink.Store(nil)
+		return
+	}
+	packetOutSink.Store(&fn)
+	packetOutCallback = syscall.NewCallback(func(data uintptr, n uintptr) uintptr {
+		sink := packetOutSink.Load()
+		if sink == nil || *sink == nil || data == 0 || n == 0 {
+			return 0
+		}
+		buf := unsafe.Slice((*byte)(unsafe.Pointer(data)), int(n))
+		cp := append([]byte(nil), buf...)
+		(*sink)(cp)
+		return 0
+	})
+	_, _, _ = procSetPacketOut.Call(packetOutCallback)
+}
+
+func engineInjectPacket(pkt []byte) error {
+	if len(pkt) == 0 {
+		return nil
+	}
+	if procInjectPacket == nil {
+		return fmt.Errorf("inject_packet unavailable")
+	}
+	r, _, _ := procInjectPacket.Call(uintptr(unsafe.Pointer(&pkt[0])), uintptr(len(pkt)))
+	if int32(r) != 0 {
+		return fmt.Errorf("inject_packet: %d", int32(r))
+	}
+	return nil
 }
 
 func engineStart(configJSON string) error {

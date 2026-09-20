@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
 use crate::{
-    Arguments, ENGINE_CANCEL, PACKET_PORT, TUN_DNS, TUN_IP, logging, protect, ready_notify, run,
-    runtime_worker_threads,
+    Arguments, ENGINE_CANCEL, PACKET_PORT, TUN_DNS, TUN_IP, logging, packet_bridge, protect,
+    ready_notify, run, runtime_worker_threads,
 };
 use serde::Deserialize;
 use std::{
     ffi::{CStr, CString, c_char},
+    slice,
     sync::atomic::Ordering,
     thread,
     time::Duration,
@@ -47,6 +48,8 @@ struct EngineJson {
     salt: String,
     #[serde(default)]
     http_proxy: String,
+    #[serde(default)]
+    packet_bridge: bool,
 }
 
 fn arguments_from_json(raw: &str) -> Result<Arguments, String> {
@@ -115,6 +118,7 @@ fn arguments_from_json(raw: &str) -> Result<Arguments, String> {
         generation: cfg.generation,
         salt: cfg.salt,
         tun_uds: String::new(),
+        packet_bridge: cfg.packet_bridge,
         validate_vk_hashes: false,
         http_proxy: cfg.http_proxy,
     })
@@ -166,6 +170,7 @@ pub extern "C" fn csqtt_engine_start(config_json: *const c_char) -> i32 {
         }
     };
     PACKET_PORT.store(0, Ordering::Release);
+    packet_bridge::clear_bridge();
     if let Ok(mut ip) = TUN_IP.lock() {
         ip.clear();
     }
@@ -201,17 +206,18 @@ pub extern "C" fn csqtt_engine_wait_ready(timeout_ms: i32) -> i32 {
     let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
-        if !TUN_IP.lock().map(|s| s.is_empty()).unwrap_or(true)
-            && PACKET_PORT.load(Ordering::Acquire) != 0
-        {
+        let tun_ready = !TUN_IP.lock().map(|s| s.is_empty()).unwrap_or(true);
+        let path_ready =
+            PACKET_PORT.load(Ordering::Acquire) != 0 || packet_bridge::bridge_ready();
+        if tun_ready && path_ready {
             return 0;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     let _ = ready_notify();
-    if !TUN_IP.lock().map(|s| s.is_empty()).unwrap_or(true)
-        && PACKET_PORT.load(Ordering::Acquire) != 0
-    {
+    let tun_ready = !TUN_IP.lock().map(|s| s.is_empty()).unwrap_or(true);
+    let path_ready = PACKET_PORT.load(Ordering::Acquire) != 0 || packet_bridge::bridge_ready();
+    if tun_ready && path_ready {
         0
     } else {
         -1
@@ -242,4 +248,20 @@ pub extern "C" fn csqtt_engine_stop() {
             cancel.cancel();
         }
     }
+    packet_bridge::clear_bridge();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn csqtt_engine_set_packet_out(cb: Option<packet_bridge::PacketOutCb>) {
+    packet_bridge::set_packet_out(cb);
+}
+
+/// Inject one raw IPv4 packet from the AntiNet helper into the engine data path.
+#[unsafe(no_mangle)]
+pub extern "C" fn csqtt_engine_inject_packet(data: *const u8, n: i32) -> i32 {
+    if data.is_null() || n <= 0 {
+        return -3;
+    }
+    let bytes = unsafe { slice::from_raw_parts(data, n as usize) };
+    packet_bridge::inject_packet(bytes)
 }

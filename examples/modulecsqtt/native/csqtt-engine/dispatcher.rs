@@ -5,6 +5,7 @@ use crate::{
     client_perf::{self, Stage as PerfStage},
     flow_frame::{self, FlowSequencer},
     packet::{PacketBuf, PacketPool},
+    packet_bridge::{self, UplinkBridge},
     stats::Stats,
     striped_scheduler::{DispatchTicket, PacketClass, packet_class},
     tun, udp_batch,
@@ -453,16 +454,18 @@ impl Dispatcher {
     pub async fn start(
         listen: &str,
         tun_uds: Option<String>,
+        packet_bridge: bool,
         pool: Arc<PacketPool>,
         stats: Arc<Stats>,
         cancel: CancellationToken,
     ) -> Result<(Arc<Self>, String)> {
-        let tun_mode = tun_uds.is_some();
+        // TUN waits for FD before accepting returns; UDP and in-process bridge start live.
+        let pause_returns = tun_uds.is_some();
         let (return_latency_tx, return_latency_rx) =
-            packet_channel(RETURN_LATENCY_CAPACITY, !tun_mode);
+            packet_channel(RETURN_LATENCY_CAPACITY, !pause_returns);
         let (return_priority_tx, return_priority_rx) =
-            packet_channel(RETURN_PRIORITY_CAPACITY, !tun_mode);
-        let (return_tx, return_rx) = packet_channel(RETURN_BULK_CAPACITY, !tun_mode);
+            packet_channel(RETURN_PRIORITY_CAPACITY, !pause_returns);
+        let (return_tx, return_rx) = packet_channel(RETURN_BULK_CAPACITY, !pause_returns);
         let dispatcher = Arc::new(Self {
             workers: ArcSwap::from_pointee(Vec::new()),
             return_latency_tx,
@@ -524,6 +527,38 @@ impl Dispatcher {
             });
             dispatcher.tasks.lock().await.push(io_task);
             dispatcher.tasks.lock().await.push(receive_task);
+            Ok((dispatcher, "0".to_owned()))
+        } else if packet_bridge {
+            let uplink = Arc::new(UplinkBridge {
+                pool: pool.clone(),
+                queue: ArrayQueue::new(1024),
+                notify: Arc::new(Notify::new()),
+                cancel: dispatcher.cancel.clone(),
+            });
+            packet_bridge::install_uplink(uplink.clone());
+            let read_dispatcher = dispatcher.clone();
+            let read_stats = stats.clone();
+            let read_cancel = dispatcher.cancel.clone();
+            let read_uplink = uplink.clone();
+            let read_task = spawn_critical("bridge reader", read_cancel, async move {
+                read_dispatcher
+                    .read_bridge(read_uplink, read_stats)
+                    .await;
+            });
+            let write_dispatcher = dispatcher.clone();
+            let write_cancel = dispatcher.cancel.clone();
+            let write_task = spawn_critical("bridge writer", write_cancel, async move {
+                write_dispatcher
+                    .write_bridge(return_latency_rx, return_priority_rx, return_rx, stats)
+                    .await;
+                packet_bridge::clear_bridge();
+            });
+            dispatcher
+                .tasks
+                .lock()
+                .await
+                .extend([read_task, write_task]);
+            crate::log_error!("[КЛИЕНТ] Packet bridge: in-process (без UDP 127.0.0.1)");
             Ok((dispatcher, "0".to_owned()))
         } else {
             let socket = bind_udp(listen).await?;
@@ -828,6 +863,86 @@ impl Dispatcher {
                         _ = tokio::time::sleep(Duration::from_millis(10)) => {}
                     }
                 }
+            }
+        }
+    }
+
+    async fn read_bridge(self: Arc<Self>, uplink: Arc<UplinkBridge>, stats: Arc<Stats>) {
+        let mut scheduler = FastPathScheduler::new();
+        let mut flow_sequences = FlowSequencer::new();
+        loop {
+            while let Some(mut packet) = uplink.queue.pop() {
+                if !frame_outbound_packet(&mut flow_sequences, &mut packet) {
+                    continue;
+                }
+                stats
+                    .total_bytes_up
+                    .fetch_add(packet.len() as i64, Ordering::Relaxed);
+                self.dispatch(&mut scheduler, packet);
+            }
+            tokio::select! {
+                _ = self.cancel.cancelled() => return,
+                _ = uplink.notify.notified() => {}
+            }
+        }
+    }
+
+    async fn write_bridge(
+        &self,
+        latency_receiver: PacketReceiver,
+        priority_receiver: PacketReceiver,
+        bulk_receiver: PacketReceiver,
+        stats: Arc<Stats>,
+    ) {
+        let mut send_batch = Vec::with_capacity(udp_batch::MAX_DATAGRAMS);
+        let mut reorder = ReturnReorder::new();
+        loop {
+            let Some(packet) = recv_ordered_return_packet(
+                &mut reorder,
+                &latency_receiver,
+                &priority_receiver,
+                &bulk_receiver,
+                &self.cancel,
+            )
+            .await
+            else {
+                return;
+            };
+            send_batch.clear();
+            let first_class = packet_class(packet.as_slice());
+            send_batch.push(packet);
+            while send_batch.len() < first_class.datagram_batch() {
+                let higher_priority_waiting = match first_class {
+                    PacketClass::Small => false,
+                    PacketClass::Medium => latency_receiver.has_queued_packet(),
+                    PacketClass::Bulk => {
+                        latency_receiver.has_queued_packet()
+                            || priority_receiver.has_queued_packet()
+                    }
+                };
+                if higher_priority_waiting {
+                    break;
+                }
+                let Some(next) = next_ordered_return_packet(
+                    &mut reorder,
+                    &latency_receiver,
+                    &priority_receiver,
+                    &bulk_receiver,
+                ) else {
+                    break;
+                };
+                if packet_class(next.as_slice()) != first_class {
+                    reorder.ready.push_front(next);
+                    break;
+                }
+                send_batch.push(next);
+            }
+
+            for packet in &send_batch {
+                packet_bridge::deliver_downlink(packet.as_slice());
+                stats
+                    .total_bytes_down
+                    .fetch_add(packet.len() as i64, Ordering::Relaxed);
             }
         }
     }
@@ -1572,6 +1687,7 @@ mod tests {
         let (dispatcher, _) = Dispatcher::start(
             "127.0.0.1:0",
             Some(name.clone()),
+            false,
             pool,
             stats,
             cancel.clone(),
@@ -2149,6 +2265,7 @@ mod tests {
         let (dispatcher, _) = Dispatcher::start(
             "127.0.0.1:0",
             None,
+            false,
             pool.clone(),
             Arc::new(Stats::default()),
             cancel,
@@ -2168,7 +2285,7 @@ mod tests {
         let stats = Arc::new(Stats::default());
         let cancel = CancellationToken::new();
         let (dispatcher, port) =
-            Dispatcher::start("127.0.0.1:0", None, pool.clone(), stats, cancel)
+            Dispatcher::start("127.0.0.1:0", None, false, pool.clone(), stats, cancel)
                 .await
                 .unwrap();
         let (worker, latency_rx, _priority_rx, _bulk_rx) = channels(0, 128);

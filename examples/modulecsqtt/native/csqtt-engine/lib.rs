@@ -18,6 +18,7 @@ mod logging;
 mod namegen;
 mod obfs;
 mod packet;
+mod packet_bridge;
 mod profiles;
 mod protect;
 mod protocol;
@@ -130,6 +131,9 @@ pub struct Arguments {
     salt: String,
     #[arg(long, default_value = "")]
     tun_uds: String,
+    /// AntiNet: IP packets via FFI callback/queue instead of localhost UDP.
+    #[arg(long, default_value_t = false)]
+    packet_bridge: bool,
     #[arg(long, default_value_t = false)]
     validate_vk_hashes: bool,
     #[arg(long, default_value = "")]
@@ -271,9 +275,11 @@ pub async fn run(arguments: Arguments) -> Result<()> {
     events.process(std::process::id());
     let pool = PacketPool::new(packet_pool_size(workers));
     let tun_uds = (!arguments.tun_uds.is_empty()).then_some(arguments.tun_uds.clone());
+    packet_bridge::clear_bridge();
     let dispatcher_result = Dispatcher::start(
         &arguments.listen,
         tun_uds,
+        arguments.packet_bridge,
         pool.clone(),
         stats.clone(),
         cancel.clone(),

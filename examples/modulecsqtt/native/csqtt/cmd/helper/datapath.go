@@ -210,17 +210,24 @@ func (g *dataPathGuard) requestRecycle(reason string) {
 		return
 	}
 	port := g.portFn()
-	if port <= 0 || port > 65535 {
+	// packet_bridge mode keeps port 0 (in-process FFI); UDP bridge mode needs a real port.
+	if port < 0 || port > 65535 {
 		g.failRecycle(reason, errors.New("bad packet port"))
 		return
 	}
-	g.setPacketPort(port)
+	if port > 0 {
+		g.setPacketPort(port)
+	}
 
 	g.mu.Lock()
 	g.recycling = false
 	g.dialFails = 0
 	g.mu.Unlock()
-	g.logFn("CSQTT: движок перезапущен · pkt=%d", port)
+	if port > 0 {
+		g.logFn("CSQTT: движок перезапущен · pkt=%d", port)
+	} else {
+		g.logFn("CSQTT: движок перезапущен · bridge=in-process")
+	}
 }
 
 func (g *dataPathGuard) failRecycle(reason string, err error) {

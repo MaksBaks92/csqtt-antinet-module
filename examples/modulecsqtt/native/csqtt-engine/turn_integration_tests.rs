@@ -1348,6 +1348,7 @@ async fn windows_client_reaches_wsl_server_through_a_real_turn_channel_and_dispa
     let (dispatcher, local_port) = Dispatcher::start(
         "127.0.0.1:0",
         None,
+        false,
         pool.clone(),
         stats.clone(),
         cancel.clone(),
@@ -1457,6 +1458,7 @@ async fn running_client_receives_hot_dns_configuration_without_reconnect() {
     let (dispatcher, local_port) = Dispatcher::start(
         "127.0.0.1:0",
         None,
+        false,
         pool.clone(),
         stats.clone(),
         cancel.clone(),
@@ -1610,6 +1612,7 @@ async fn nine_windows_workers_register_with_a_wsl_server_without_missing_or_dupl
     let (dispatcher, local_port) = Dispatcher::start(
         "127.0.0.1:0",
         None,
+        false,
         pool.clone(),
         stats.clone(),
         cancel.clone(),

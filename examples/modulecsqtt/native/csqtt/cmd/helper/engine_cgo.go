@@ -19,8 +19,11 @@ static int32_t (*fn_packet_port)(void);
 static int32_t (*fn_tun_ip)(char *, int32_t);
 static int32_t (*fn_tun_dns)(char *, int32_t);
 static void (*fn_stop)(void);
+static void (*fn_set_packet_out)(void *);
+static int32_t (*fn_inject_packet)(const uint8_t *, int32_t);
 
 extern int32_t goProtectFd(int64_t fd);
+extern void goPacketOut(const uint8_t *data, int32_t n);
 
 static int csqtt_load(const char *path) {
 	eng = dlopen(path, RTLD_NOW);
@@ -34,6 +37,8 @@ static int csqtt_load(const char *path) {
 	fn_tun_ip = (int32_t (*)(char *, int32_t))dlsym(eng, "csqtt_engine_tun_ip");
 	fn_tun_dns = (int32_t (*)(char *, int32_t))dlsym(eng, "csqtt_engine_tun_dns");
 	fn_stop = (void (*)(void))dlsym(eng, "csqtt_engine_stop");
+	fn_set_packet_out = (void (*)(void *))dlsym(eng, "csqtt_engine_set_packet_out");
+	fn_inject_packet = (int32_t (*)(const uint8_t *, int32_t))dlsym(eng, "csqtt_engine_inject_packet");
 	if (!fn_start || !fn_wait_ready || !fn_packet_port || !fn_tun_ip || !fn_stop) {
 		return -2;
 	}
@@ -48,12 +53,21 @@ static void csqtt_bind_protect(void) {
 	}
 }
 
+static void csqtt_bind_packet_out(void) {
+	if (fn_set_packet_out) {
+		fn_set_packet_out((void *)goPacketOut);
+	}
+}
+
 static int32_t csqtt_start(const char *j) { return fn_start ? fn_start(j) : -1; }
 static int32_t csqtt_wait_ready(int32_t ms) { return fn_wait_ready ? fn_wait_ready(ms) : -1; }
 static int32_t csqtt_packet_port(void) { return fn_packet_port ? fn_packet_port() : 0; }
 static int32_t csqtt_tun_ip(char *b, int32_t n) { return fn_tun_ip ? fn_tun_ip(b, n) : -1; }
 static int32_t csqtt_tun_dns(char *b, int32_t n) { return fn_tun_dns ? fn_tun_dns(b, n) : -1; }
 static void csqtt_stop(void) { if (fn_stop) fn_stop(); }
+static int32_t csqtt_inject(const uint8_t *d, int32_t n) {
+	return fn_inject_packet ? fn_inject_packet(d, n) : -1;
+}
 */
 import "C"
 
@@ -63,11 +77,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"strings"
 	"unsafe"
 )
 
 var protectImpl func(int64) bool
+var packetOutSink atomic.Pointer[func([]byte)]
 
 //export goProtectFd
 func goProtectFd(fd C.int64_t) C.int32_t {
@@ -78,6 +94,19 @@ func goProtectFd(fd C.int64_t) C.int32_t {
 		return 1
 	}
 	return 0
+}
+
+//export goPacketOut
+func goPacketOut(data *C.uint8_t, n C.int32_t) {
+	if data == nil || n <= 0 {
+		return
+	}
+	sink := packetOutSink.Load()
+	if sink == nil || *sink == nil {
+		return
+	}
+	buf := C.GoBytes(unsafe.Pointer(data), C.int(n))
+	(*sink)(buf)
 }
 
 func engineLibName() string {
@@ -104,6 +133,26 @@ func engineLoad(searchDirs ...string) error {
 func engineSetProtect(fn func(int64) bool) {
 	protectImpl = fn
 	C.csqtt_bind_protect()
+}
+
+func engineSetPacketOut(fn func([]byte)) {
+	if fn == nil {
+		packetOutSink.Store(nil)
+		return
+	}
+	packetOutSink.Store(&fn)
+	C.csqtt_bind_packet_out()
+}
+
+func engineInjectPacket(pkt []byte) error {
+	if len(pkt) == 0 {
+		return nil
+	}
+	rc := C.csqtt_inject((*C.uint8_t)(unsafe.Pointer(&pkt[0])), C.int32_t(len(pkt)))
+	if rc != 0 {
+		return fmt.Errorf("inject_packet: %d", int32(rc))
+	}
+	return nil
 }
 
 func engineStart(configJSON string) error {

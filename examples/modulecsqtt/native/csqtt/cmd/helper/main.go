@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //
 // CSQTT helper — протокол-модуль AntiNet. Каноны shared/* инжектит build.py.
-// Data-plane: SOCKS5 → gVisor → UDP 127.0.0.1 → rust CSQTT engine (TURN/RTP).
+// Data-plane: SOCKS5 → gVisor → in-process FFI → rust CSQTT engine (TURN/RTP).
 // Движок — производный от https://github.com/amurcanov/csqtt (PolyForm-Noncommercial-1.0.0).
 package main
 
@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"csqtt-antinet/tunnel"
@@ -573,6 +574,7 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 		"obfs":           obfs,
 		"turn_transport": turnTransport,
 		"fingerprint":    "firefox",
+		"packet_bridge":  true,
 	}
 	if proxyURL != "" {
 		engineJSON["http_proxy"] = proxyURL
@@ -587,6 +589,13 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	engineCfg, _ := json.Marshal(engineJSON)
 
 	emitProgress(s.openingEngine)
+	// Downlink sink registered before start so early packets are not dropped.
+	var inbound atomic.Pointer[func([]byte)]
+	engineSetPacketOut(func(pkt []byte) {
+		if fn := inbound.Load(); fn != nil {
+			(*fn)(pkt)
+		}
+	})
 	if err := engineStart(string(engineCfg)); err != nil {
 		emitLog(s.engineStartFailedFmt, err)
 		emitStatus(statusFatal, "engine start failed")
@@ -606,29 +615,11 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 		emitStatus(statusFatal, "bad tun ip")
 		log.Fatalf("bad TUN IP %q", engineTunIP())
 	}
-	pktPort := enginePacketPort()
-	if pktPort <= 0 || pktPort > 65535 {
-		emitLog(s.packetPortFailed)
-		emitStatus(statusFatal, "no packet port")
-		log.Fatalf("packet port %d", pktPort)
-	}
-	guard := newDataPathGuard(string(engineCfg), readyWaitBudget, pktPort, tunIP.String())
 
-	bridge, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
-	if err != nil {
-		emitLog(s.bridgeListenFailed)
-		emitStatus(statusFatal, "packet bridge failed")
-		log.Fatalf("packet bridge: %v", err)
-	}
-	defer bridge.Close()
-
+	// In-process bridge: gVisor ↔ rust without UDP 127.0.0.1.
 	tun, err := tunnel.NewIPTunnel(tunIP, func(pkt []byte) {
-		addr := guard.packetAddr()
-		if addr == nil {
-			return
-		}
-		if _, werr := bridge.WriteToUDP(pkt, addr); werr != nil && debug {
-			log.Printf("[BRIDGE] write: %v", werr)
+		if err := engineInjectPacket(pkt); err != nil && debug {
+			log.Printf("[BRIDGE] inject: %v", err)
 		}
 	})
 	if err != nil {
@@ -636,20 +627,8 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 		log.Fatalf("netstack: %v", err)
 	}
 	defer tun.Close()
-
-	go func() {
-		buf := make([]byte, 65535)
-		for {
-			n, _, rerr := bridge.ReadFromUDP(buf)
-			if rerr != nil {
-				return
-			}
-			if n > 0 {
-				tun.InjectInbound(buf[:n])
-			}
-		}
-	}()
-	// First outbound datagram teaches the rust engine our UDP source address.
+	deliver := func(pkt []byte) { tun.InjectInbound(pkt) }
+	inbound.Store(&deliver)
 
 	ln, err := openListener(port, listenFd)
 	if err != nil {
@@ -666,7 +645,9 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	emitProgress(s.socksUpFmt, actualPort)
 	emitLog(s.deviceAuthOKFmt, deviceID)
 	emitStatus(statusOK, "")
-	log.Printf("csqtt helper: SOCKS5 on 127.0.0.1:%d tun=%s dns=%s pkt=%d", actualPort, tunIP, engineTunDNS(), pktPort)
+	log.Printf("csqtt helper: SOCKS5 on 127.0.0.1:%d tun=%s dns=%s bridge=in-process", actualPort, tunIP, engineTunDNS())
+
+	guard := newDataPathGuard(string(engineCfg), readyWaitBudget, 0, tunIP.String())
 
 	setHostEventHandler(func(event string) {
 		// dns=<…> забирает канон hostproto→rememberHostDNSServers (подписка newProtectedResolver).

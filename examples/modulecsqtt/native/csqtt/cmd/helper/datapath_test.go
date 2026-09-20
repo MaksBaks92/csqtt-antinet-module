@@ -174,3 +174,28 @@ func TestDataPathGuardCooldown(t *testing.T) {
 		t.Fatalf("cooldown broken: starts=%d", starts.Load())
 	}
 }
+
+func TestDataPathGuardRecycleAllowsZeroPacketPort(t *testing.T) {
+	var exited atomic.Int32
+	g := &dataPathGuard{
+		cfgJSON:     `{}`,
+		readyWaitMs: 100,
+		tunIP:       "10.0.0.2",
+		stopFn:      func() {},
+		startFn:     func(string) error { return nil },
+		waitFn:      func(int) error { return nil },
+		portFn:      func() int { return 0 }, // in-process bridge
+		ipFn:        func() string { return "10.0.0.2" },
+		exitFn:      func(int) { exited.Add(1) },
+		nowFn:       time.Now,
+		logFn:       func(string, ...any) {},
+		statusFn:    func(string, string) {},
+	}
+	g.requestRecycle("bridge")
+	if exited.Load() != 0 {
+		t.Fatal("port 0 must be valid for packet_bridge")
+	}
+	if g.rejecting() {
+		t.Fatal("should accept after bridge recycle")
+	}
+}
