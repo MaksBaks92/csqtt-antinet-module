@@ -24,6 +24,8 @@ func NewLinkEndpoint() *LinkEndpoint {
 	return &LinkEndpoint{}
 }
 
+// SetOutgoingPacketHandler sets the uplink sink. The callback MUST copy or
+// finish using the slice before returning — the view is released immediately after.
 func (e *LinkEndpoint) SetOutgoingPacketHandler(fn func([]byte)) {
 	e.onOutgoingPacket = fn
 }
@@ -33,7 +35,7 @@ func (e *LinkEndpoint) InjectInbound(data []byte) {
 	e.dispatcherMu.RLock()
 	dispatcher := e.dispatcher
 	e.dispatcherMu.RUnlock()
-	if dispatcher == nil {
+	if dispatcher == nil || len(data) == 0 {
 		return
 	}
 	defer func() {
@@ -41,20 +43,36 @@ func (e *LinkEndpoint) InjectInbound(data []byte) {
 			log.Printf("[TUNNEL] recovered from inbound panic (%d bytes): %v", len(data), r)
 		}
 	}()
+	// MakeWithData / NewViewWithData already copies into a pooled chunk.
+	// Do NOT append() first — that was a redundant full-packet copy.
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Payload: buffer.MakeWithData(append([]byte{}, data...)),
+		Payload: buffer.MakeWithData(data),
 	})
+	// Ownership transfers to the stack (HandlePacket / DecRef inside).
 	dispatcher.DeliverNetworkPacket(ipv4.ProtocolNumber, pkt)
 }
 
 func (e *LinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
 	n := 0
+	handler := e.onOutgoingPacket
 	for _, pkt := range pkts.AsSlice() {
-		data := pkt.ToView().ToSlice()
 		e.packetOut.Add(1)
-		if e.onOutgoingPacket != nil {
-			e.onOutgoingPacket(data)
+		if handler == nil {
+			n++
+			continue
 		}
+		// ToView() already materializes a caller-owned View; AsSlice avoids a
+		// second ToSlice() allocation. inject_packet copies before we Release.
+		view := pkt.ToView()
+		if view == nil || view.Size() == 0 {
+			if view != nil {
+				view.Release()
+			}
+			n++
+			continue
+		}
+		handler(view.AsSlice())
+		view.Release()
 		n++
 	}
 	return n, nil

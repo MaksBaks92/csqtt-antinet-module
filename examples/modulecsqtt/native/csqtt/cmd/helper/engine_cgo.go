@@ -105,7 +105,9 @@ func goPacketOut(data *C.uint8_t, n C.int32_t) {
 	if sink == nil || *sink == nil {
 		return
 	}
-	buf := C.GoBytes(unsafe.Pointer(data), C.int(n))
+	// Borrowed slice: InjectInbound → MakeWithData copies before return.
+	// Do not retain past this call.
+	buf := unsafe.Slice((*byte)(unsafe.Pointer(data)), int(n))
 	(*sink)(buf)
 }
 

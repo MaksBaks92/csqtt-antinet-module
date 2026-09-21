@@ -78,9 +78,9 @@ func engineSetPacketOut(fn func([]byte)) {
 		if sink == nil || *sink == nil || data == 0 || n == 0 {
 			return 0
 		}
+		// Borrowed slice: InjectInbound → MakeWithData copies before return.
 		buf := unsafe.Slice((*byte)(unsafe.Pointer(data)), int(n))
-		cp := append([]byte(nil), buf...)
-		(*sink)(cp)
+		(*sink)(buf)
 		return 0
 	})
 	_, _, _ = procSetPacketOut.Call(packetOutCallback)
