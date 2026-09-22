@@ -903,7 +903,11 @@ impl Inner {
                 self.allocation_expires_at = Some(now + Duration::from_secs(u64::from(lifetime)));
                 self.refresh_failures = 0;
                 self.maintenance_refresh = Some(now + self.profile.maintenance_refresh);
-                self.keepalive = Some(now + self.profile.keepalive_interval);
+                self.keepalive = Some(first_keepalive_deadline(
+                    now,
+                    self.profile.keepalive_interval,
+                    relay,
+                ));
                 self.push_event(NativeEvent {
                     kind: EVENT_RELAY_ADDRESS,
                     address: NativeAddress::from_socket_addr(relay),
@@ -1196,6 +1200,26 @@ fn allocation_refresh_deadline(now: Instant, lifetime: Option<u32>, interval: Du
         lifetime.unwrap_or(REQUESTED_ALLOCATION_LIFETIME_SECS),
     ));
     now + interval.min(lifetime / 2).max(Duration::from_millis(500))
+}
+
+/// First keepalive is spread ±20% of the interval from the relay address so N workers
+/// that become READY together do not wake the radio on the same tick. Later keepalives
+/// stay on the fixed interval from that offset.
+fn first_keepalive_deadline(now: Instant, interval: Duration, relay: SocketAddr) -> Instant {
+    let span_ms = (interval.as_millis() as u64 / 5).max(1);
+    let mix = keepalive_mix(relay);
+    now + Duration::from_millis(interval.as_millis() as u64 - span_ms + mix % (span_ms * 2 + 1))
+}
+
+fn keepalive_mix(relay: SocketAddr) -> u64 {
+    let port = u64::from(relay.port());
+    match relay.ip() {
+        IpAddr::V4(ip) => port ^ u64::from(u32::from(ip)),
+        IpAddr::V6(ip) => {
+            let o = ip.octets();
+            port ^ u64::from_be_bytes(o[8..16].try_into().unwrap_or([0; 8]))
+        }
+    }
 }
 
 fn encode_xor_address(address: SocketAddr, transaction: &[u8; 12]) -> Vec<u8> {
@@ -1615,6 +1639,19 @@ mod tests {
         let mut wire = [0u8; 1024];
         let (length, _) = core.pull_control(&mut wire).unwrap().unwrap();
         assert_eq!(&wire[..length], &[0x40, 0, 0, 1, 0xff, 0, 0, 0]);
+    }
+
+    #[test]
+    fn first_keepalive_is_spread_across_workers() {
+        let interval = Duration::from_secs(10);
+        let now = Instant::now();
+        let a = first_keepalive_deadline(now, interval, "1.1.1.1:3478".parse().unwrap());
+        let b = first_keepalive_deadline(now, interval, "8.8.8.8:3478".parse().unwrap());
+        let lo = now + Duration::from_secs(8);
+        let hi = now + Duration::from_secs(12);
+        assert!(a >= lo && a <= hi);
+        assert!(b >= lo && b <= hi);
+        assert_ne!(a, b);
     }
 
     #[test]

@@ -251,6 +251,15 @@ impl PacketSender {
         self.shared.notify.notify_one();
         Ok(())
     }
+
+    /// Take queued packets so a dying worker can hand them to still-healthy paths.
+    pub fn steal(&self) -> Vec<PacketBuf> {
+        let mut packets = Vec::new();
+        while let Some(queued) = self.shared.queue.pop() {
+            packets.push(queued.packet);
+        }
+        packets
+    }
 }
 
 impl PacketReceiver {
@@ -336,7 +345,6 @@ impl PacketReceiver {
 impl Drop for PacketReceiver {
     fn drop(&mut self) {
         self.shared.receiver_open.store(false, Ordering::Release);
-        self.purge();
         self.shared.notify.notify_waiters();
     }
 }
@@ -366,6 +374,24 @@ pub struct WorkerChannels {
     pub latency: PacketSender,
     pub priority: PacketSender,
     pub bulk: PacketSender,
+    pub healthy: Arc<AtomicBool>,
+}
+
+impl WorkerChannels {
+    pub fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Acquire)
+    }
+
+    pub fn mark_unhealthy(&self) {
+        self.healthy.store(false, Ordering::Release);
+    }
+
+    pub fn drain_uplink(&self) -> Vec<PacketBuf> {
+        let mut packets = self.latency.steal();
+        packets.extend(self.priority.steal());
+        packets.extend(self.bulk.steal());
+        packets
+    }
 }
 
 fn interleave_turn_paths(workers: &mut Vec<WorkerChannels>) {
@@ -963,6 +989,27 @@ impl Dispatcher {
         }
     }
 
+    pub(crate) fn redispatch(&self, packet: PacketBuf) {
+        let workers = self.workers.load();
+        if workers.is_empty() {
+            return;
+        }
+        let class = packet_class(packet.as_slice());
+        let ticket = DispatchTicket {
+            start_slot: 0,
+            class,
+        };
+        if let Err(packet) = enqueue_selected_worker(&workers, ticket, packet) {
+            let _ = replace_oldest_in_selected_queue(&workers, ticket, packet);
+        }
+    }
+
+    pub(crate) fn redispatch_all(&self, packets: Vec<PacketBuf>) {
+        for packet in packets {
+            self.redispatch(packet);
+        }
+    }
+
     #[cfg(unix)]
     async fn write_tun(
         &self,
@@ -1319,19 +1366,44 @@ fn is_retryable_tun_error(error: &std::io::Error) -> bool {
         )
 }
 
+fn queue_for_class(worker: &WorkerChannels, class: PacketClass) -> &PacketSender {
+    match class {
+        PacketClass::Small => &worker.latency,
+        PacketClass::Medium => &worker.priority,
+        PacketClass::Bulk => &worker.bulk,
+    }
+}
+
 fn enqueue_selected_worker(
     workers: &[WorkerChannels],
     ticket: DispatchTicket,
     packet: PacketBuf,
 ) -> Result<(), PacketBuf> {
-    let Some(worker) = workers.get(ticket.start_slot) else {
+    let n = workers.len();
+    if n == 0 {
         return Err(packet);
-    };
-    match ticket.class {
-        PacketClass::Small => worker.latency.try_send(packet),
-        PacketClass::Medium => worker.priority.try_send(packet),
-        PacketClass::Bulk => worker.bulk.try_send(packet),
     }
+    let primary_healthy = workers
+        .get(ticket.start_slot)
+        .is_some_and(WorkerChannels::is_healthy);
+    // Full-but-healthy: try a couple of neighbours. Unhealthy primary: walk the whole set.
+    let search = if primary_healthy {
+        1 + 2.min(n.saturating_sub(1))
+    } else {
+        n
+    };
+    let mut packet = packet;
+    for offset in 0..search {
+        let worker = &workers[(ticket.start_slot + offset) % n];
+        if !worker.is_healthy() {
+            continue;
+        }
+        match queue_for_class(worker, ticket.class).try_send(packet) {
+            Ok(()) => return Ok(()),
+            Err(returned) => packet = returned,
+        }
+    }
+    Err(packet)
 }
 
 fn replace_oldest_in_selected_queue(
@@ -1339,14 +1411,18 @@ fn replace_oldest_in_selected_queue(
     ticket: DispatchTicket,
     packet: PacketBuf,
 ) -> Result<(), PacketBuf> {
-    let Some(worker) = workers.get(ticket.start_slot) else {
+    let n = workers.len();
+    if n == 0 {
+        return Err(packet);
+    }
+    let worker = workers
+        .get(ticket.start_slot)
+        .filter(|worker| worker.is_healthy())
+        .or_else(|| workers.iter().find(|worker| worker.is_healthy()));
+    let Some(worker) = worker else {
         return Err(packet);
     };
-    match ticket.class {
-        PacketClass::Small => worker.latency.force_send(packet),
-        PacketClass::Medium => worker.priority.force_send(packet),
-        PacketClass::Bulk => worker.bulk.force_send(packet),
-    }
+    queue_for_class(worker, ticket.class).force_send(packet)
 }
 
 async fn bind_udp(address: &str) -> Result<UdpSocket> {
@@ -1482,6 +1558,7 @@ mod tests {
                 latency,
                 priority,
                 bulk,
+                healthy: Arc::new(AtomicBool::new(true)),
             },
             latency_rx,
             priority_rx,
@@ -1884,7 +1961,7 @@ mod tests {
     }
 
     #[test]
-    fn saturated_selected_queue_never_redirects_a_chunk_to_another_worker() {
+    fn saturated_selected_queue_spills_to_a_neighbour() {
         let (dispatcher, _return_latency, _return_priority, _return_bulk) = test_dispatcher();
         let pool = PacketPool::new(2);
         let (first, _first_latency, _first_priority, first_bulk) = channels(0, 1);
@@ -1895,10 +1972,10 @@ mod tests {
         dispatcher.dispatch(&mut scheduler, tcp_packet(&pool, 50_000, 1));
         dispatcher.dispatch(&mut scheduler, tcp_packet(&pool, 50_000, 2));
 
-        assert_eq!(packet_sequence(&first_bulk.try_recv().unwrap()), 2);
+        assert_eq!(packet_sequence(&first_bulk.try_recv().unwrap()), 1);
+        assert_eq!(packet_sequence(&second_bulk.try_recv().unwrap()), 2);
         assert!(second_latency.try_recv().is_none());
         assert!(second_priority.try_recv().is_none());
-        assert!(second_bulk.try_recv().is_none());
         assert_eq!(pool.available(), pool.capacity());
     }
 
@@ -1946,6 +2023,28 @@ mod tests {
             dispatcher.register(channels(id, 1).0);
             assert_eq!(dispatcher.active_count(), 9);
         }
+    }
+
+    #[test]
+    fn unhealthy_worker_is_skipped_and_dying_uplink_is_redispatched() {
+        let (dispatcher, _return_latency_rx, _return_priority_rx, _return_rx) = test_dispatcher();
+        let (dead, dead_latency, _dead_priority, _dead_bulk) = channels(0, 4);
+        let (live, live_latency, _live_priority, _live_bulk) = channels(1, 4);
+        dead.mark_unhealthy();
+        dispatcher.register(dead.clone());
+        dispatcher.register(live);
+        let pool = PacketPool::new(8);
+        let mut packet = pool.acquire();
+        packet.set_read_len(64).unwrap();
+        dispatcher.redispatch(packet);
+        assert!(dead_latency.try_recv().is_none());
+        assert!(live_latency.try_recv().is_some());
+
+        let mut queued = pool.acquire();
+        queued.set_read_len(64).unwrap();
+        assert!(dead.latency.try_send(queued).is_ok());
+        dispatcher.redispatch_all(dead.drain_uplink());
+        assert!(live_latency.try_recv().is_some());
     }
 
     #[test]

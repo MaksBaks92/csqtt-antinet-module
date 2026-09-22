@@ -119,10 +119,10 @@ fn build_registration_payload(config: &SessionConfig) -> Bytes {
         &config.local_port,
         &config.device_id,
         &config.password,
-        config.generation,
+        crate::idle::generation(config.generation),
         &config.salt,
         config.id,
-        Some(config.desired_count),
+        Some(crate::idle::declared_count().max(1)),
     ))
 }
 
@@ -803,6 +803,7 @@ async fn run_allocated_session(
         latency: latency_tx,
         priority: priority_tx,
         bulk: bulk_tx,
+        healthy: Arc::new(AtomicBool::new(true)),
     };
     let (writer_command_tx, writer_command_rx) = mpsc::channel(WRITER_COMMAND_CAPACITY);
     let shutdown_registration = runtime
@@ -844,33 +845,45 @@ async fn run_allocated_session(
     ));
     let repair_generation = config.repair.restart_generation(config.id);
     let rebind_epoch = crate::rebind::epoch();
-    let (session_result, completed): (Result<()>, u8) = tokio::select! {
-        biased;
-        _ = runtime.cancel.cancelled() => {
-            runtime
-                .shutdown
-                .request_disconnect(&config.device_id, &config.salt)
-                .await;
-            (Ok(()), 0)
-        }
-        _ = crate::rebind::requested(rebind_epoch) => {
-            (Err(anyhow!("NET_REBIND")), 0)
-        }
-        _ = crate::idle::parked(config.id) => {
-            (Err(anyhow!("IDLE_PARK")), 0)
-        }
-        _ = config.repair.changed(config.id, repair_generation) => {
-            (Err(anyhow!("TARGET_REPAIR")), 0)
-        }
-        result = &mut writer => {
-            (result.map_err(anyhow::Error::from).and_then(|value| value), 1)
-        }
-        result = &mut reader => {
-            (result.map_err(anyhow::Error::from).and_then(|value| value), 2)
+    let mut announce_seen = crate::idle::announce_epoch();
+    let (session_result, completed): (Result<()>, u8) = loop {
+        tokio::select! {
+            biased;
+            _ = runtime.cancel.cancelled() => {
+                runtime
+                    .shutdown
+                    .request_disconnect(&config.device_id, &config.salt)
+                    .await;
+                break (Ok(()), 0);
+            }
+            _ = crate::rebind::requested(rebind_epoch) => {
+                break (Err(anyhow!("NET_REBIND")), 0);
+            }
+            _ = crate::idle::parked(config.id) => {
+                break (Err(anyhow!("IDLE_PARK")), 0);
+            }
+            _ = crate::idle::announce_changed(announce_seen) => {
+                announce_seen = crate::idle::announce_epoch();
+                let payload = build_registration_payload(&config);
+                let _ = send_writer_bytes(&writer_command_tx, payload.as_ref()).await;
+            }
+            _ = config.repair.changed(config.id, repair_generation) => {
+                break (Err(anyhow!("TARGET_REPAIR")), 0);
+            }
+            result = &mut writer => {
+                break (result.map_err(anyhow::Error::from).and_then(|value| value), 1);
+            }
+            result = &mut reader => {
+                break (result.map_err(anyhow::Error::from).and_then(|value| value), 2);
+            }
         }
     };
+    worker_channels.mark_unhealthy();
     session_cancel.cancel();
     stop_session_tasks(completed, writer, reader).await;
+    runtime
+        .dispatcher
+        .redispatch_all(worker_channels.drain_uplink());
     crate::log_error!("[СЕССИЯ #{}] Завершена", config.id);
     session_result?;
     Ok(config_delivered)
@@ -1280,27 +1293,17 @@ mod tests {
 
     #[test]
     fn first_registration_announces_the_full_stream_set_before_the_feature_reply() {
-        let config = SessionConfig {
-            id: 1,
-            peer: "127.0.0.1:46000".parse().unwrap(),
-            turn_host: None,
-            turn_port: None,
-            turn_transport: TurnTransportMode::Udp,
-            local_port: Arc::from("9000"),
-            device_id: Arc::from("device"),
-            password: Arc::from("password"),
-            generation: 7,
-            turn_endpoint_cursor: 0,
-            salt: Arc::from("generation-id"),
-            mode: ObfsMode::Audio,
-            wrap_key: [0; 32],
-            get_config: true,
-            desired_count: 9,
-            server_stream_repair: Arc::new(AtomicBool::new(false)),
-            repair: RepairState::new(9),
-        };
         assert_eq!(
-            build_registration_payload(&config).as_ref(),
+            crate::protocol::config_request(
+                "9000",
+                "device",
+                "password",
+                7,
+                "generation-id",
+                1,
+                Some(9)
+            )
+            .as_bytes(),
             b"GETCONF:9000|device|password|7|generation-id|1|9|CSQTT-WIRE-3"
         );
     }

@@ -1,15 +1,15 @@
 {
-  "version": "1.2.53",
+  "version": "1.2.54",
   "android": {
-    "arm64-v8a": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.53/csqtt-android-arm64-v8a.zip",
-    "armeabi-v7a": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.53/csqtt-android-armeabi-v7a.zip",
-    "x86": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.53/csqtt-android-x86.zip",
-    "x86_64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.53/csqtt-android-x86_64.zip"
+    "arm64-v8a": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.54/csqtt-android-arm64-v8a.zip",
+    "armeabi-v7a": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.54/csqtt-android-armeabi-v7a.zip",
+    "x86": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.54/csqtt-android-x86.zip",
+    "x86_64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.54/csqtt-android-x86_64.zip"
   },
   "desktop": {
     "windows_amd64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.0.0/csqtt-windows_amd64.zip",
     "linux_amd64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.0.0/csqtt-linux_amd64.zip",
     "darwin_amd64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.0.0/csqtt-darwin_amd64.zip"
   },
-  "changelog": "1.2.53: мягкий handover Wi-Fi↔моб.сеть — вместо перезапуска движка (VK-креды заново, 3–8с, обрыв всех соединений) TURN-пути пересоздаются на новой сети с текущими кредами за ~1–2с, движок и таблица потоков сохраняются, TCP внутри туннеля переживает переход. Собственный детектор смены сети (адрес protected-сокета раз в 5с) — не зависим от события handover от хоста. Детектор «чёрной дыры»: uplink без downlink 6с → немедленная проверка всех путей (Refresh), мёртвые переподнимаются за ~15с вместо минуты. stall тоже идёт через мягкий путь; полный recycle — только если пути не поднялись за 15с. Флаппинг Wi-Fi больше не ведёт к fatal через 4 рестарта."
+  "changelog": "1.2.54: простой совместим с сервером — keepers шлют GETCONF с desired_count=idleWorkers и новой эпохой, чтобы сервер снял запаркованные слоты с downlink (иначе stripe шёл бы на мёртвые пути до 10ч). Handover во время recycle не теряется. Первый TURN keepalive размазан ±20%, чтобы N воркеров не будили радио хором. Умирающий путь не берёт новый uplink; очередь с него уходит на живые. Полная очередь одного воркера spill на соседа. Stats в тишине реже."
 }

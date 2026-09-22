@@ -27,6 +27,10 @@ impl Stats {
     pub async fn run(self: Arc<Self>, events: Events, cancel: CancellationToken) {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
         interval.tick().await;
+        let mut last_up = 0i64;
+        let mut last_down = 0i64;
+        let mut last_active = 0i32;
+        let mut quiet_ticks = 0u32;
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => return,
@@ -35,6 +39,18 @@ impl Stats {
                         let active = self.active_connections.load(Ordering::Relaxed);
                         let up = self.total_bytes_up.load(Ordering::Relaxed);
                         let down = self.total_bytes_down.load(Ordering::Relaxed);
+                        let unchanged = active == last_active && up == last_up && down == last_down;
+                        last_active = active;
+                        last_up = up;
+                        last_down = down;
+                        if unchanged && active == 0 {
+                            quiet_ticks = quiet_ticks.saturating_add(1);
+                            if quiet_ticks % 10 != 0 {
+                                return;
+                            }
+                        } else {
+                            quiet_ticks = 0;
+                        }
                         let total_mb = (up + down) as f64 / (1024.0 * 1024.0);
                         crate::log_error!("[СТАТИСТИКА] Активных: {active} | Трафик: {total_mb:.2} МБ");
                         events.stats(active, up, down);

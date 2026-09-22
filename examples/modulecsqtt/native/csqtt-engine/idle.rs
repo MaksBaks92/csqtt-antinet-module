@@ -17,10 +17,13 @@
 //! tied to a particular worker count. `keep` is the `idleWorkers` setting (default 2).
 //!
 //! Enter: uplink stays below one packet-sized delta per poll for `after`. Small chatter (TCP
-//! ACKs, DNS, push heartbeats) does not postpone it.
+//! ACKs, DNS, push heartbeats) does not postpone it. Keepers then re-GETCONF with
+//! `desired_count = keep` and a bumped `generation` so the server drops the parked workers
+//! from its RouteTable (otherwise it would stripe downlink onto dead sessions for up to 10 h
+//! and emit STREAM_REPAIR after 30 s).
 //! Exit: a real burst — several new TCP connections within a few seconds or a dozen uplink
-//! packets within a second. One background sync opening a single connection runs over the
-//! keepers instead of waking the whole set for nothing.
+//! packets within a second. Keepers re-GETCONF with the user's full `workers` count; parked
+//! ids reconnect on the same epoch.
 //!
 //! State is process-global (one engine per process) so that sessions and the packet bridge hot
 //! path can consult it without plumbing through every constructor. `netlost` pause is a separate
@@ -58,6 +61,12 @@ pub struct IdleConfig {
 static LIMIT: AtomicUsize = AtomicUsize::new(usize::MAX);
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static TOTAL_WORKERS: AtomicUsize = AtomicUsize::new(0);
+/// `desired_count` advertised in GETCONF (keep while idle, user total otherwise).
+static DECLARED: AtomicUsize = AtomicUsize::new(0);
+/// Added to the session's base generation so idle enter is a new server epoch.
+static GEN_OFFSET: AtomicU64 = AtomicU64::new(0);
+/// Bumped on enter/exit so live keepers re-GETCONF without tearing the TURN path.
+static ANNOUNCE: AtomicU64 = AtomicU64::new(0);
 static PACKET_WINDOW_START_MS: AtomicU64 = AtomicU64::new(0);
 static PACKET_WINDOW_COUNT: AtomicU64 = AtomicU64::new(0);
 static SYN_WINDOW_START_MS: AtomicU64 = AtomicU64::new(0);
@@ -76,9 +85,38 @@ fn clock_ms() -> u64 {
 /// Engine (re)start: everything unparked.
 pub fn reset(total_workers: usize) {
     TOTAL_WORKERS.store(total_workers, Ordering::Release);
+    DECLARED.store(total_workers, Ordering::Release);
     LIMIT.store(usize::MAX, Ordering::Release);
     ACTIVE.store(false, Ordering::Release);
+    GEN_OFFSET.store(0, Ordering::Release);
+    ANNOUNCE.store(0, Ordering::Release);
     notify().notify_waiters();
+}
+
+pub fn declared_count() -> usize {
+    match DECLARED.load(Ordering::Acquire) {
+        0 => TOTAL_WORKERS.load(Ordering::Acquire),
+        n => n,
+    }
+}
+
+pub fn generation(base: u64) -> u64 {
+    base.saturating_add(GEN_OFFSET.load(Ordering::Acquire))
+}
+
+pub fn announce_epoch() -> u64 {
+    ANNOUNCE.load(Ordering::Acquire)
+}
+
+/// Resolves once keepers should re-GETCONF (register-then-check).
+pub async fn announce_changed(seen: u64) {
+    loop {
+        let changed = notified();
+        if announce_epoch() != seen {
+            return;
+        }
+        changed.await;
+    }
 }
 
 pub fn is_active() -> bool {
@@ -114,11 +152,14 @@ pub fn enter(keep: usize) {
         return;
     }
     LIMIT.store(keep, Ordering::Release);
+    DECLARED.store(keep, Ordering::Release);
+    GEN_OFFSET.fetch_add(1, Ordering::AcqRel);
+    ANNOUNCE.fetch_add(1, Ordering::AcqRel);
     PACKET_WINDOW_COUNT.store(0, Ordering::Relaxed);
     SYN_WINDOW_COUNT.store(0, Ordering::Relaxed);
     notify().notify_waiters();
     crate::log_error!(
-        "[IDLE] Нет трафика — оставляю {keep} из {total} воркеров (их TURN keepalive держит путь), остальные паркую"
+        "[IDLE] Нет трафика — оставляю {keep} из {total} воркеров (GETCONF desired={keep}, новая эпоха); остальные паркую"
     );
 }
 
@@ -127,11 +168,11 @@ pub fn exit(reason: &str) {
         return;
     }
     LIMIT.store(usize::MAX, Ordering::Release);
+    let total = TOTAL_WORKERS.load(Ordering::Acquire);
+    DECLARED.store(total, Ordering::Release);
+    ANNOUNCE.fetch_add(1, Ordering::AcqRel);
     notify().notify_waiters();
-    crate::log_error!(
-        "[IDLE] {reason} — поднимаю воркеры до {}",
-        TOTAL_WORKERS.load(Ordering::Acquire)
-    );
+    crate::log_error!("[IDLE] {reason} — поднимаю воркеры до {total}");
 }
 
 /// IPv4 TCP segment with SYN set and ACK clear = a new outbound connection.
@@ -274,6 +315,8 @@ mod tests {
         assert!(is_active());
         assert!(allows(1) && allows(2));
         assert!(!allows(3) && !allows(27));
+        assert_eq!(declared_count(), 2);
+        assert_eq!(generation(7), 8);
         // parked() resolves promptly for a parked id.
         tokio::time::timeout(Duration::from_millis(200), parked(9))
             .await
@@ -281,12 +324,15 @@ mod tests {
         exit("test");
         assert!(!is_active());
         assert!(allows(27));
+        assert_eq!(declared_count(), 27);
+        assert_eq!(generation(7), 8); // offset stays; unparked workers join this epoch
 
         // keep >= total: nothing to park, stays inactive.
         reset(2);
         enter(2);
         assert!(!is_active());
         assert!(allows(2));
+        assert_eq!(declared_count(), 2);
         reset(0);
     }
 }

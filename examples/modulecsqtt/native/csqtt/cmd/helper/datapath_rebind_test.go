@@ -105,3 +105,26 @@ func TestDataPathGuardHandoverWhilePausedResumesFirst(t *testing.T) {
 		t.Fatal("must accept after handover lifted the pause")
 	}
 }
+
+func TestDataPathGuardHandoverDuringRecycleRebindsAfter(t *testing.T) {
+	var active, rebinds, starts atomic.Int32
+	active.Store(2)
+	g := newRebindTestGuard(&active, &rebinds, &starts, true)
+	g.recycling = true
+	g.onHandover("netchange")
+	if rebinds.Load() != 0 {
+		t.Fatalf("handover during recycle must wait: rebinds=%d", rebinds.Load())
+	}
+	if !g.pendingHandover {
+		t.Fatal("must remember handover until recycle finishes")
+	}
+	source := g.pendingHandoverSource
+	g.recycling = false
+	g.pendingHandover = false
+	g.pendingHandoverSource = ""
+	g.lastRebind = time.Time{}
+	g.onHandover(source)
+	if rebinds.Load() != 1 {
+		t.Fatalf("pending handover must rebind after recycle: %d", rebinds.Load())
+	}
+}

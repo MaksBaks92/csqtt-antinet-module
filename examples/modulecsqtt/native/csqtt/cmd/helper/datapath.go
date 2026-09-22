@@ -59,18 +59,20 @@ type dataPathGuard struct {
 
 	addr atomic.Pointer[net.UDPAddr]
 
-	dialFails      int
-	recycles       int
-	lastRecycle    time.Time
-	recycling      bool
-	paused         bool // netlost: do not burn dial budget / recycle
-	pauseGen       uint64
-	pendingRecycle bool // heal requested while paused → apply on netback
-	pendingReason  string
-	graceUntil     time.Time // after wake: stale dial-timeouts are not evidence
-	lastRebind     time.Time // soft handover dedupe (host event + own detector)
-	rebindGen      uint64
-	exiting        bool
+	dialFails             int
+	recycles              int
+	lastRecycle           time.Time
+	recycling             bool
+	paused                bool // netlost: do not burn dial budget / recycle
+	pauseGen              uint64
+	pendingRecycle        bool // heal requested while paused → apply on netback
+	pendingReason         string
+	graceUntil            time.Time // after wake: stale dial-timeouts are not evidence
+	lastRebind            time.Time // soft handover dedupe (host event + own detector)
+	rebindGen             uint64
+	pendingHandover       bool
+	pendingHandoverSource string
+	exiting               bool
 
 	stopFn   func()
 	startFn  func(string) error
@@ -238,8 +240,19 @@ func (g *dataPathGuard) onHandover(source string) {
 	}
 	g.resumeFromPause(source)
 	g.mu.Lock()
-	if g.exiting || g.recycling {
+	if g.exiting {
 		g.mu.Unlock()
+		return
+	}
+	if g.recycling {
+		// Recycle owns the sockets; remember the change and rebind as soon as the new
+		// engine is up instead of leaving it on the old network.
+		g.pendingHandover = true
+		if g.pendingHandoverSource == "" {
+			g.pendingHandoverSource = source
+		}
+		g.mu.Unlock()
+		g.logFn("CSQTT: %s во время recycle — rebind сразу после перезапуска движка", source)
 		return
 	}
 	now := g.nowFn()
@@ -509,11 +522,21 @@ func (g *dataPathGuard) requestRecycle(reason string) {
 	g.mu.Lock()
 	g.recycling = false
 	g.dialFails = 0
+	handover := g.pendingHandover
+	handoverSource := g.pendingHandoverSource
+	g.pendingHandover = false
+	g.pendingHandoverSource = ""
+	if handover {
+		g.lastRebind = time.Time{}
+	}
 	g.mu.Unlock()
 	if port > 0 {
 		g.logFn("CSQTT: движок перезапущен · pkt=%d", port)
 	} else {
 		g.logFn("CSQTT: движок перезапущен · bridge=in-process")
+	}
+	if handover {
+		g.onHandover(handoverSource)
 	}
 }
 
