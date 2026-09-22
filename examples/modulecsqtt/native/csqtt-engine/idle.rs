@@ -5,19 +5,22 @@
 //! anything, bring the full worker set back the moment real traffic appears.
 //!
 //! Why: every READY worker emits a ChannelData keepalive each 10 s plus Refresh / permission /
-//! channel maintenance; 27 unsynchronised workers wake the radio every ~0.4 s and keep it out of
+//! channel maintenance; N unsynchronised workers wake the radio every ~10/N s and keep it out of
 //! its idle state — that is the main battery cost of an otherwise silent tunnel. On wake-up from
-//! sleep all 27 paths are dead and reconnect at once. With two keepers both problems shrink to
-//! 2/27, and the keepers' control plane (keepalive 10 s, Refresh 300 s, maintenance 175 s) is
+//! sleep all N paths are dead and reconnect at once. With `keep` keepers both problems shrink to
+//! keep/N, and the keepers' control plane (keepalive 10 s, Refresh 300 s, maintenance 175 s) is
 //! **independent of user traffic**: it keeps the NAT mapping, the relay allocation and the server
 //! session alive even when nothing is sent through the tunnel. The keepers also carry whatever
 //! light traffic does happen (push ACKs, DNS) while the rest is parked.
+//!
+//! N is whatever the user configured (`workers` setting, passed in via `reset`); nothing here is
+//! tied to a particular worker count. `keep` is the `idleWorkers` setting (default 2).
 //!
 //! Enter: uplink stays below one packet-sized delta per poll for `after`. Small chatter (TCP
 //! ACKs, DNS, push heartbeats) does not postpone it.
 //! Exit: a real burst — several new TCP connections within a few seconds or a dozen uplink
 //! packets within a second. One background sync opening a single connection runs over the
-//! keepers instead of waking 25 workers for nothing.
+//! keepers instead of waking the whole set for nothing.
 //!
 //! State is process-global (one engine per process) so that sessions and the packet bridge hot
 //! path can consult it without plumbing through every constructor. `netlost` pause is a separate
