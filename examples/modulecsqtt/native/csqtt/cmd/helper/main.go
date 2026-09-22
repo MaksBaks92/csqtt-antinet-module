@@ -798,8 +798,9 @@ func handleConn(c net.Conn, user, pass string, tun *tunnel.IPTunnel, resolver *p
 	target := net.JoinHostPort(host, strconv.Itoa(int(req.Port)))
 	dialStart := time.Now()
 	if guard != nil && guard.rejecting() {
-		// Fast-fail while recycling/paused so host FIRE can accumulate rejects
-		// instead of hanging on 20s dials and 146-byte scraps.
+		// Fast-fail while paused/exiting so host FIRE can accumulate rejects
+		// instead of hanging on 20s dials and 146-byte scraps. Recycle/rebind
+		// holds the CONNECT in waitForPath instead of rejecting.
 		log.Printf("[SOCKS] reject (data path recovering) target=%s", target)
 		_, _ = c.Write(socksRep(0x01))
 		return

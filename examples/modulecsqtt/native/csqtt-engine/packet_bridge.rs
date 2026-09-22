@@ -6,21 +6,26 @@
 //! is an optional C callback into the helper.
 
 use crate::packet::{PacketBuf, PacketPool};
+use arc_swap::ArcSwapOption;
 use crossbeam_queue::ArrayQueue;
 use std::sync::{
-    Arc, Mutex,
+    Arc, OnceLock,
     atomic::{AtomicBool, AtomicPtr, Ordering},
 };
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-const UPLINK_CAPACITY: usize = 1024;
+pub const UPLINK_CAPACITY: usize = 1024;
 
 pub type PacketOutCb = extern "C" fn(*const u8, i32);
 
 static PACKET_OUT: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 static BRIDGE_READY: AtomicBool = AtomicBool::new(false);
-static UPLINK: Mutex<Option<Arc<UplinkBridge>>> = Mutex::new(None);
+
+fn uplink_slot() -> &'static ArcSwapOption<UplinkBridge> {
+    static UPLINK: OnceLock<ArcSwapOption<UplinkBridge>> = OnceLock::new();
+    UPLINK.get_or_init(ArcSwapOption::empty)
+}
 
 pub struct UplinkBridge {
     pub pool: Arc<PacketPool>,
@@ -49,15 +54,11 @@ pub fn bridge_ready() -> bool {
 
 pub fn clear_bridge() {
     BRIDGE_READY.store(false, Ordering::Release);
-    if let Ok(mut slot) = UPLINK.lock() {
-        *slot = None;
-    }
+    uplink_slot().store(None);
 }
 
 pub fn install_uplink(bridge: Arc<UplinkBridge>) {
-    if let Ok(mut slot) = UPLINK.lock() {
-        *slot = Some(bridge);
-    }
+    uplink_slot().store(Some(bridge));
     BRIDGE_READY.store(true, Ordering::Release);
 }
 
@@ -68,11 +69,7 @@ pub fn inject_packet(data: &[u8]) -> i32 {
     {
         return -3;
     }
-    let bridge = match UPLINK.lock() {
-        Ok(guard) => guard.as_ref().cloned(),
-        Err(_) => None,
-    };
-    let Some(bridge) = bridge else {
+    let Some(bridge) = uplink_slot().load_full() else {
         return -1;
     };
     if bridge.cancel.is_cancelled() {
@@ -94,7 +91,10 @@ pub fn inject_packet(data: &[u8]) -> i32 {
     if bridge.queue.push(packet).is_err() {
         return -2;
     }
-    bridge.notify.notify_one();
+    // Wake the reader only on empty → nonempty; it drains the whole queue per wake.
+    if bridge.queue.len() == 1 {
+        bridge.notify.notify_one();
+    }
     0
 }
 

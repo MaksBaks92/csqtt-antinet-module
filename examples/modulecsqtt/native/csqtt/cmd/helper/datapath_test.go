@@ -82,6 +82,30 @@ func TestDataPathGuardRecyclesAfterDialTimeouts(t *testing.T) {
 	}
 }
 
+func TestDataPathGuardRecycleDoesNotReject(t *testing.T) {
+	g := &dataPathGuard{
+		recycling: true,
+		nowFn:     time.Now,
+		logFn:     func(string, ...any) {},
+		statusFn:  func(string, string) {},
+	}
+	if g.rejecting() {
+		t.Fatal("recycle must hold CONNECT, not reject")
+	}
+
+	var polls atomic.Int32
+	paused := &dataPathGuard{
+		paused:   true,
+		activeFn: func() int { polls.Add(1); return 0 },
+		sleepFn:  func(time.Duration) {},
+		nowFn:    time.Now,
+	}
+	paused.waitForPath(context.Background())
+	if polls.Load() != 0 {
+		t.Fatalf("paused must not poll for a path: %d", polls.Load())
+	}
+}
+
 func TestDataPathGuardResetsOnDialOK(t *testing.T) {
 	var starts atomic.Int32
 	g := &dataPathGuard{

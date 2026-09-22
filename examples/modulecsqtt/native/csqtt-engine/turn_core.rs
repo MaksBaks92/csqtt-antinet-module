@@ -487,7 +487,6 @@ impl NativeCore {
             inner.destroy_allocation(Operation::Refresh, RESULT_TIMEOUT, 0);
         }
         if !inner.shutting_down && inner.state == STATE_READY {
-            let mut control_started = false;
             let maintenance_due = inner
                 .maintenance_refresh
                 .is_some_and(|deadline| now >= deadline);
@@ -502,7 +501,6 @@ impl NativeCore {
             {
                 inner.allocation_refresh = None;
                 inner.start_operation(Operation::Refresh, true, 0)?;
-                control_started = true;
             }
             if maintenance_due {
                 inner.maintenance_refresh = Some(now + inner.profile.maintenance_refresh);
@@ -512,19 +510,15 @@ impl NativeCore {
             {
                 inner.permission_retry = None;
                 inner.start_operation(Operation::Permission, true, 0)?;
-                control_started = true;
             }
             if (maintenance_due || channel_retry_due) && !inner.has_operation(Operation::Channel) {
                 inner.channel_retry = None;
                 inner.start_operation(Operation::Channel, true, 0)?;
-                control_started = true;
             }
 
             if inner.keepalive.is_some_and(|deadline| now >= deadline) {
                 inner.keepalive = Some(now + inner.profile.keepalive_interval);
-                if !control_started {
-                    inner.queue_keepalive();
-                }
+                inner.queue_keepalive();
             }
         }
         Ok(inner.next_deadline().map(|deadline| {

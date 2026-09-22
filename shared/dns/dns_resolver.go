@@ -50,13 +50,19 @@ import (
 
 const (
 	dnsCacheTTL      = 60 * time.Second
+	dnsNegCacheTTL   = 15 * time.Second
+	dnsCacheMax      = 256
 	dnsMaxPacketSize = 1500
 )
 
 type dnsCacheEntry struct {
-	ips     []string
-	expires time.Time
+	ips      []string
+	expires  time.Time
+	negative bool
 }
+
+// dnsQueryOne is [queryOneServer]; tests swap it so A/AAAA policy can be checked without a live resolver.
+var dnsQueryOne = queryOneServer
 
 type protectedResolver struct {
 	servers     []string // "ip:port"
@@ -166,7 +172,7 @@ func (r *protectedResolver) LookupHost(host string) ([]string, error) {
 	r.mu.Lock()
 	if e, ok := r.cache[host]; ok && time.Now().Before(e.expires) {
 		r.mu.Unlock()
-		return e.ips, nil
+		return cachedLookup(host, e)
 	}
 	if ch, ok := r.inFlight[host]; ok {
 		// Резолв ЭТОГО хоста уже идёт на другой горутине — ждём его результат вместо дублирования
@@ -177,7 +183,7 @@ func (r *protectedResolver) LookupHost(host string) ([]string, error) {
 		e, ok := r.cache[host]
 		r.mu.Unlock()
 		if ok && time.Now().Before(e.expires) {
-			return e.ips, nil
+			return cachedLookup(host, e)
 		}
 		return nil, fmt.Errorf("dns: concurrent resolve of %s failed", host)
 	}
@@ -190,7 +196,9 @@ func (r *protectedResolver) LookupHost(host string) ([]string, error) {
 	r.mu.Lock()
 	delete(r.inFlight, host)
 	if err == nil {
-		r.cache[host] = dnsCacheEntry{ips: ips, expires: time.Now().Add(dnsCacheTTL)}
+		r.rememberLocked(host, dnsCacheEntry{ips: ips, expires: time.Now().Add(dnsCacheTTL)})
+	} else {
+		r.rememberLocked(host, dnsCacheEntry{negative: true, expires: time.Now().Add(dnsNegCacheTTL)})
 	}
 	r.mu.Unlock()
 	close(ch)
@@ -198,24 +206,86 @@ func (r *protectedResolver) LookupHost(host string) ([]string, error) {
 	return ips, err
 }
 
-// queryAll — пробует все сконфигурированные сервера по очереди для A, затем (если ни один не дал
-// A-записи) для AAAA. Первый успех побеждает — не гонка (здесь резолверы — реальные физические DNS,
-// не флакающий in-tunnel путь qWDTT, гонять их параллельно незачем).
+func cachedLookup(host string, e dnsCacheEntry) ([]string, error) {
+	if e.negative {
+		return nil, fmt.Errorf("dns: no records for %s", host)
+	}
+	return e.ips, nil
+}
+
+func (r *protectedResolver) rememberLocked(host string, e dnsCacheEntry) {
+	if len(r.cache) >= dnsCacheMax {
+		if _, exists := r.cache[host]; !exists {
+			now := time.Now()
+			evicted := ""
+			for k, v := range r.cache {
+				if now.After(v.expires) {
+					evicted = k
+					break
+				}
+				if evicted == "" {
+					evicted = k
+				}
+			}
+			if evicted != "" {
+				delete(r.cache, evicted)
+			}
+		}
+	}
+	r.cache[host] = e
+}
+
+// queryAll — A ко всем серверам параллельно (первый успех побеждает). AAAA только если ни один
+// A не дал адресов: v4-only туннель не выигрывает от AAAA, а round-trip за ним на каждом CONNECT
+// это лишние 3с при мёртвом IPv6. Негативный ответ кэширует вызывающий.
 func (r *protectedResolver) queryAll(host string) ([]string, error) {
-	var lastErr error
 	// Снимок берётся ОДИН раз на весь обход: замена списка посреди перебора дала бы часть
-	// запросов старым резолверам, часть новым, и `lastErr` уже нельзя было бы отнести ни к
+	// запросов старым резолверам, часть новым, и ошибку уже нельзя было бы отнести ни к
 	// одному из состояний.
 	servers := r.currentServers()
-	for _, qtype := range [...]dnsmessage.Type{dnsmessage.TypeA, dnsmessage.TypeAAAA} {
-		for _, srv := range servers {
-			ips, err := queryOneServer(srv, r.protectPath, host, qtype, dnsQueryTimeout)
-			if err == nil && len(ips) > 0 {
-				return ips, nil
-			}
-			if err != nil {
-				lastErr = err
-			}
+	ips, err := r.queryTypeParallel(host, servers, dnsmessage.TypeA)
+	if err == nil && len(ips) > 0 {
+		return ips, nil
+	}
+	aaaa, aaaaErr := r.queryTypeParallel(host, servers, dnsmessage.TypeAAAA)
+	if aaaaErr == nil && len(aaaa) > 0 {
+		return aaaa, nil
+	}
+	if err == nil {
+		err = aaaaErr
+	}
+	if err == nil {
+		err = fmt.Errorf("dns: no records for %s", host)
+	}
+	return nil, err
+}
+
+func (r *protectedResolver) queryTypeParallel(host string, servers []string, qtype dnsmessage.Type) ([]string, error) {
+	if len(servers) == 0 {
+		return nil, fmt.Errorf("dns: no records for %s", host)
+	}
+	if len(servers) == 1 {
+		return dnsQueryOne(servers[0], r.protectPath, host, qtype, dnsQueryTimeout)
+	}
+	type result struct {
+		ips []string
+		err error
+	}
+	ch := make(chan result, len(servers))
+	for _, srv := range servers {
+		go func(srv string) {
+			ips, err := dnsQueryOne(srv, r.protectPath, host, qtype, dnsQueryTimeout)
+			ch <- result{ips, err}
+		}(srv)
+	}
+	var lastErr error
+	for i := 0; i < len(servers); i++ {
+		got := <-ch
+		if got.err == nil && len(got.ips) > 0 {
+			return got.ips, nil
+		}
+		if got.err != nil {
+			lastErr = got.err
 		}
 	}
 	if lastErr == nil {

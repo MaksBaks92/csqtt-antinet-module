@@ -32,7 +32,7 @@ import (
 const (
 	dataPathDialFailThreshold = 3
 	dataPathRecycleMinGap     = 45 * time.Second
-	dataPathMaxRecycles       = 4
+	dataPathMaxRecycles       = 8
 	dataPathEngineSettle      = 800 * time.Millisecond
 	dataPathWakeGrace         = 30 * time.Second
 	dataPathPathWaitMax       = 8 * time.Second
@@ -130,7 +130,9 @@ func (g *dataPathGuard) packetAddr() *net.UDPAddr {
 func (g *dataPathGuard) rejecting() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.recycling || g.paused || g.exiting
+	// Recycle/rebind: SOCKS CONNECT is held (waitForPath), not rejected — apps survive the
+	// 1–2 s path rebuild. Instant reject stays for pause (offline) and fatal exit (FIRE).
+	return g.paused || g.exiting
 }
 
 func (g *dataPathGuard) setPaused(v bool) {
@@ -425,7 +427,13 @@ func (g *dataPathGuard) onWake(gap time.Duration) {
 // sleep / handover). Returns as soon as a path exists, ctx ends, or the cap elapses; the dial
 // itself is still bounded by ctx. Zero cost on the hot path: one atomic read via FFI.
 func (g *dataPathGuard) waitForPath(ctx context.Context) {
-	if g == nil || g.activeFn == nil || g.activeFn() != 0 {
+	if g == nil {
+		return
+	}
+	if g.rejecting() {
+		return
+	}
+	if g.activeFn == nil || g.activeFn() != 0 {
 		return
 	}
 	deadline := g.nowFn().Add(dataPathPathWaitMax)
@@ -434,6 +442,9 @@ func (g *dataPathGuard) waitForPath(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		default:
+		}
+		if g.rejecting() {
+			return
 		}
 		g.sleepFn(dataPathPathWaitPoll)
 		if g.activeFn() != 0 {

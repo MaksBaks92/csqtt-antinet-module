@@ -314,6 +314,24 @@ type socksUDPTransport interface {
 // клиента могут жить и умирать внахлёст, без id их не различить в общем логе.
 var udpAssocSeq int64
 
+const socksUDPIdleTTL = 60 * time.Second
+
+type udpNatEntry struct {
+	conn net.Conn
+	last time.Time
+}
+
+func sweepIdleUDPTargets(targets map[netip.AddrPort]*udpNatEntry, now time.Time) {
+	for dst, e := range targets {
+		if e == nil || e.conn == nil || now.Sub(e.last) >= socksUDPIdleTTL {
+			if e != nil && e.conn != nil {
+				_ = e.conn.Close()
+			}
+			delete(targets, dst)
+		}
+	}
+}
+
 // serveSocksUDPAssociate — стандартное SOCKS5 UDP-реле:
 //  1. биндим loopback-UDP relay (хост шлёт сюда SOCKS5-UDP-датаграммы);
 //  2. отвечаем control-conn'у BND.ADDR=127.0.0.1:relayPort;
@@ -342,14 +360,18 @@ func serveSocksUDPAssociate(ctrl net.Conn, br *bufio.Reader, t socksUDPTransport
 	}
 
 	var mu sync.Mutex
-	targets := map[netip.AddrPort]net.Conn{}
+	targets := map[netip.AddrPort]*udpNatEntry{}
 	var clientAddr *net.UDPAddr
 	var pktsIn, pktsOut, bytesIn, bytesOut int64
 	var parseFails, dialFails, famRejects int64
+	sweepDone := make(chan struct{})
 	defer func() {
+		close(sweepDone)
 		mu.Lock()
-		for _, u := range targets {
-			_ = u.Close()
+		for _, e := range targets {
+			if e != nil && e.conn != nil {
+				_ = e.conn.Close()
+			}
 		}
 		nTargets := len(targets)
 		targets = nil
@@ -358,6 +380,22 @@ func serveSocksUDPAssociate(ctrl net.Conn, br *bufio.Reader, t socksUDPTransport
 			assocID, time.Since(assocStart), atomic.LoadInt64(&pktsIn), atomic.LoadInt64(&pktsOut),
 			atomic.LoadInt64(&bytesIn), atomic.LoadInt64(&bytesOut), atomic.LoadInt64(&parseFails),
 			atomic.LoadInt64(&famRejects), atomic.LoadInt64(&dialFails), nTargets)
+	}()
+	go func() {
+		tick := time.NewTicker(socksUDPIdleTTL / 2)
+		defer tick.Stop()
+		for {
+			select {
+			case <-sweepDone:
+				return
+			case now := <-tick.C:
+				mu.Lock()
+				if targets != nil {
+					sweepIdleUDPTargets(targets, now)
+				}
+				mu.Unlock()
+			}
+		}
 	}()
 
 	// Закрытие control-conn'а (хост завершил ассоциацию) → рвём relay (разблокирует ReadFromUDP).
@@ -389,7 +427,12 @@ func serveSocksUDPAssociate(ctrl net.Conn, br *bufio.Reader, t socksUDPTransport
 			continue
 		}
 		mu.Lock()
-		uc := targets[dst]
+		sweepIdleUDPTargets(targets, time.Now())
+		var uc net.Conn
+		if e := targets[dst]; e != nil {
+			uc = e.conn
+			e.last = time.Now()
+		}
 		mu.Unlock()
 		if uc == nil {
 			dialStart := time.Now()
@@ -407,7 +450,7 @@ func serveSocksUDPAssociate(ctrl net.Conn, br *bufio.Reader, t socksUDPTransport
 			log.Printf("UDPASSOC #%d target dial OK dst=%v dialElapsed=%v", assocID, dst, time.Since(dialStart))
 			uc = nc
 			mu.Lock()
-			targets[dst] = uc
+			targets[dst] = &udpNatEntry{conn: uc, last: time.Now()}
 			mu.Unlock()
 			// pump target → client: ответы оборачиваем в SOCKS5-UDP-заголовок с этим target'ом.
 			//

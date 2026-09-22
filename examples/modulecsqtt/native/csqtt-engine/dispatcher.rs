@@ -245,10 +245,12 @@ impl PacketSender {
         };
         if force {
             drop(self.shared.queue.force_push(queued));
+            self.shared.notify.notify_one();
         } else if let Err(queued) = self.shared.queue.push(queued) {
             return Err(queued.packet);
+        } else if self.shared.queue.len() == 1 {
+            self.shared.notify.notify_one();
         }
-        self.shared.notify.notify_one();
         Ok(())
     }
 
@@ -557,7 +559,7 @@ impl Dispatcher {
         } else if packet_bridge {
             let uplink = Arc::new(UplinkBridge {
                 pool: pool.clone(),
-                queue: ArrayQueue::new(1024),
+                queue: ArrayQueue::new(packet_bridge::UPLINK_CAPACITY),
                 notify: Arc::new(Notify::new()),
                 cancel: dispatcher.cancel.clone(),
             });

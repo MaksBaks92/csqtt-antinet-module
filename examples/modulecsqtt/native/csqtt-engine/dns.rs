@@ -26,6 +26,7 @@ const DNS_AAAA_RECORD: u16 = 28;
 /// TURN relay IP has not changed. Relay/peer records are stable for hours.
 const DNS_CACHE_FRESH: Duration = Duration::from_secs(60);
 const DNS_CACHE_STALE_MAX: Duration = Duration::from_secs(6 * 60 * 60);
+const DNS_CACHE_MAX: usize = 64;
 static TUNNEL_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 enum YandexDnsError {
@@ -53,6 +54,15 @@ fn cached(host: &str, max_age: Duration) -> Option<Vec<IpAddr>> {
 
 fn remember(host: &str, addresses: &[IpAddr]) {
     let mut guard = cache().lock().unwrap_or_else(|p| p.into_inner());
+    if guard.len() >= DNS_CACHE_MAX && !guard.contains_key(host) {
+        let oldest = guard
+            .iter()
+            .min_by_key(|(_, entry)| entry.resolved_at)
+            .map(|(key, _)| key.clone());
+        if let Some(key) = oldest {
+            guard.remove(&key);
+        }
+    }
     guard.insert(
         host.to_string(),
         CacheEntry {

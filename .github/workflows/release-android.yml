@@ -20,6 +20,9 @@ jobs:
           go-version-file: examples/modulecsqtt/native/csqtt/go.mod
           cache-dependency-path: examples/modulecsqtt/native/csqtt/go.sum
 
+      - name: Go helper tests
+        run: python build.py --test --module csqtt -y
+
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Rust Android targets

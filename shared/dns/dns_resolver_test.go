@@ -12,8 +12,13 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"golang.org/x/net/dns/dnsmessage"
 )
 
 // TestLookupHostNeverFallsBackToDefaultResolver — ловушка на `net.DefaultResolver`.
@@ -92,4 +97,124 @@ func TestSetServersKeepsPreviousOnEmpty(t *testing.T) {
 	if len(after) != len(before) {
 		t.Fatalf("пустой список затёр рабочие серверы: было %v, стало %v", before, after)
 	}
+}
+
+func TestQueryAllSkipsAAAAWhenAHits(t *testing.T) {
+	orig := dnsQueryOne
+	t.Cleanup(func() { dnsQueryOne = orig })
+	var aaaa atomic.Int32
+	dnsQueryOne = func(server, protectPath, host string, qtype dnsmessage.Type, timeout time.Duration) ([]string, error) {
+		_ = server
+		_ = protectPath
+		_ = host
+		_ = timeout
+		if qtype == dnsmessage.TypeAAAA {
+			aaaa.Add(1)
+			return []string{"2001:db8::1"}, nil
+		}
+		return []string{"192.0.2.1"}, nil
+	}
+	r := newProtectedResolver("192.0.2.53,192.0.2.54", "")
+	ips, err := r.queryAll("example.test")
+	if err != nil || len(ips) != 1 || ips[0] != "192.0.2.1" {
+		t.Fatalf("A must win: ips=%v err=%v", ips, err)
+	}
+	if aaaa.Load() != 0 {
+		t.Fatalf("AAAA must not run when A succeeded: %d", aaaa.Load())
+	}
+}
+
+func TestQueryAllFallsBackToAAAA(t *testing.T) {
+	orig := dnsQueryOne
+	t.Cleanup(func() { dnsQueryOne = orig })
+	dnsQueryOne = func(server, protectPath, host string, qtype dnsmessage.Type, timeout time.Duration) ([]string, error) {
+		_ = server
+		_ = protectPath
+		_ = host
+		_ = timeout
+		if qtype == dnsmessage.TypeA {
+			return nil, fmt.Errorf("no A")
+		}
+		return []string{"2001:db8::1"}, nil
+	}
+	r := newProtectedResolver("192.0.2.53", "")
+	ips, err := r.queryAll("example.test")
+	if err != nil || len(ips) != 1 || ips[0] != "2001:db8::1" {
+		t.Fatalf("AAAA fallback: ips=%v err=%v", ips, err)
+	}
+}
+
+func TestQueryAllRacesAServers(t *testing.T) {
+	orig := dnsQueryOne
+	t.Cleanup(func() { dnsQueryOne = orig })
+	dnsQueryOne = func(server, protectPath, host string, qtype dnsmessage.Type, timeout time.Duration) ([]string, error) {
+		_ = protectPath
+		_ = host
+		_ = timeout
+		if qtype != dnsmessage.TypeA {
+			return nil, fmt.Errorf("unexpected %v", qtype)
+		}
+		if server == "192.0.2.53:53" {
+			time.Sleep(400 * time.Millisecond)
+			return []string{"192.0.2.10"}, nil
+		}
+		return []string{"192.0.2.20"}, nil
+	}
+	r := newProtectedResolver("192.0.2.53,192.0.2.54", "")
+	start := time.Now()
+	ips, err := r.queryAll("example.test")
+	if err != nil || len(ips) != 1 || ips[0] != "192.0.2.20" {
+		t.Fatalf("fast A must win: ips=%v err=%v", ips, err)
+	}
+	if time.Since(start) > 800*time.Millisecond {
+		t.Fatalf("A queries must race, took %v", time.Since(start))
+	}
+}
+
+func TestLookupHostNegativeCache(t *testing.T) {
+	orig := dnsQueryOne
+	t.Cleanup(func() { dnsQueryOne = orig })
+	var calls atomic.Int32
+	dnsQueryOne = func(server, protectPath, host string, qtype dnsmessage.Type, timeout time.Duration) ([]string, error) {
+		_ = server
+		_ = protectPath
+		_ = host
+		_ = qtype
+		_ = timeout
+		calls.Add(1)
+		return nil, fmt.Errorf("nxdomain")
+	}
+	r := newProtectedResolver("192.0.2.53", "")
+	if _, err := r.LookupHost("missing.test"); err == nil {
+		t.Fatal("expected negative lookup error")
+	}
+	first := calls.Load()
+	if first == 0 {
+		t.Fatal("first lookup must query")
+	}
+	if _, err := r.LookupHost("missing.test"); err == nil {
+		t.Fatal("negative cache must still fail")
+	}
+	if calls.Load() != first {
+		t.Fatalf("negative cache must skip the network: first=%d later=%d", first, calls.Load())
+	}
+}
+
+func TestDNSCacheCapEvicts(t *testing.T) {
+	r := newProtectedResolver("192.0.2.53", "")
+	r.mu.Lock()
+	for i := 0; i < dnsCacheMax; i++ {
+		r.cache[fmt.Sprintf("h%d.test", i)] = dnsCacheEntry{
+			ips:     []string{"192.0.2.1"},
+			expires: time.Now().Add(time.Hour),
+		}
+	}
+	r.rememberLocked("new.test", dnsCacheEntry{ips: []string{"192.0.2.9"}, expires: time.Now().Add(time.Hour)})
+	if len(r.cache) != dnsCacheMax {
+		t.Fatalf("cap %d, got %d", dnsCacheMax, len(r.cache))
+	}
+	if _, ok := r.cache["new.test"]; !ok {
+		t.Fatal("new entry must be stored")
+	}
+	r.mu.Unlock()
 }

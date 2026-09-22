@@ -579,6 +579,36 @@ def inject_canons(m, go_dir, android=False):
     return copied
 
 
+def cmd_test(mod):
+    """go test helper'а: каноны инжектятся как при сборке, CGO_ENABLED=0 (без rust-движка)."""
+    m = MODULES[mod]
+    go = find_go()
+    if not go:
+        err("go не найден")
+        return False
+    go_dir = REPO / m["dir"]
+    if not (go_dir / "go.mod").exists():
+        err(f"go.mod не найден: {go_dir}")
+        return False
+    env = dict(os.environ, CGO_ENABLED="0")
+    injected = inject_canons(m, go_dir)
+    try:
+        cmd = [go, "test", "-vet=off", "./..."]
+        info(f"[{mod}] {' '.join(cmd[1:])}  CGO_ENABLED=0")
+        r = subprocess.run(cmd, cwd=str(go_dir), env=env)
+    finally:
+        for p in injected:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+    if r.returncode != 0:
+        err(f"[{mod}] go test упал (код {r.returncode})")
+        return False
+    ok(f"[{mod}] go test ok")
+    return True
+
+
 def build_desktop(go, mod, goos, goarch):
     """go build helper'а под desktop-ОС (CGO_ENABLED=0 → кросс-компиляция без C-тулчейна)."""
     m = MODULES[mod]
@@ -1324,6 +1354,7 @@ HELP_EPILOG = """
   python build.py --os all     --module echo -y  android + windows + linux + darwin
   python build.py --package --module echo        самодостаточный архив автору → dist-archive/
   python build.py --bundle  --module echo        release-бандлы + манифест → dist-release/
+  python build.py --test --module csqtt -y       go test helper (каноны, CGO_ENABLED=0)
 
 ГДЕ ОКАЖЕТСЯ РЕЗУЛЬТАТ
   examples/<module>/dist/android/<abi>/lib<name>.so   + module.json рядом
@@ -1346,6 +1377,8 @@ def main():
                          "а при --os all — все)")
     ap.add_argument("--api", type=int, default=26, help="Android API level для NDK clang (default 26)")
     ap.add_argument("-y", "--yes", action="store_true", help="не задавать вопросов (всё из флагов/дефолтов)")
+    ap.add_argument("--test", action="store_true",
+                    help="go test helper'а (инжект канонов, CGO_ENABLED=0 → без rust-движка)")
     ap.add_argument("--doctor", action="store_true",
                     help="проверить тулчейн (Go/NDK/C-компилятор) и напечатать, чего не хватает и как поставить")
     ap.add_argument("--package", action="store_true",
@@ -1358,6 +1391,16 @@ def main():
     if a.doctor:
         targets = list(ALL_OSES) if a.os in (None, "all") else [a.os]
         return 0 if cmd_doctor(targets, a.module) else 1
+
+    if a.test:
+        mod = a.module
+        if not mod and not a.yes:
+            mod = ask_choice("Модуль", list(MODULES), next(iter(MODULES)))
+        if not mod:
+            mod = next(iter(MODULES))
+        if mod not in MODULES:
+            err(f"Неизвестный модуль: {mod}. Допустимо: {list(MODULES)}"); return 2
+        return 0 if cmd_test(mod) else 1
 
     # package / bundle — не требуют Go (только копирование/zip); резолвим модуль и выходим.
     if a.package or a.bundle:
