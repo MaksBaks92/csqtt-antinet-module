@@ -19,6 +19,7 @@ static int32_t (*fn_packet_port)(void);
 static int32_t (*fn_tun_ip)(char *, int32_t);
 static int32_t (*fn_tun_dns)(char *, int32_t);
 static void (*fn_stop)(void);
+static void (*fn_set_paused)(int32_t);
 static void (*fn_set_packet_out)(void *);
 static int32_t (*fn_inject_packet)(const uint8_t *, int32_t);
 
@@ -37,6 +38,7 @@ static int csqtt_load(const char *path) {
 	fn_tun_ip = (int32_t (*)(char *, int32_t))dlsym(eng, "csqtt_engine_tun_ip");
 	fn_tun_dns = (int32_t (*)(char *, int32_t))dlsym(eng, "csqtt_engine_tun_dns");
 	fn_stop = (void (*)(void))dlsym(eng, "csqtt_engine_stop");
+	fn_set_paused = (void (*)(int32_t))dlsym(eng, "csqtt_engine_set_paused");
 	fn_set_packet_out = (void (*)(void *))dlsym(eng, "csqtt_engine_set_packet_out");
 	fn_inject_packet = (int32_t (*)(const uint8_t *, int32_t))dlsym(eng, "csqtt_engine_inject_packet");
 	if (!fn_start || !fn_wait_ready || !fn_packet_port || !fn_tun_ip || !fn_stop) {
@@ -65,6 +67,7 @@ static int32_t csqtt_packet_port(void) { return fn_packet_port ? fn_packet_port(
 static int32_t csqtt_tun_ip(char *b, int32_t n) { return fn_tun_ip ? fn_tun_ip(b, n) : -1; }
 static int32_t csqtt_tun_dns(char *b, int32_t n) { return fn_tun_dns ? fn_tun_dns(b, n) : -1; }
 static void csqtt_stop(void) { if (fn_stop) fn_stop(); }
+static void csqtt_set_paused(int32_t v) { if (fn_set_paused) fn_set_paused(v); }
 static int32_t csqtt_inject(const uint8_t *d, int32_t n) {
 	return fn_inject_packet ? fn_inject_packet((uint8_t *)d, n) : -1;
 }
@@ -200,6 +203,14 @@ func cstrFrom(buf []byte) string {
 }
 
 func engineStop() { C.csqtt_stop() }
+
+func engineSetPaused(paused bool) {
+	v := C.int32_t(0)
+	if paused {
+		v = 1
+	}
+	C.csqtt_set_paused(v)
+}
 
 func findEngineLib(name string, extra ...string) (string, error) {
 	var dirs []string

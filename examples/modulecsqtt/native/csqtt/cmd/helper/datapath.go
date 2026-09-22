@@ -16,6 +16,9 @@ import (
 // gVisor→engine hangs until dialTimeout (exactly 20s) and SOCKS still accepts with scraps.
 // Host FIRE needs 3 SOCKS rejects / 60s and gets reset by those scraps — so the module must
 // self-heal (qWDTT relayWatchdog pattern: detect → recycle transport → give up → exit).
+//
+// Doze / netlost: pause TURN workers + reject SOCKS (battery). Never recycle or fatal while
+// offline — defer heal until netback (energy-efficient hold).
 
 const (
 	dataPathDialFailThreshold = 3
@@ -33,21 +36,24 @@ type dataPathGuard struct {
 
 	addr atomic.Pointer[net.UDPAddr]
 
-	dialFails   int
-	recycles    int
-	lastRecycle time.Time
-	recycling   bool
-	paused      bool // netlost: do not burn dial budget
-	exiting     bool
+	dialFails      int
+	recycles       int
+	lastRecycle    time.Time
+	recycling      bool
+	paused         bool // netlost: do not burn dial budget / recycle
+	pendingRecycle bool // heal requested while paused → apply on netback
+	pendingReason  string
+	exiting        bool
 
-	stopFn  func()
-	startFn func(string) error
-	waitFn  func(int) error
-	portFn  func() int
-	ipFn    func() string
-	exitFn  func(code int)
-	nowFn   func() time.Time
-	logFn   func(format string, args ...any)
+	stopFn   func()
+	startFn  func(string) error
+	waitFn   func(int) error
+	portFn   func() int
+	ipFn     func() string
+	pauseFn  func(bool) // engine PauseGate; optional in tests
+	exitFn   func(code int)
+	nowFn    func() time.Time
+	logFn    func(format string, args ...any)
 	statusFn func(kind, detail string)
 }
 
@@ -61,6 +67,7 @@ func newDataPathGuard(cfgJSON string, readyWait time.Duration, pktPort int, tunI
 		waitFn:      engineWaitReady,
 		portFn:      enginePacketPort,
 		ipFn:        engineTunIP,
+		pauseFn:     engineSetPaused,
 		exitFn:      os.Exit,
 		nowFn:       time.Now,
 		logFn:       emitLog,
@@ -94,6 +101,12 @@ func (g *dataPathGuard) setPaused(v bool) {
 	g.mu.Unlock()
 }
 
+func (g *dataPathGuard) applyEnginePause(v bool) {
+	if g.pauseFn != nil {
+		g.pauseFn(v)
+	}
+}
+
 func isDialTimeout(err error) bool {
 	if err == nil {
 		return false
@@ -118,6 +131,8 @@ func (g *dataPathGuard) noteDialResult(err error) {
 		g.mu.Lock()
 		g.dialFails = 0
 		g.recycles = 0 // traffic returned — allow future recoveries from a clean slate
+		g.pendingRecycle = false
+		g.pendingReason = ""
 		g.mu.Unlock()
 		return
 	}
@@ -125,6 +140,16 @@ func (g *dataPathGuard) noteDialResult(err error) {
 		return
 	}
 	g.mu.Lock()
+	if g.paused || g.exiting {
+		// Offline: do not burn recycle/DNS budget — remember for netback.
+		g.pendingRecycle = true
+		if g.pendingReason == "" {
+			g.pendingReason = "dial-timeouts"
+		}
+		g.dialFails = 0
+		g.mu.Unlock()
+		return
+	}
 	g.dialFails++
 	n := g.dialFails
 	g.mu.Unlock()
@@ -139,12 +164,32 @@ func (g *dataPathGuard) onHostEvent(event string) {
 	}
 	switch event {
 	case "netlost":
-		g.setPaused(true)
-		g.logFn("CSQTT: сеть пропала — SOCKS временно отклоняет дозвоны")
+		g.mu.Lock()
+		g.paused = true
+		g.dialFails = 0
+		g.mu.Unlock()
+		g.applyEnginePause(true)
+		g.logFn("CSQTT: сеть пропала — пауза TURN/SOCKS (энергосбережение)")
 	case "netback":
-		g.setPaused(false)
-		g.logFn("CSQTT: сеть вернулась — перезапускаю data path")
-		go g.requestRecycle("netback")
+		g.mu.Lock()
+		g.paused = false
+		need := g.pendingRecycle
+		reason := g.pendingReason
+		if reason == "" {
+			reason = "netback"
+		}
+		g.pendingRecycle = false
+		g.pendingReason = ""
+		g.dialFails = 0
+		g.mu.Unlock()
+		g.applyEnginePause(false)
+		if need {
+			g.logFn("CSQTT: сеть вернулась — отложенный перезапуск data path (%s)", reason)
+			go g.requestRecycle(reason)
+		} else {
+			// Prefer soft resume: workers reconnect without VK re-auth storm.
+			g.logFn("CSQTT: сеть вернулась — RESUME воркеров (без recycle)")
+		}
 	case "stall":
 		g.logFn("CSQTT: stall от хоста — перезапускаю data path")
 		go g.requestRecycle("stall")
@@ -159,7 +204,19 @@ func (g *dataPathGuard) requestRecycle(reason string) {
 		return
 	}
 	g.mu.Lock()
-	if g.exiting || g.recycling {
+	if g.exiting {
+		g.mu.Unlock()
+		return
+	}
+	if g.paused {
+		// Never stop/start engine while offline — DNS/TURN fail → fatal storm.
+		g.pendingRecycle = true
+		g.pendingReason = reason
+		g.mu.Unlock()
+		g.logFn("CSQTT: recycle отложен до netback (%s)", reason)
+		return
+	}
+	if g.recycling {
 		g.mu.Unlock()
 		return
 	}
@@ -231,11 +288,21 @@ func (g *dataPathGuard) requestRecycle(reason string) {
 }
 
 func (g *dataPathGuard) failRecycle(reason string, err error) {
-	g.logFn("CSQTT: recycle движка не удался (%s): %v — выхожу", reason, err)
 	g.mu.Lock()
+	offline := g.paused
+	if offline {
+		// Should be rare (recycle gated), but never fatal offline — wait for netback.
+		g.recycling = false
+		g.pendingRecycle = true
+		g.pendingReason = reason
+		g.mu.Unlock()
+		g.logFn("CSQTT: recycle не удался офлайн (%s): %v — жду netback", reason, err)
+		return
+	}
 	g.exiting = true
 	g.recycling = false
 	g.mu.Unlock()
+	g.logFn("CSQTT: recycle движка не удался (%s): %v — выхожу", reason, err)
 	g.statusFn(statusFatal, "engine recycle failed")
 	g.exitFn(42)
 }

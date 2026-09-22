@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
 use crate::{
-    Arguments, ENGINE_CANCEL, PACKET_PORT, TUN_DNS, TUN_IP, logging, packet_bridge, protect,
-    ready_notify, run, runtime_worker_threads,
+    Arguments, ENGINE_CANCEL, ENGINE_PAUSE, PACKET_PORT, TUN_DNS, TUN_IP, logging, packet_bridge,
+    protect, ready_notify, run, runtime_worker_threads,
 };
 use serde::Deserialize;
 use std::{
@@ -243,12 +243,26 @@ pub extern "C" fn csqtt_engine_tun_dns(buf: *mut c_char, n: i32) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn csqtt_engine_stop() {
+    if let Ok(mut guard) = ENGINE_PAUSE.lock() {
+        *guard = None;
+    }
     if let Ok(guard) = ENGINE_CANCEL.lock() {
         if let Some(cancel) = guard.as_ref() {
             cancel.cancel();
         }
     }
     packet_bridge::clear_bridge();
+}
+
+/// Pause/resume TURN workers without tearing down the engine (doze / netlost).
+/// paused != 0 → PAUSE; 0 → RESUME. No-op if engine is not running.
+#[unsafe(no_mangle)]
+pub extern "C" fn csqtt_engine_set_paused(paused: i32) {
+    if let Ok(guard) = ENGINE_PAUSE.lock() {
+        if let Some(gate) = guard.as_ref() {
+            gate.set_paused(paused != 0);
+        }
+    }
 }
 
 #[unsafe(no_mangle)]

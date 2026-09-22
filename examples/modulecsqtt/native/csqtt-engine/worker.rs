@@ -142,12 +142,16 @@ impl PauseGate {
         self.paused.load(Ordering::Acquire)
     }
 
+    /// Blocks without polling — woken only by set_paused / cancel (doze-friendly).
     async fn wait_until_resumed(&self, cancel: &CancellationToken) -> bool {
         while self.is_paused() {
+            let notified = self.changed.notified();
+            if !self.is_paused() {
+                break;
+            }
             tokio::select! {
                 _ = cancel.cancelled() => return false,
-                _ = self.changed.notified() => {},
-                _ = tokio::time::sleep(Duration::from_millis(250)) => {},
+                _ = notified => {},
             }
         }
         true

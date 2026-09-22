@@ -69,6 +69,9 @@ pub(crate) static TUN_IP: Mutex<String> = Mutex::new(String::new());
 pub(crate) static TUN_DNS: Mutex<String> = Mutex::new(String::new());
 pub(crate) static READY: OnceLock<tokio::sync::Notify> = OnceLock::new();
 pub(crate) static ENGINE_CANCEL: Mutex<Option<CancellationToken>> = Mutex::new(None);
+pub(crate) static ENGINE_PAUSE: Mutex<Option<Arc<PauseGate>>> = Mutex::new(None);
+/// Last successful peer SocketAddr — recycle after doze must not depend on live DNS.
+pub(crate) static PEER_ADDR_CACHE: Mutex<Option<(String, SocketAddr)>> = Mutex::new(None);
 
 pub(crate) fn ready_notify() -> &'static tokio::sync::Notify {
     READY.get_or_init(tokio::sync::Notify::new)
@@ -263,6 +266,7 @@ pub async fn run(arguments: Arguments) -> Result<()> {
     ));
     let stats = Arc::new(Stats::default());
     let paused = Arc::new(PauseGate::new());
+    *ENGINE_PAUSE.lock().unwrap_or_else(|p| p.into_inner()) = Some(paused.clone());
     let finish_js_calls = Arc::new(AtomicBool::new(false));
     let control_task = start_control_input(
         cancel.clone(),
@@ -402,6 +406,9 @@ pub async fn run(arguments: Arguments) -> Result<()> {
         _ = cancel.cancelled() => false,
     };
     cancel.cancel();
+    if let Ok(mut slot) = ENGINE_PAUSE.lock() {
+        *slot = None;
+    }
     if !groups_completed {
         groups_future.await;
     }
@@ -593,12 +600,38 @@ async fn run_vk_hash_validation(arguments: &Arguments) -> Result<()> {
 
 async fn resolve_peer(peer: &str) -> Result<SocketAddr> {
     let mut last_error = None;
-    for _ in 0..15 {
+    for attempt in 0..15 {
         match dns::resolve_socket(peer).await {
-            Ok(address) => return Ok(address),
+            Ok(address) => {
+                if let Ok(mut cache) = PEER_ADDR_CACHE.lock() {
+                    *cache = Some((peer.to_string(), address));
+                }
+                return Ok(address);
+            }
             Err(error) => last_error = Some(error),
         }
+        // After a couple of DNS misses, prefer the last-known peer IP (doze / netlost).
+        if attempt >= 1 {
+            if let Ok(cache) = PEER_ADDR_CACHE.lock() {
+                if let Some((cached_peer, addr)) = cache.as_ref() {
+                    if cached_peer == peer {
+                        crate::log_error!(
+                            "[КЛИЕНТ] DNS пира недоступен — использую кэш {addr}"
+                        );
+                        return Ok(*addr);
+                    }
+                }
+            }
+        }
         tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    if let Ok(cache) = PEER_ADDR_CACHE.lock() {
+        if let Some((cached_peer, addr)) = cache.as_ref() {
+            if cached_peer == peer {
+                crate::log_error!("[КЛИЕНТ] DNS пира исчерпан — использую кэш {addr}");
+                return Ok(*addr);
+            }
+        }
     }
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("пустой DNS-ответ для пира")))
         .context("ошибка разбора пира")

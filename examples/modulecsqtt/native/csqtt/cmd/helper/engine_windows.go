@@ -22,6 +22,7 @@ var (
 	procTunIP         *windows.LazyProc
 	procTunDNS        *windows.LazyProc
 	procStop          *windows.LazyProc
+	procSetPaused     *windows.LazyProc
 	procSetPacketOut  *windows.LazyProc
 	procInjectPacket  *windows.LazyProc
 	protectImpl       func(int64) bool
@@ -48,6 +49,7 @@ func engineLoad(searchDirs ...string) error {
 	procTunIP = engineDLL.NewProc("csqtt_engine_tun_ip")
 	procTunDNS = engineDLL.NewProc("csqtt_engine_tun_dns")
 	procStop = engineDLL.NewProc("csqtt_engine_stop")
+	procSetPaused = engineDLL.NewProc("csqtt_engine_set_paused")
 	procSetPacketOut = engineDLL.NewProc("csqtt_engine_set_packet_out")
 	procInjectPacket = engineDLL.NewProc("csqtt_engine_inject_packet")
 	return nil
@@ -145,6 +147,17 @@ func engineStop() {
 	if procStop != nil {
 		_, _, _ = procStop.Call()
 	}
+}
+
+func engineSetPaused(paused bool) {
+	if procSetPaused == nil {
+		return
+	}
+	v := uintptr(0)
+	if paused {
+		v = 1
+	}
+	_, _, _ = procSetPaused.Call(v)
 }
 
 func findEngineLib(name string, extra ...string) (string, error) {

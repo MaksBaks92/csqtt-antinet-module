@@ -151,6 +151,112 @@ func TestDataPathGuardRejectingWhilePaused(t *testing.T) {
 	}
 }
 
+func TestDataPathGuardNetlostDefersRecycle(t *testing.T) {
+	var starts, pauses atomic.Int32
+	var exited atomic.Int32
+	g := &dataPathGuard{
+		cfgJSON:     `{}`,
+		readyWaitMs: 100,
+		tunIP:       "10.0.0.2",
+		stopFn:      func() {},
+		startFn: func(string) error {
+			starts.Add(1)
+			return nil
+		},
+		waitFn:   func(int) error { return nil },
+		portFn:   func() int { return 0 },
+		ipFn:     func() string { return "10.0.0.2" },
+		pauseFn:  func(v bool) { if v { pauses.Add(1) } else { pauses.Add(10) } },
+		exitFn:   func(int) { exited.Add(1) },
+		nowFn:    time.Now,
+		logFn:    func(string, ...any) {},
+		statusFn: func(string, string) {},
+	}
+	g.onHostEvent("netlost")
+	if pauses.Load() != 1 {
+		t.Fatalf("engine pause on netlost: %d", pauses.Load())
+	}
+	for i := 0; i < dataPathDialFailThreshold; i++ {
+		g.noteDialResult(context.DeadlineExceeded)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if starts.Load() != 0 {
+		t.Fatalf("must not recycle while offline: starts=%d", starts.Load())
+	}
+	g.requestRecycle("dial-timeouts")
+	if starts.Load() != 0 || exited.Load() != 0 {
+		t.Fatalf("deferred recycle leaked: starts=%d exited=%d", starts.Load(), exited.Load())
+	}
+
+	g.onHostEvent("netback")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && starts.Load() == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if starts.Load() != 1 {
+		t.Fatalf("netback should apply pending recycle: starts=%d", starts.Load())
+	}
+	if pauses.Load() < 11 {
+		t.Fatalf("expected resume: pauses=%d", pauses.Load())
+	}
+	if exited.Load() != 0 {
+		t.Fatal("must not exit")
+	}
+}
+
+func TestDataPathGuardNetbackSoftResume(t *testing.T) {
+	var starts, resumes atomic.Int32
+	g := &dataPathGuard{
+		cfgJSON:     `{}`,
+		readyWaitMs: 100,
+		stopFn:      func() {},
+		startFn:     func(string) error { starts.Add(1); return nil },
+		waitFn:      func(int) error { return nil },
+		portFn:      func() int { return 0 },
+		ipFn:        func() string { return "" },
+		pauseFn: func(v bool) {
+			if !v {
+				resumes.Add(1)
+			}
+		},
+		exitFn:   func(int) {},
+		nowFn:    time.Now,
+		logFn:    func(string, ...any) {},
+		statusFn: func(string, string) {},
+	}
+	g.onHostEvent("netlost")
+	g.onHostEvent("netback")
+	time.Sleep(30 * time.Millisecond)
+	if starts.Load() != 0 {
+		t.Fatalf("soft resume must not recycle: starts=%d", starts.Load())
+	}
+	if resumes.Load() != 1 {
+		t.Fatalf("expected engine resume: %d", resumes.Load())
+	}
+	if g.rejecting() {
+		t.Fatal("must accept after netback")
+	}
+}
+
+func TestDataPathGuardFailRecycleOfflineDefers(t *testing.T) {
+	var exited atomic.Int32
+	g := &dataPathGuard{
+		paused:   true,
+		exitFn:   func(int) { exited.Add(1) },
+		logFn:    func(string, ...any) {},
+		statusFn: func(string, string) {},
+		nowFn:    time.Now,
+	}
+	g.recycling = true
+	g.failRecycle("test", errors.New("dns down"))
+	if exited.Load() != 0 {
+		t.Fatal("must not fatal while paused")
+	}
+	if !g.pendingRecycle {
+		t.Fatal("should pending")
+	}
+}
+
 func TestDataPathGuardCooldown(t *testing.T) {
 	var starts atomic.Int32
 	now := time.Now()

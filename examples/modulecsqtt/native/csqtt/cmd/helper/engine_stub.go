@@ -24,3 +24,4 @@ func enginePacketPort() int               { return 0 }
 func engineTunIP() string                 { return "" }
 func engineTunDNS() string                { return "" }
 func engineStop()                         {}
+func engineSetPaused(paused bool)         { _ = paused }
