@@ -543,14 +543,31 @@ func TestDataPathGuardWaitForPath(t *testing.T) {
 		t.Fatalf("cancelled ctx must stop polling: calls=%d", calls.Load())
 	}
 
-	// Cap: nowFn advances past the deadline → returns even with zero paths.
+	// Cap: nowFn advances past the deadline → returns even with zero paths, and asks for a recycle.
 	step := time.Now()
+	var starts atomic.Int32
 	d := &dataPathGuard{
+		cfgJSON:  `{}`,
 		activeFn: func() int { return 0 },
 		sleepFn:  func(dur time.Duration) { step = step.Add(dur) },
 		nowFn:    func() time.Time { return step },
+		stopFn:   func() {},
+		startFn:  func(string) error { starts.Add(1); return nil },
+		waitFn:   func(int) error { return nil },
+		portFn:   func() int { return 0 },
+		ipFn:     func() string { return "" },
+		exitFn:   func(int) {},
+		logFn:    func(string, ...any) {},
+		statusFn: func(string, string) {},
 	}
 	d.waitForPath(context.Background())
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && starts.Load() == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if starts.Load() != 1 {
+		t.Fatalf("zero-path wait cap must recycle: starts=%d", starts.Load())
+	}
 }
 
 func TestNetworkProbeHost(t *testing.T) {
@@ -590,5 +607,61 @@ func TestDataPathGuardRecycleAllowsZeroPacketPort(t *testing.T) {
 	}
 	if g.rejecting() {
 		t.Fatal("should accept after bridge recycle")
+	}
+}
+
+func TestDataPathGuardRebuildsTunOnIPChange(t *testing.T) {
+	var exited atomic.Int32
+	var rebuilt atomic.Int32
+	g := &dataPathGuard{
+		cfgJSON:     `{}`,
+		readyWaitMs: 100,
+		tunIP:       "10.0.0.2",
+		stopFn:      func() {},
+		startFn:     func(string) error { return nil },
+		waitFn:      func(int) error { return nil },
+		portFn:      func() int { return 0 },
+		ipFn:        func() string { return "10.0.0.9" },
+		rebuildTunFn: func(newIP string) error {
+			if newIP != "10.0.0.9" {
+				t.Fatalf("rebuild ip: %s", newIP)
+			}
+			rebuilt.Add(1)
+			return nil
+		},
+		exitFn:   func(int) { exited.Add(1) },
+		nowFn:    time.Now,
+		logFn:    func(string, ...any) {},
+		statusFn: func(string, string) {},
+	}
+	g.requestRecycle("ip-change")
+	if exited.Load() != 0 {
+		t.Fatal("tun ip change must rebuild, not exit")
+	}
+	if rebuilt.Load() != 1 {
+		t.Fatalf("rebuildTunFn calls=%d", rebuilt.Load())
+	}
+	if g.tunIP != "10.0.0.9" {
+		t.Fatalf("tunIP not updated: %s", g.tunIP)
+	}
+}
+
+func TestDataPathGuardRecycleStreakSurvivesOneOK(t *testing.T) {
+	now := time.Now()
+	g := &dataPathGuard{
+		recycles:    3,
+		lastRecycle: now,
+		nowFn:       func() time.Time { return now },
+		logFn:       func(string, ...any) {},
+		statusFn:    func(string, string) {},
+	}
+	g.noteDialResult(nil)
+	if g.recycles != 3 {
+		t.Fatalf("one OK inside stable window must keep streak: %d", g.recycles)
+	}
+	now = now.Add(dataPathRecycleStable)
+	g.noteDialResult(nil)
+	if g.recycles != 0 {
+		t.Fatalf("OK after stable window must clear streak: %d", g.recycles)
 	}
 }

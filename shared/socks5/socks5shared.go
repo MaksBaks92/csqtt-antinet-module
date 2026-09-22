@@ -302,6 +302,50 @@ type socksResolver interface {
 // в один счётчик значит потерять различие ровно там, где по логу и разбираются.
 var errSocksTargetUnreachable = errors.New("socks5: no route to this address family")
 
+// errSocksDNSPending — домен ещё резолвится; датаграмму отбрасываем (UDP клиент повторит).
+var errSocksDNSPending = errors.New("socks5: dns resolve pending")
+
+// asyncSocksResolver — не блокирует ReadFromUDP на холодном LookupHost: первый пакет к новому
+// домену дропается, ответ кэшируется, следующие идут сразу.
+type asyncSocksResolver struct {
+	inner    socksResolver
+	mu       sync.Mutex
+	cache    map[string][]string
+	inflight map[string]struct{}
+}
+
+func newAsyncSocksResolver(inner socksResolver) *asyncSocksResolver {
+	return &asyncSocksResolver{
+		inner:    inner,
+		cache:    map[string][]string{},
+		inflight: map[string]struct{}{},
+	}
+}
+
+func (r *asyncSocksResolver) LookupHost(host string) ([]string, error) {
+	r.mu.Lock()
+	if ips, ok := r.cache[host]; ok {
+		r.mu.Unlock()
+		return ips, nil
+	}
+	if _, busy := r.inflight[host]; busy {
+		r.mu.Unlock()
+		return nil, errSocksDNSPending
+	}
+	r.inflight[host] = struct{}{}
+	r.mu.Unlock()
+	go func() {
+		ips, err := r.inner.LookupHost(host)
+		r.mu.Lock()
+		delete(r.inflight, host)
+		if err == nil && len(ips) > 0 {
+			r.cache[host] = ips
+		}
+		r.mu.Unlock()
+	}()
+	return nil, errSocksDNSPending
+}
+
 // socksUDPTransport — всё, что канону нужно от модуля для UDP-реле.
 type socksUDPTransport interface {
 	socksResolver
@@ -358,6 +402,8 @@ func serveSocksUDPAssociate(ctrl net.Conn, br *bufio.Reader, t socksUDPTransport
 		log.Printf("UDPASSOC #%d reply write FAILED err=%v lifetime=%v", assocID, err, time.Since(assocStart))
 		return
 	}
+
+	dns := newAsyncSocksResolver(t)
 
 	var mu sync.Mutex
 	targets := map[netip.AddrPort]*udpNatEntry{}
@@ -420,10 +466,9 @@ func serveSocksUDPAssociate(ctrl net.Conn, br *bufio.Reader, t socksUDPTransport
 			log.Printf("UDPASSOC #%d first client datagram from=%v n=%d elapsed=%v", assocID, src, n, time.Since(assocStart))
 		}
 		mu.Unlock()
-		dst, data, ok := parseSocksUDP(buf[:n], t)
+		dst, data, ok := parseSocksUDP(buf[:n], dns)
 		if !ok {
 			atomic.AddInt64(&parseFails, 1)
-			log.Printf("UDPASSOC #%d parseSocksUDP FAILED n=%d", assocID, n)
 			continue
 		}
 		mu.Lock()

@@ -70,6 +70,8 @@ pub(crate) struct StallDetector {
 
 pub(crate) const STALL_POLL: Duration = Duration::from_secs(2);
 const STALL_POLLS: u32 = 3;
+/// Ignore tiny uplink ticks (TURN keepalive / stats) — only probe when real traffic moved.
+const STALL_MIN_UPLINK_DELTA: i64 = 4096;
 const PROBE_MIN_GAP: Duration = Duration::from_secs(20);
 
 impl StallDetector {
@@ -83,7 +85,8 @@ impl StallDetector {
     }
 
     pub(crate) fn observe(&mut self, up: i64, down: i64, now: Instant) -> bool {
-        let up_moved = up != self.last_up;
+        let up_delta = up.saturating_sub(self.last_up);
+        let up_moved = up_delta >= STALL_MIN_UPLINK_DELTA;
         let down_moved = down != self.last_down;
         self.last_up = up;
         self.last_down = down;
@@ -142,9 +145,18 @@ mod tests {
     fn stall_needs_consecutive_polls_of_uplink_without_downlink() {
         let t0 = Instant::now();
         let mut d = StallDetector::new(0, 0);
-        assert!(!d.observe(100, 0, t0)); // 1
-        assert!(!d.observe(200, 0, t0)); // 2
-        assert!(d.observe(300, 0, t0)); // 3 → probe
+        assert!(!d.observe(STALL_MIN_UPLINK_DELTA, 0, t0)); // 1
+        assert!(!d.observe(STALL_MIN_UPLINK_DELTA * 2, 0, t0)); // 2
+        assert!(d.observe(STALL_MIN_UPLINK_DELTA * 3, 0, t0)); // 3 → probe
+    }
+
+    #[test]
+    fn stall_ignores_tiny_uplink_ticks() {
+        let t0 = Instant::now();
+        let mut d = StallDetector::new(0, 0);
+        for up in [1_i64, 2, 3, 100, 500] {
+            assert!(!d.observe(up, 0, t0));
+        }
     }
 
     #[test]
@@ -168,16 +180,28 @@ mod tests {
     fn probes_are_rate_limited() {
         let t0 = Instant::now();
         let mut d = StallDetector::new(0, 0);
-        for up in [1, 2, 3] {
+        for up in [
+            STALL_MIN_UPLINK_DELTA,
+            STALL_MIN_UPLINK_DELTA * 2,
+            STALL_MIN_UPLINK_DELTA * 3,
+        ] {
             let _ = d.observe(up, 0, t0);
         }
         // Still stalled right after a probe: no second probe inside the gap.
-        for up in [4, 5, 6] {
+        for up in [
+            STALL_MIN_UPLINK_DELTA * 4,
+            STALL_MIN_UPLINK_DELTA * 5,
+            STALL_MIN_UPLINK_DELTA * 6,
+        ] {
             assert!(!d.observe(up, 0, t0 + Duration::from_secs(6)));
         }
         // The streak kept growing; once the gap has passed the next stalled poll probes again.
-        assert!(d.observe(7, 0, t0 + PROBE_MIN_GAP));
-        assert!(!d.observe(8, 0, t0 + PROBE_MIN_GAP + Duration::from_secs(2)));
+        assert!(d.observe(STALL_MIN_UPLINK_DELTA * 7, 0, t0 + PROBE_MIN_GAP));
+        assert!(!d.observe(
+            STALL_MIN_UPLINK_DELTA * 8,
+            0,
+            t0 + PROBE_MIN_GAP + Duration::from_secs(2)
+        ));
     }
 
     #[tokio::test]

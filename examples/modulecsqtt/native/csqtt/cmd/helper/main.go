@@ -626,6 +626,7 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	}
 
 	// In-process bridge: gVisor ↔ rust without UDP 127.0.0.1.
+	var liveTun atomic.Pointer[tunnel.IPTunnel]
 	tun, err := tunnel.NewIPTunnel(tunIP, func(pkt []byte) {
 		if err := engineInjectPacket(pkt); err != nil && debug {
 			log.Printf("[BRIDGE] inject: %v", err)
@@ -635,8 +636,17 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 		emitStatus(statusFatal, "netstack failed")
 		log.Fatalf("netstack: %v", err)
 	}
-	defer tun.Close()
-	deliver := func(pkt []byte) { tun.InjectInbound(pkt) }
+	liveTun.Store(tun)
+	defer func() {
+		if t := liveTun.Swap(nil); t != nil {
+			t.Close()
+		}
+	}()
+	deliver := func(pkt []byte) {
+		if t := liveTun.Load(); t != nil {
+			t.InjectInbound(pkt)
+		}
+	}
 	inbound.Store(&deliver)
 
 	ln, err := openListener(port, listenFd)
@@ -657,6 +667,31 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	log.Printf("csqtt helper: SOCKS5 on 127.0.0.1:%d tun=%s dns=%s bridge=in-process", actualPort, tunIP, engineTunDNS())
 
 	guard := newDataPathGuard(string(engineCfg), readyWaitBudget, 0, tunIP.String())
+	guard.rebuildTunFn = func(newIP string) error {
+		ip := net.ParseIP(strings.TrimSpace(newIP))
+		if ip == nil || ip.To4() == nil {
+			return fmt.Errorf("bad tun ip %q", newIP)
+		}
+		nt, err := tunnel.NewIPTunnel(ip, func(pkt []byte) {
+			if err := engineInjectPacket(pkt); err != nil && debug {
+				log.Printf("[BRIDGE] inject: %v", err)
+			}
+		})
+		if err != nil {
+			return err
+		}
+		old := liveTun.Swap(nt)
+		d := func(pkt []byte) {
+			if t := liveTun.Load(); t != nil {
+				t.InjectInbound(pkt)
+			}
+		}
+		inbound.Store(&d)
+		if old != nil {
+			old.Close()
+		}
+		return nil
+	}
 	// Offline self-probe (paused watchdog / wake while paused): one protected DNS round trip
 	// to a name we need anyway. Fails fast without a route, proves reachability with one.
 	probeHost := networkProbeHost(link.peerAddr())
@@ -679,9 +714,18 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 		}
 	})
 
-	udpT := csqttUDPTransport{tun: tun, resolver: resolver}
+	getTun := func() *tunnel.IPTunnel { return liveTun.Load() }
+	udpT := csqttUDPTransport{getTun: getTun, resolver: resolver}
+	// Soft cap: recycle/wake can hold many CONNECTs; do not spawn unbounded accept goroutines.
+	socksSem := make(chan struct{}, 128)
 	serveSocksListener(ln, func(c net.Conn) {
-		handleConn(c, user, pass, tun, resolver, udpT, dialTimeout, guard)
+		select {
+		case socksSem <- struct{}{}:
+			defer func() { <-socksSem }()
+			handleConn(c, user, pass, getTun, resolver, udpT, dialTimeout, guard)
+		default:
+			_ = c.Close()
+		}
 	})
 	return 0
 }
@@ -716,7 +760,7 @@ func probeNetwork(r *protectedResolver, host string) bool {
 }
 
 type csqttUDPTransport struct {
-	tun      *tunnel.IPTunnel
+	getTun   func() *tunnel.IPTunnel
 	resolver *protectedResolver
 }
 
@@ -741,7 +785,11 @@ func (t csqttUDPTransport) DialUDPTarget(dst netip.AddrPort) (net.Conn, error) {
 		}
 		dst = netip.AddrPortFrom(mapped, dst.Port())
 	}
-	c, err := t.tun.DialUDP(dst)
+	tun := t.getTun()
+	if tun == nil {
+		return nil, errors.New("tunnel down")
+	}
+	c, err := tun.DialUDP(dst)
 	if err != nil {
 		return nil, err
 	}
@@ -778,8 +826,12 @@ func settingDuration(cfg map[string]string, key string, defSec int) time.Duratio
 	return time.Duration(defSec) * time.Second
 }
 
-func handleConn(c net.Conn, user, pass string, tun *tunnel.IPTunnel, resolver *protectedResolver, udpT csqttUDPTransport, dialTimeout time.Duration, guard *dataPathGuard) {
+func handleConn(c net.Conn, user, pass string, getTun func() *tunnel.IPTunnel, resolver *protectedResolver, udpT csqttUDPTransport, dialTimeout time.Duration, guard *dataPathGuard) {
 	defer c.Close()
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(45 * time.Second)
+	}
 	br := bufio.NewReader(c)
 	req, ok := socksHandshake(c, br, user, pass)
 	if !ok {
@@ -801,27 +853,44 @@ func handleConn(c net.Conn, user, pass string, tun *tunnel.IPTunnel, resolver *p
 		// Fast-fail while paused/exiting so host FIRE can accumulate rejects
 		// instead of hanging on 20s dials and 146-byte scraps. Recycle/rebind
 		// holds the CONNECT in waitForPath instead of rejecting.
-		log.Printf("[SOCKS] reject (data path recovering) target=%s", target)
+		logSocksReject("[SOCKS] reject (data path recovering) target=%s", target)
 		_, _ = c.Write(socksRep(0x01))
 		return
 	}
-	ip, rerr := resolveV4(req, resolver)
-	if rerr != nil {
-		log.Printf("[SOCKS] resolve FAILED host=%s err=%v", host, rerr)
+
+	// Overlap DNS with waitForPath: after wake/handover the workers reconnect while we resolve.
+	type resolveOut struct {
+		ip  string
+		err error
+	}
+	resolved := make(chan resolveOut, 1)
+	go func() {
+		ip, err := resolveV4(req, resolver)
+		resolved <- resolveOut{ip, err}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+	if guard != nil {
+		guard.waitForPath(ctx)
+	}
+	res := <-resolved
+	if res.err != nil {
+		log.Printf("[SOCKS] resolve FAILED host=%s err=%v", host, res.err)
 		_, _ = c.Write(socksRep(0x04))
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
-	// After a wake / handover the workers may still be reconnecting: hold the CONNECT for a
-	// few seconds instead of sending the SYN into a tunnel with zero TURN paths.
-	guard.waitForPath(ctx)
-	up, err := tun.DialTCP(ctx, ip, req.Port)
-	cancel()
+	tun := getTun()
+	if tun == nil {
+		_, _ = c.Write(socksRep(0x01))
+		return
+	}
+	up, err := tun.DialTCP(ctx, res.ip, req.Port)
 	if guard != nil {
 		guard.noteDialResult(err)
 	}
 	if err != nil {
-		log.Printf("[SOCKS] tunnel dial FAILED target=%s ip=%s elapsed=%v err=%v", target, ip, time.Since(dialStart), err)
+		logSocksReject("[SOCKS] tunnel dial FAILED target=%s ip=%s elapsed=%v err=%v", target, res.ip, time.Since(dialStart), err)
 		_, _ = c.Write(socksRep(0x01))
 		return
 	}
@@ -830,6 +899,19 @@ func handleConn(c net.Conn, user, pass string, tun *tunnel.IPTunnel, resolver *p
 		return
 	}
 	relayBidi(c, br, up, target, dialStart)
+}
+
+var lastSocksRejectLog atomic.Int64
+
+func logSocksReject(format string, args ...any) {
+	now := time.Now().Unix()
+	prev := lastSocksRejectLog.Load()
+	if prev != 0 && now-prev < 2 {
+		return
+	}
+	if lastSocksRejectLog.CompareAndSwap(prev, now) {
+		log.Printf(format, args...)
+	}
 }
 
 func resolveV4(req socksRequest, resolver *protectedResolver) (string, error) {

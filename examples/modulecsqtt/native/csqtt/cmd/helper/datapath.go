@@ -37,6 +37,8 @@ const (
 	dataPathWakeGrace         = 30 * time.Second
 	dataPathPathWaitMax       = 8 * time.Second
 	dataPathPathWaitPoll      = 200 * time.Millisecond
+	// One lucky dial after a flap must not wipe the recycle streak; only a quiet window does.
+	dataPathRecycleStable = 60 * time.Second
 	// Soft handover (engineRebind): dedupe window, settle before judging, fallback deadline.
 	dataPathRebindMinGap = 3 * time.Second
 	dataPathRebindSettle = 1 * time.Second
@@ -74,21 +76,22 @@ type dataPathGuard struct {
 	pendingHandoverSource string
 	exiting               bool
 
-	stopFn   func()
-	startFn  func(string) error
-	waitFn   func(int) error
-	portFn   func() int
-	ipFn     func() string
-	pauseFn  func(bool)  // engine PauseGate; optional in tests
-	activeFn func() int  // engine READY TURN paths (-1 = unknown); optional
-	nudgeFn  func()      // engine re-validate paths now; optional
-	rebindFn func() bool // engine soft handover; false → not supported, recycle instead
-	probeFn  func() bool // "is the network usable?" while paused; optional
-	exitFn   func(code int)
-	nowFn    func() time.Time
-	sleepFn  func(time.Duration)
-	logFn    func(format string, args ...any)
-	statusFn func(kind, detail string)
+	stopFn       func()
+	startFn      func(string) error
+	waitFn       func(int) error
+	portFn       func() int
+	ipFn         func() string
+	pauseFn      func(bool)  // engine PauseGate; optional in tests
+	activeFn     func() int  // engine READY TURN paths (-1 = unknown); optional
+	nudgeFn      func()      // engine re-validate paths now; optional
+	rebindFn     func() bool // engine soft handover; false → not supported, recycle instead
+	probeFn      func() bool // "is the network usable?" while paused; optional
+	rebuildTunFn func(newIP string) error // swap gVisor when engine TUN IP changes on recycle
+	exitFn       func(code int)
+	nowFn        func() time.Time
+	sleepFn      func(time.Duration)
+	logFn        func(format string, args ...any)
+	statusFn     func(kind, detail string)
 }
 
 func newDataPathGuard(cfgJSON string, readyWait time.Duration, pktPort int, tunIP string) *dataPathGuard {
@@ -162,7 +165,8 @@ func isDialTimeout(err error) bool {
 	return strings.Contains(s, "deadline exceeded") || strings.Contains(s, "i/o timeout")
 }
 
-// noteDialResult — успех сбрасывает счётчик; ровно dial-timeout копит к порогу recycle.
+// noteDialResult — успех сбрасывает streak dial-timeout; recycle-счётчик — только после
+// тихого окна (иначе один удачный dial на флапе маскирует исчерпание).
 func (g *dataPathGuard) noteDialResult(err error) {
 	if g == nil {
 		return
@@ -170,9 +174,11 @@ func (g *dataPathGuard) noteDialResult(err error) {
 	if err == nil {
 		g.mu.Lock()
 		g.dialFails = 0
-		g.recycles = 0 // traffic returned — allow future recoveries from a clean slate
 		g.pendingRecycle = false
 		g.pendingReason = ""
+		if g.recycles > 0 && (g.lastRecycle.IsZero() || g.nowFn().Sub(g.lastRecycle) >= dataPathRecycleStable) {
+			g.recycles = 0
+		}
 		g.mu.Unlock()
 		return
 	}
@@ -451,6 +457,10 @@ func (g *dataPathGuard) waitForPath(ctx context.Context) {
 			return
 		}
 	}
+	// Cap elapsed with still-zero READY paths: do not wait for 3×dialTimeout — recycle now.
+	if !g.rejecting() && g.activeFn != nil && g.activeFn() == 0 {
+		go g.requestRecycle("zero-paths")
+	}
 }
 
 func (g *dataPathGuard) requestRecycle(reason string) {
@@ -511,14 +521,24 @@ func (g *dataPathGuard) requestRecycle(reason string) {
 	}
 	newIP := strings.TrimSpace(g.ipFn())
 	if wantIP != "" && newIP != "" && newIP != wantIP {
-		g.logFn("CSQTT: после recycle TUN IP сменился (%s→%s) — полный рестарт процесса", wantIP, newIP)
+		if g.rebuildTunFn == nil {
+			g.logFn("CSQTT: после recycle TUN IP сменился (%s→%s) — полный рестарт процесса", wantIP, newIP)
+			g.mu.Lock()
+			g.exiting = true
+			g.recycling = false
+			g.mu.Unlock()
+			g.statusFn(statusFatal, "tun ip changed on recycle")
+			g.exitFn(42)
+			return
+		}
+		g.logFn("CSQTT: после recycle TUN IP сменился (%s→%s) — пересобираю netstack", wantIP, newIP)
+		if err := g.rebuildTunFn(newIP); err != nil {
+			g.failRecycle(reason, err)
+			return
+		}
 		g.mu.Lock()
-		g.exiting = true
-		g.recycling = false
+		g.tunIP = newIP
 		g.mu.Unlock()
-		g.statusFn(statusFatal, "tun ip changed on recycle")
-		g.exitFn(42)
-		return
 	}
 	port := g.portFn()
 	// packet_bridge mode keeps port 0 (in-process FFI); UDP bridge mode needs a real port.

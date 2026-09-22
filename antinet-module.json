@@ -1,15 +1,15 @@
 {
-  "version": "1.2.55",
+  "version": "1.2.56",
   "android": {
-    "arm64-v8a": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.55/csqtt-android-arm64-v8a.zip",
-    "armeabi-v7a": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.55/csqtt-android-armeabi-v7a.zip",
-    "x86": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.55/csqtt-android-x86.zip",
-    "x86_64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.55/csqtt-android-x86_64.zip"
+    "arm64-v8a": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.56/csqtt-android-arm64-v8a.zip",
+    "armeabi-v7a": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.56/csqtt-android-armeabi-v7a.zip",
+    "x86": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.56/csqtt-android-x86.zip",
+    "x86_64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.2.56/csqtt-android-x86_64.zip"
   },
   "desktop": {
     "windows_amd64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.0.0/csqtt-windows_amd64.zip",
     "linux_amd64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.0.0/csqtt-linux_amd64.zip",
     "darwin_amd64": "https://github.com/MaxPain99/csqtt-antinet-module/releases/download/v1.0.0/csqtt-darwin_amd64.zip"
   },
-  "changelog": "1.2.55: SOCKS CONNECT ждёт recycle/rebind вместо мгновенного отказа. gVisor CUBIC + autotune recv. DNS: параллельный A, AAAA только без A, негативный кэш 15с. Атомарный inject_packet и coalesce Notify. Keepalive не пропускается рядом с Refresh. DNS LRU, UDP NAT idle TTL 60с, recycle cap 8, go test в CI."
+  "changelog": "1.2.56: DNS параллельно с waitForPath; TCP keepalive на SOCKS; смена TUN IP после recycle — пересборка netstack без exit(42); recycle при нуле путей и устойчивый streak; async DNS для UDP ASSOCIATE; шире skipSlowPTR; параллельный VK DNS preflight; пул пакетов без zeroed; stall только на реальном uplink."
 }

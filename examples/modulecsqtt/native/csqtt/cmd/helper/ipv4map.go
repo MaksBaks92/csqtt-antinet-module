@@ -155,8 +155,8 @@ func cloudflareEmbedded(ip netip.Addr) (netip.Addr, bool) {
 	return netip.Addr{}, false
 }
 
-// Microsoft / Azure / Hetzner IPv6 almost never has a useful A sibling. Skip PTR
-// so Happy Eyeballs can fall back to IPv4 immediately instead of waiting ~1s.
+// Microsoft / Azure / Hetzner / Cloudflare / AWS / Meta IPv6 almost never have a useful A
+// sibling. Skip PTR so Happy Eyeballs can fall back to IPv4 immediately instead of waiting ~1s.
 func skipSlowPTR(ip netip.Addr) bool {
 	b := ip.As16()
 	if b[0] == 0x26 && b[1] == 0x20 && b[2] == 0x01 && b[3] == 0xec {
@@ -167,6 +167,21 @@ func skipSlowPTR(ip netip.Addr) bool {
 	}
 	if b[0] == 0x2a && b[1] == 0x01 && b[2] == 0x4f && b[3] == 0xf8 {
 		return true // 2a01:4f8::/32 Hetzner
+	}
+	if b[0] == 0x26 && b[1] == 0x06 && b[2] == 0x47 && b[3] == 0x00 {
+		return true // 2606:4700::/32 Cloudflare
+	}
+	if b[0] == 0x24 && b[1] == 0x00 && b[2] == 0xcb && b[3] == 0x00 {
+		return true // 2400:cb00::/32 Cloudflare
+	}
+	if b[0] == 0x26 && b[1] == 0x00 && b[2] == 0x1f {
+		return true // 2600:1f00::/24 AWS
+	}
+	if b[0] == 0x2a && b[1] == 0x03 && b[2] == 0x28 && b[3] == 0x80 {
+		return true // 2a03:2880::/32 Meta
+	}
+	if b[0] == 0x2a && b[1] == 0x05 && b[2] == 0xd0 {
+		return true // 2a05:d000::/29 AWS eu
 	}
 	return false
 }

@@ -56,7 +56,12 @@ impl PacketPool {
                     (allocated < self.allocation_limit).then_some(allocated + 1)
                 })
                 .ok()?;
-            BytesMut::zeroed(PACKET_CAPACITY)
+            // Fresh buffers are only written via read_area/set_read_len; skip zeroing 2304 B.
+            let mut storage = BytesMut::with_capacity(PACKET_CAPACITY);
+            unsafe {
+                storage.set_len(PACKET_CAPACITY);
+            }
+            storage
         };
         Some(PacketBuf {
             storage,
