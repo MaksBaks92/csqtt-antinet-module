@@ -314,3 +314,32 @@ pub extern "C" fn csqtt_engine_inject_packet(data: *const u8, n: i32) -> i32 {
     let bytes = unsafe { slice::from_raw_parts(data, n as usize) };
     packet_bridge::inject_packet(bytes)
 }
+
+/// Inject a burst of raw IPv4 packets. Pointers are valid only for this call.
+#[unsafe(no_mangle)]
+pub extern "C" fn csqtt_engine_inject_batch(
+    ptrs: *const *const u8,
+    lens: *const i32,
+    count: i32,
+) -> i32 {
+    if ptrs.is_null() || lens.is_null() || count <= 0 {
+        return -3;
+    }
+    let n = count as usize;
+    let ptrs = unsafe { slice::from_raw_parts(ptrs, n) };
+    let lens = unsafe { slice::from_raw_parts(lens, n) };
+    let mut packets = Vec::with_capacity(n);
+    for i in 0..n {
+        if ptrs[i].is_null() || lens[i] <= 0 {
+            continue;
+        }
+        packets.push(unsafe { slice::from_raw_parts(ptrs[i], lens[i] as usize) });
+    }
+    packet_bridge::inject_packets(&packets)
+}
+
+/// Host is about to stop the helper. Send DISCONNECT so the server drops our routes.
+#[unsafe(no_mangle)]
+pub extern "C" fn csqtt_engine_disconnect() {
+    crate::session::signal_stop_disconnect();
+}

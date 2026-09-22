@@ -28,7 +28,7 @@ use std::{
     collections::VecDeque,
     net::SocketAddr,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
@@ -43,9 +43,10 @@ const CONFIG_RESPONSE_TIMEOUT_MS: [u64; 3] = [750, 1_500, 3_000];
 const DEALLOCATE_TIMEOUT: Duration = Duration::from_millis(700);
 const CONNECT_CANCEL_GRACE: Duration = Duration::from_secs(1);
 const SESSION_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
-const DISCONNECT_SEND_TIMEOUT: Duration = Duration::from_millis(300);
-const DISCONNECT_ACK_TIMEOUT: Duration = Duration::from_millis(350);
-const DISCONNECT_CONTROL_ATTEMPTS: usize = 2;
+/// Whole goodbye must finish inside the host stop window (desktop ~1s, we wait 800ms).
+const DISCONNECT_BUDGET: Duration = Duration::from_millis(700);
+/// A silent stream must not eat the budget; closed queues fail in try_send and cost nothing.
+const DISCONNECT_ATTEMPT: Duration = Duration::from_millis(80);
 const WORKER_LATENCY_CAPACITY: usize = crate::striped_scheduler::SMALL_DATAGRAM_BATCH;
 const WORKER_PRIORITY_CAPACITY: usize = crate::striped_scheduler::MEDIUM_DATAGRAM_BATCH;
 const WORKER_BULK_CAPACITY: usize = crate::striped_scheduler::BULK_DATAGRAM_BATCH;
@@ -114,16 +115,20 @@ pub struct SessionRuntime {
     pub allocation_ready: Option<oneshot::Sender<()>>,
 }
 
-fn build_registration_payload(config: &SessionConfig) -> Bytes {
-    Bytes::from(config_request(
-        &config.local_port,
-        &config.device_id,
-        &config.password,
-        crate::idle::generation(config.generation),
-        &config.salt,
-        config.id,
-        Some(crate::idle::declared_count().max(1)),
-    ))
+fn build_registration_payload(config: &SessionConfig) -> (Bytes, u64) {
+    let offset = crate::idle::generation_offset();
+    (
+        Bytes::from(config_request(
+            &config.local_port,
+            &config.device_id,
+            &config.password,
+            config.generation.saturating_add(offset),
+            &config.salt,
+            config.id,
+            Some(crate::idle::declared_count().max(1)),
+        )),
+        offset,
+    )
 }
 
 pub struct ConfigDeliveryState {
@@ -190,6 +195,51 @@ struct ReaderRuntime {
     config_tx: mpsc::Sender<String>,
 }
 
+static STOP_FLAG: AtomicBool = AtomicBool::new(false);
+static STOP_DONE: AtomicBool = AtomicBool::new(false);
+
+fn stop_notify() -> &'static tokio::sync::Notify {
+    static NOTIFY: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    NOTIFY.get_or_init(tokio::sync::Notify::new)
+}
+
+fn stop_wait() -> &'static (Mutex<bool>, std::sync::Condvar) {
+    static WAIT: OnceLock<(Mutex<bool>, std::sync::Condvar)> = OnceLock::new();
+    WAIT.get_or_init(|| (Mutex::new(false), std::sync::Condvar::new()))
+}
+
+/// Host `stop`: ask the running engine to send DISCONNECT, then wait at most 800 ms.
+/// Desktop gives about a second before kill; Android holds the call for the duration.
+pub fn signal_stop_disconnect() {
+    STOP_DONE.store(false, Ordering::Release);
+    STOP_FLAG.store(true, Ordering::Release);
+    stop_notify().notify_waiters();
+    let (lock, cv) = stop_wait();
+    let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+    let _ = cv
+        .wait_timeout_while(guard, Duration::from_millis(800), |_| {
+            !STOP_DONE.load(Ordering::Acquire)
+        })
+        .unwrap_or_else(|p| p.into_inner());
+}
+
+pub async fn stop_disconnect_requested() {
+    loop {
+        let notified = stop_notify().notified();
+        if STOP_FLAG.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        notified.await;
+    }
+}
+
+pub fn stop_disconnect_finished() {
+    STOP_DONE.store(true, Ordering::Release);
+    let (lock, cv) = stop_wait();
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+    cv.notify_all();
+}
+
 pub struct ShutdownCoordinator {
     state: Mutex<ShutdownState>,
     changed: tokio::sync::Notify,
@@ -252,7 +302,7 @@ impl ShutdownCoordinator {
         activity.store(self.next_activity(), Ordering::Release);
     }
 
-    async fn request_disconnect(&self, device_id: &str, salt: &str) {
+    pub(crate) async fn request_disconnect(&self, device_id: &str, salt: &str) {
         let leader = {
             let mut state = self.lock_state();
             if state.active {
@@ -269,21 +319,36 @@ impl ShutdownCoordinator {
         }
 
         let request = disconnect_request(device_id, salt);
-        for writer in self
-            .control_streams()
-            .into_iter()
-            .take(DISCONNECT_CONTROL_ATTEMPTS)
-        {
+        let deadline = tokio::time::Instant::now() + DISCONNECT_BUDGET;
+        // Most recently active first. Stop on the first ack. A stream that accepts the
+        // command and then stays silent yields the rest of the budget to the next one,
+        // so two dead writers do not hide a live path.
+        for writer in self.control_streams() {
             if self.is_completed() {
                 break;
             }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let attempt = DISCONNECT_ATTEMPT.min(deadline - now);
             let delivered = tokio::time::timeout(
-                DISCONNECT_SEND_TIMEOUT,
+                attempt,
                 send_writer_bytes(&writer, request.as_bytes()),
             )
             .await
             .is_ok_and(|result| result.is_ok());
-            if delivered && self.wait_until_completed(DISCONNECT_ACK_TIMEOUT).await {
+            if !delivered {
+                continue;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            if self
+                .wait_until_completed(DISCONNECT_ATTEMPT.min(deadline - now))
+                .await
+            {
                 break;
             }
         }
@@ -864,8 +929,13 @@ async fn run_allocated_session(
             }
             _ = crate::idle::announce_changed(announce_seen) => {
                 announce_seen = crate::idle::announce_epoch();
-                let payload = build_registration_payload(&config);
-                let _ = send_writer_bytes(&writer_command_tx, payload.as_ref()).await;
+                let (payload, offset) = build_registration_payload(&config);
+                if send_writer_bytes(&writer_command_tx, payload.as_ref())
+                    .await
+                    .is_ok()
+                {
+                    crate::idle::note_path_joined(config.id, offset);
+                }
             }
             _ = config.repair.changed(config.id, repair_generation) => {
                 break (Err(anyhow!("TARGET_REPAIR")), 0);
@@ -878,6 +948,16 @@ async fn run_allocated_session(
             }
         }
     };
+    let unexpected = session_result.as_ref().is_err_and(|error| {
+        let text = error.to_string();
+        !text.contains("IDLE_PARK")
+            && !text.contains("NET_REBIND")
+            && !text.contains("TARGET_REPAIR")
+    });
+    if unexpected {
+        // One epoch for every live worker. Park / rebind / repair already have their own GETCONF.
+        crate::idle::note_path_lost(config.id);
+    }
     worker_channels.mark_unhealthy();
     session_cancel.cancel();
     stop_session_tasks(completed, writer, reader).await;
@@ -919,8 +999,8 @@ async fn request_configuration(
     events: &Events,
     config_tx: Option<mpsc::Sender<String>>,
 ) -> Result<bool> {
-    let request = build_registration_payload(config);
     'attempts: for (attempt, timeout_ms) in CONFIG_RESPONSE_TIMEOUT_MS.into_iter().enumerate() {
+        let (request, offset) = build_registration_payload(config);
         writer
             .send_bytes(request.as_ref())
             .await
@@ -980,6 +1060,7 @@ async fn request_configuration(
                 if let Some(sender) = &config_tx {
                     let _ = sender.try_send(value);
                 }
+                crate::idle::note_path_joined(config.id, offset);
                 crate::log_error!("[ВОРКЕР #{}] Конфиг получен", config.id);
                 return Ok(true);
             }
@@ -1341,6 +1422,53 @@ mod tests {
         assert!(newer_rx.try_recv().is_err());
         drop(older);
         drop(newer);
+    }
+
+    #[tokio::test]
+    async fn shutdown_reaches_a_later_stream_when_the_active_ones_stay_silent() {
+        let shutdown = Arc::new(ShutdownCoordinator::new());
+        let (first_tx, mut first_rx) = mpsc::channel(1);
+        let first = shutdown.register(1, first_tx);
+        let (second_tx, mut second_rx) = mpsc::channel(1);
+        let second = shutdown.register(2, second_tx);
+        let (live_tx, mut live_rx) = mpsc::channel(1);
+        let live = shutdown.register(3, live_tx);
+        shutdown.mark_activity(&second.activity);
+        shutdown.mark_activity(&first.activity);
+        shutdown.mark_activity(&first.activity);
+
+        let coordinator = shutdown.clone();
+        let task = tokio::spawn(async move {
+            coordinator.request_disconnect("device", "salt").await;
+        });
+        let mut held = Vec::new();
+        for rx in [&mut first_rx, &mut second_rx] {
+            match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+                Ok(Some(WriterCommand::SendBytes { completion, .. })) => held.push(completion),
+                _ => panic!("silent stream was not offered DISCONNECT"),
+            }
+        }
+        let command = tokio::time::timeout(Duration::from_millis(500), live_rx.recv())
+            .await
+            .unwrap_or(None);
+        let completion = match command {
+            Some(WriterCommand::SendBytes { data, completion }) => {
+                assert_eq!(data.as_ref(), b"DISCONNECT:device|salt");
+                completion
+            }
+            None => panic!("DISCONNECT did not reach the live stream"),
+        };
+        assert!(completion.send(Ok(())).is_ok());
+        assert!(shutdown.observe_control_response(b"OK:disconnected"));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .is_ok()
+        );
+        drop(held);
+        drop(first);
+        drop(second);
+        drop(live);
     }
 
     #[tokio::test]

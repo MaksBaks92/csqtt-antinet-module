@@ -128,3 +128,54 @@ func TestDataPathGuardHandoverDuringRecycleRebindsAfter(t *testing.T) {
 		t.Fatalf("pending handover must rebind after recycle: %d", rebinds.Load())
 	}
 }
+
+func TestHealWhileRebindInFlightDoesNotRecycle(t *testing.T) {
+	var active, rebinds, starts atomic.Int32
+	g := newRebindTestGuard(&active, &rebinds, &starts, true)
+	g.onHostEvent("handover")
+	g.heal("zero-paths")
+	if rebinds.Load() != 1 || starts.Load() != 0 {
+		t.Fatalf("in-flight rebind owns the heal: rebinds=%d starts=%d", rebinds.Load(), starts.Load())
+	}
+	active.Store(2)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		g.mu.Lock()
+		flying := g.rebindInFlight
+		g.mu.Unlock()
+		if !flying {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if starts.Load() != 0 {
+		t.Fatalf("paths returned, no recycle: %d", starts.Load())
+	}
+}
+
+func TestHealAfterRebindInsideGapRecycles(t *testing.T) {
+	var active, rebinds, starts atomic.Int32
+	g := newRebindTestGuard(&active, &rebinds, &starts, true)
+	g.onHostEvent("handover")
+	active.Store(2)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		g.mu.Lock()
+		flying := g.rebindInFlight
+		g.mu.Unlock()
+		if !flying {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	g.mu.Lock()
+	flying := g.rebindInFlight
+	g.mu.Unlock()
+	if flying {
+		t.Fatal("watchdog should clear in-flight once paths are up")
+	}
+	g.heal("dial-timeouts")
+	if rebinds.Load() != 1 || starts.Load() != 1 {
+		t.Fatalf("fresh failure inside the rebind gap must recycle: rebinds=%d starts=%d", rebinds.Load(), starts.Load())
+	}
+}

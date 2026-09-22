@@ -115,6 +115,51 @@ pub fn inject_packet(data: &[u8]) -> i32 {
     0
 }
 
+/// Copy a burst from gVisor in one bridge lookup and one reader wake.
+pub fn inject_packets(packets: &[&[u8]]) -> i32 {
+    if packets.is_empty() {
+        return 0;
+    }
+    let Some(bridge) = uplink_slot().load_full() else {
+        return -1;
+    };
+    if bridge.cancel.is_cancelled() {
+        return -1;
+    }
+    let mut queued = 0i32;
+    let mut failed = 0i32;
+    for data in packets {
+        if data.is_empty() {
+            continue;
+        }
+        crate::idle::note_uplink(data);
+        let Some(mut packet) = bridge.pool.try_acquire() else {
+            failed += 1;
+            continue;
+        };
+        let area = packet.read_area();
+        if data.len() > area.len() {
+            failed += 1;
+            continue;
+        }
+        area[..data.len()].copy_from_slice(data);
+        if packet.set_read_len(data.len()).is_err() {
+            failed += 1;
+            continue;
+        }
+        if bridge.queue.push(packet).is_err() {
+            failed += 1;
+            continue;
+        }
+        queued += 1;
+    }
+    if queued > 0 {
+        bridge.notify.notify_one();
+        return 0;
+    }
+    if failed > 0 { -2 } else { 0 }
+}
+
 pub fn deliver_downlink(packet: &[u8]) {
     if packet.is_empty() {
         return;

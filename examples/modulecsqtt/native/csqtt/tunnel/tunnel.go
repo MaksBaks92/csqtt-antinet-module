@@ -22,7 +22,7 @@ type IPTunnel struct {
 	ep    *LinkEndpoint
 }
 
-func NewIPTunnel(clientIP net.IP, onOutgoing func([]byte)) (*IPTunnel, error) {
+func NewIPTunnel(clientIP net.IP, onOutgoing func([][]byte)) (*IPTunnel, error) {
 	ip4 := clientIP.To4()
 	if ip4 == nil {
 		return nil, fmt.Errorf("tunnel IP %q is not IPv4", clientIP)
@@ -67,6 +67,10 @@ func NewIPTunnel(clientIP net.IP, onOutgoing func([]byte)) (*IPTunnel, error) {
 
 func (t *IPTunnel) InjectInbound(data []byte) {
 	t.ep.InjectInbound(data)
+}
+
+func (t *IPTunnel) InjectInboundBatch(pkts [][]byte) {
+	t.ep.InjectInboundBatch(pkts)
 }
 
 func (t *IPTunnel) DialTCP(ctx context.Context, ip string, port uint16) (net.Conn, error) {

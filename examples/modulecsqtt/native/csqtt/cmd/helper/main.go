@@ -600,10 +600,10 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 
 	emitProgress(s.openingEngine)
 	// Downlink sink registered before start so early packets are not dropped.
-	var inbound atomic.Pointer[func([]byte)]
-	engineSetPacketOut(func(pkt []byte) {
+	var inbound atomic.Pointer[func([][]byte)]
+	engineSetPacketOut(func(pkts [][]byte) {
 		if fn := inbound.Load(); fn != nil {
-			(*fn)(pkt)
+			(*fn)(pkts)
 		}
 	})
 	if err := engineStart(string(engineCfg)); err != nil {
@@ -628,11 +628,12 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 
 	// In-process bridge: gVisor ↔ rust without UDP 127.0.0.1.
 	var liveTun atomic.Pointer[tunnel.IPTunnel]
-	tun, err := tunnel.NewIPTunnel(tunIP, func(pkt []byte) {
-		if err := engineInjectPacket(pkt); err != nil && debug {
+	injectUp := func(pkts [][]byte) {
+		if err := engineInjectPackets(pkts); err != nil && debug {
 			log.Printf("[BRIDGE] inject: %v", err)
 		}
-	})
+	}
+	tun, err := tunnel.NewIPTunnel(tunIP, injectUp)
 	if err != nil {
 		emitStatus(statusFatal, "netstack failed")
 		log.Fatalf("netstack: %v", err)
@@ -643,9 +644,9 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 			t.Close()
 		}
 	}()
-	deliver := func(pkt []byte) {
+	deliver := func(pkts [][]byte) {
 		if t := liveTun.Load(); t != nil {
-			t.InjectInbound(pkt)
+			t.InjectInboundBatch(pkts)
 		}
 	}
 	inbound.Store(&deliver)
@@ -673,18 +674,14 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 		if ip == nil || ip.To4() == nil {
 			return fmt.Errorf("bad tun ip %q", newIP)
 		}
-		nt, err := tunnel.NewIPTunnel(ip, func(pkt []byte) {
-			if err := engineInjectPacket(pkt); err != nil && debug {
-				log.Printf("[BRIDGE] inject: %v", err)
-			}
-		})
+		nt, err := tunnel.NewIPTunnel(ip, injectUp)
 		if err != nil {
 			return err
 		}
 		old := liveTun.Swap(nt)
-		d := func(pkt []byte) {
+		d := func(pkts [][]byte) {
 			if t := liveTun.Load(); t != nil {
-				t.InjectInbound(pkt)
+				t.InjectInboundBatch(pkts)
 			}
 		}
 		inbound.Store(&d)
@@ -707,7 +704,7 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	setHostEventHandler(func(event string) {
 		// dns=<…> забирает канон hostproto→rememberHostDNSServers (подписка newProtectedResolver).
 		switch event {
-		case "handover", "netlost", "netback", "stall":
+		case "handover", "netlost", "netback", "stall", "stop":
 			if event == "handover" {
 				emitLog(s.handoverLog)
 			}

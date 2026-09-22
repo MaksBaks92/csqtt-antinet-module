@@ -15,7 +15,7 @@ import (
 type LinkEndpoint struct {
 	dispatcherMu     sync.RWMutex
 	dispatcher       stack.NetworkDispatcher
-	onOutgoingPacket func([]byte)
+	onOutgoingPacket func([][]byte)
 	packetIn         atomic.Uint64
 	packetOut        atomic.Uint64
 }
@@ -26,7 +26,7 @@ func NewLinkEndpoint() *LinkEndpoint {
 
 // SetOutgoingPacketHandler sets the uplink sink. The callback MUST copy or
 // finish using the slice before returning — the view is released immediately after.
-func (e *LinkEndpoint) SetOutgoingPacketHandler(fn func([]byte)) {
+func (e *LinkEndpoint) SetOutgoingPacketHandler(fn func([][]byte)) {
 	e.onOutgoingPacket = fn
 }
 
@@ -52,17 +52,45 @@ func (e *LinkEndpoint) InjectInbound(data []byte) {
 	dispatcher.DeliverNetworkPacket(ipv4.ProtocolNumber, pkt)
 }
 
+func (e *LinkEndpoint) InjectInboundBatch(pkts [][]byte) {
+	if len(pkts) == 0 {
+		return
+	}
+	e.dispatcherMu.RLock()
+	dispatcher := e.dispatcher
+	e.dispatcherMu.RUnlock()
+	if dispatcher == nil {
+		return
+	}
+	for _, data := range pkts {
+		if len(data) == 0 {
+			continue
+		}
+		e.packetIn.Add(1)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[TUNNEL] recovered from inbound panic (%d bytes): %v", len(data), r)
+				}
+			}()
+			pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+				Payload: buffer.MakeWithData(data),
+			})
+			dispatcher.DeliverNetworkPacket(ipv4.ProtocolNumber, pkt)
+		}()
+	}
+}
+
 func (e *LinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
 	n := 0
 	handler := e.onOutgoingPacket
+	if handler == nil {
+		return pkts.Len(), nil
+	}
+	views := make([]*buffer.View, 0, pkts.Len())
+	batch := make([][]byte, 0, pkts.Len())
 	for _, pkt := range pkts.AsSlice() {
 		e.packetOut.Add(1)
-		if handler == nil {
-			n++
-			continue
-		}
-		// ToView() already materializes a caller-owned View; AsSlice avoids a
-		// second ToSlice() allocation. inject_packet copies before we Release.
 		view := pkt.ToView()
 		if view == nil || view.Size() == 0 {
 			if view != nil {
@@ -71,9 +99,15 @@ func (e *LinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Err
 			n++
 			continue
 		}
-		handler(view.AsSlice())
-		view.Release()
+		views = append(views, view)
+		batch = append(batch, view.AsSlice())
 		n++
+	}
+	if len(batch) > 0 {
+		handler(batch)
+	}
+	for _, view := range views {
+		view.Release()
 	}
 	return n, nil
 }

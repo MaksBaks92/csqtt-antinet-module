@@ -29,9 +29,11 @@ var (
 	procSetPacketOut      *windows.LazyProc
 	procSetPacketOutBatch *windows.LazyProc
 	procInjectPacket      *windows.LazyProc
+	procInjectBatch       *windows.LazyProc
+	procDisconnect        *windows.LazyProc
 	protectImpl           func(int64) bool
 	protectCallback       uintptr
-	packetOutSink         atomic.Pointer[func([]byte)]
+	packetOutSink         atomic.Pointer[func([][]byte)]
 	packetOutCallback     uintptr
 )
 
@@ -60,6 +62,8 @@ func engineLoad(searchDirs ...string) error {
 	procSetPacketOut = engineDLL.NewProc("csqtt_engine_set_packet_out")
 	procSetPacketOutBatch = engineDLL.NewProc("csqtt_engine_set_packet_out_batch")
 	procInjectPacket = engineDLL.NewProc("csqtt_engine_inject_packet")
+	procInjectBatch = engineDLL.NewProc("csqtt_engine_inject_batch")
+	procDisconnect = engineDLL.NewProc("csqtt_engine_disconnect")
 	return nil
 }
 
@@ -77,7 +81,7 @@ func engineSetProtect(fn func(int64) bool) {
 	_, _, _ = procSetProtect.Call(protectCallback)
 }
 
-func engineSetPacketOut(fn func([]byte)) {
+func engineSetPacketOut(fn func([][]byte)) {
 	if fn == nil {
 		packetOutSink.Store(nil)
 		return
@@ -91,12 +95,15 @@ func engineSetPacketOut(fn func([]byte)) {
 		n := int(count)
 		ptrSlice := unsafe.Slice((**byte)(unsafe.Pointer(ptrs)), n)
 		lenSlice := unsafe.Slice((*int32)(unsafe.Pointer(lens)), n)
+		batch := make([][]byte, 0, n)
 		for i := 0; i < n; i++ {
 			if ptrSlice[i] == nil || lenSlice[i] <= 0 {
 				continue
 			}
-			buf := unsafe.Slice(ptrSlice[i], int(lenSlice[i]))
-			(*sink)(buf)
+			batch = append(batch, unsafe.Slice(ptrSlice[i], int(lenSlice[i])))
+		}
+		if len(batch) > 0 {
+			(*sink)(batch)
 		}
 		return 0
 	})
@@ -111,24 +118,59 @@ func engineSetPacketOut(fn func([]byte)) {
 			return 0
 		}
 		buf := unsafe.Slice((*byte)(unsafe.Pointer(data)), int(n))
-		(*sink)(buf)
+		(*sink)([][]byte{buf})
 		return 0
 	})
 	_, _, _ = procSetPacketOut.Call(packetOutCallback)
 }
 
 func engineInjectPacket(pkt []byte) error {
-	if len(pkt) == 0 {
+	return engineInjectPackets([][]byte{pkt})
+}
+
+func engineInjectPackets(pkts [][]byte) error {
+	if len(pkts) == 0 {
 		return nil
 	}
-	if procInjectPacket == nil {
-		return fmt.Errorf("inject_packet unavailable")
+	if procInjectBatch != nil && procInjectBatch.Find() == nil {
+		ptrs := make([]uintptr, len(pkts))
+		lens := make([]int32, len(pkts))
+		for i, pkt := range pkts {
+			if len(pkt) == 0 {
+				continue
+			}
+			ptrs[i] = uintptr(unsafe.Pointer(&pkt[0]))
+			lens[i] = int32(len(pkt))
+		}
+		r, _, _ := procInjectBatch.Call(
+			uintptr(unsafe.Pointer(&ptrs[0])),
+			uintptr(unsafe.Pointer(&lens[0])),
+			uintptr(len(pkts)),
+		)
+		if int32(r) != 0 {
+			return fmt.Errorf("inject_batch: %d", int32(r))
+		}
+		return nil
 	}
-	r, _, _ := procInjectPacket.Call(uintptr(unsafe.Pointer(&pkt[0])), uintptr(len(pkt)))
-	if int32(r) != 0 {
-		return fmt.Errorf("inject_packet: %d", int32(r))
+	for _, pkt := range pkts {
+		if len(pkt) == 0 {
+			continue
+		}
+		if procInjectPacket == nil {
+			return fmt.Errorf("inject_packet unavailable")
+		}
+		r, _, _ := procInjectPacket.Call(uintptr(unsafe.Pointer(&pkt[0])), uintptr(len(pkt)))
+		if int32(r) != 0 {
+			return fmt.Errorf("inject_packet: %d", int32(r))
+		}
 	}
 	return nil
+}
+
+func engineDisconnect() {
+	if procDisconnect != nil && procDisconnect.Find() == nil {
+		_, _, _ = procDisconnect.Call()
+	}
 }
 
 func engineStart(configJSON string) error {

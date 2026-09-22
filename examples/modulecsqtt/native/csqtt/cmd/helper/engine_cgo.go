@@ -26,6 +26,8 @@ static void (*fn_rebind)(void);
 static void (*fn_set_packet_out)(void *);
 static void (*fn_set_packet_out_batch)(void *);
 static int32_t (*fn_inject_packet)(const uint8_t *, int32_t);
+static int32_t (*fn_inject_batch)(const uint8_t **, const int32_t *, int32_t);
+static void (*fn_disconnect)(void);
 
 extern int32_t goProtectFd(int64_t fd);
 extern void goPacketOut(uint8_t *data, int32_t n);
@@ -50,6 +52,8 @@ static int csqtt_load(const char *path) {
 	fn_set_packet_out = (void (*)(void *))dlsym(eng, "csqtt_engine_set_packet_out");
 	fn_set_packet_out_batch = (void (*)(void *))dlsym(eng, "csqtt_engine_set_packet_out_batch");
 	fn_inject_packet = (int32_t (*)(const uint8_t *, int32_t))dlsym(eng, "csqtt_engine_inject_packet");
+	fn_inject_batch = (int32_t (*)(const uint8_t **, const int32_t *, int32_t))dlsym(eng, "csqtt_engine_inject_batch");
+	fn_disconnect = (void (*)(void))dlsym(eng, "csqtt_engine_disconnect");
 	if (!fn_start || !fn_wait_ready || !fn_packet_port || !fn_tun_ip || !fn_stop) {
 		return -2;
 	}
@@ -85,6 +89,11 @@ static int32_t csqtt_rebind(void) { if (!fn_rebind) return -1; fn_rebind(); retu
 static int32_t csqtt_inject(const uint8_t *d, int32_t n) {
 	return fn_inject_packet ? fn_inject_packet((uint8_t *)d, n) : -1;
 }
+static int csqtt_has_inject_batch(void) { return fn_inject_batch != 0; }
+static int32_t csqtt_inject_batch(const uint8_t **p, const int32_t *l, int32_t n) {
+	return fn_inject_batch ? fn_inject_batch(p, l, n) : -4;
+}
+static void csqtt_disconnect(void) { if (fn_disconnect) fn_disconnect(); }
 */
 import "C"
 
@@ -100,7 +109,7 @@ import (
 )
 
 var protectImpl func(int64) bool
-var packetOutSink atomic.Pointer[func([]byte)]
+var packetOutSink atomic.Pointer[func([][]byte)]
 
 //export goProtectFd
 func goProtectFd(fd C.int64_t) C.int32_t {
@@ -125,7 +134,7 @@ func goPacketOut(data *C.uint8_t, n C.int32_t) {
 	// Borrowed slice: InjectInbound → MakeWithData copies before return.
 	// Do not retain past this call.
 	buf := unsafe.Slice((*byte)(unsafe.Pointer(data)), int(n))
-	(*sink)(buf)
+	(*sink)([][]byte{buf})
 }
 
 //export goPacketOutBatch
@@ -140,12 +149,15 @@ func goPacketOutBatch(ptrs **C.uint8_t, lens *C.int32_t, count C.int32_t) {
 	n := int(count)
 	ptrSlice := unsafe.Slice(ptrs, n)
 	lenSlice := unsafe.Slice(lens, n)
+	batch := make([][]byte, 0, n)
 	for i := 0; i < n; i++ {
 		if ptrSlice[i] == nil || lenSlice[i] <= 0 {
 			continue
 		}
-		buf := unsafe.Slice((*byte)(unsafe.Pointer(ptrSlice[i])), int(lenSlice[i]))
-		(*sink)(buf)
+		batch = append(batch, unsafe.Slice((*byte)(unsafe.Pointer(ptrSlice[i])), int(lenSlice[i])))
+	}
+	if len(batch) > 0 {
+		(*sink)(batch)
 	}
 }
 
@@ -175,7 +187,7 @@ func engineSetProtect(fn func(int64) bool) {
 	C.csqtt_bind_protect()
 }
 
-func engineSetPacketOut(fn func([]byte)) {
+func engineSetPacketOut(fn func([][]byte)) {
 	if fn == nil {
 		packetOutSink.Store(nil)
 		return
@@ -185,14 +197,43 @@ func engineSetPacketOut(fn func([]byte)) {
 }
 
 func engineInjectPacket(pkt []byte) error {
-	if len(pkt) == 0 {
+	return engineInjectPackets([][]byte{pkt})
+}
+
+func engineInjectPackets(pkts [][]byte) error {
+	if len(pkts) == 0 {
 		return nil
 	}
-	rc := C.csqtt_inject((*C.uint8_t)(unsafe.Pointer(&pkt[0])), C.int32_t(len(pkt)))
+	if C.csqtt_has_inject_batch() == 0 {
+		for _, pkt := range pkts {
+			if len(pkt) == 0 {
+				continue
+			}
+			rc := C.csqtt_inject((*C.uint8_t)(unsafe.Pointer(&pkt[0])), C.int32_t(len(pkt)))
+			if rc != 0 {
+				return fmt.Errorf("inject_packet: %d", int32(rc))
+			}
+		}
+		return nil
+	}
+	ptrs := make([]*C.uint8_t, len(pkts))
+	lens := make([]C.int32_t, len(pkts))
+	for i, pkt := range pkts {
+		if len(pkt) == 0 {
+			continue
+		}
+		ptrs[i] = (*C.uint8_t)(unsafe.Pointer(&pkt[0]))
+		lens[i] = C.int32_t(len(pkt))
+	}
+	rc := C.csqtt_inject_batch((**C.uint8_t)(unsafe.Pointer(&ptrs[0])), &lens[0], C.int32_t(len(pkts)))
 	if rc != 0 {
-		return fmt.Errorf("inject_packet: %d", int32(rc))
+		return fmt.Errorf("inject_batch: %d", int32(rc))
 	}
 	return nil
+}
+
+func engineDisconnect() {
+	C.csqtt_disconnect()
 }
 
 func engineStart(configJSON string) error {

@@ -422,16 +422,27 @@ pub async fn run(arguments: Arguments) -> Result<()> {
         _ => None,
     };
     let shutdown_events = events.clone();
+    let shutdown = context.shutdown.clone();
+    let device_id = context.params.device_id.clone();
+    let salt = context.params.salt.clone();
     let groups_future = run_groups(groups, context);
     tokio::pin!(groups_future);
-    let groups_completed = tokio::select! {
-        _ = &mut groups_future => true,
-        _ = tokio::signal::ctrl_c() => {
-            crate::log_error!("[КЛИЕНТ] Получен сигнал завершения");
-            cancel.cancel();
-            false
+    let groups_completed = loop {
+        tokio::select! {
+            _ = &mut groups_future => break true,
+            _ = tokio::signal::ctrl_c() => {
+                crate::log_error!("[КЛИЕНТ] Получен сигнал завершения");
+                cancel.cancel();
+                break false;
+            }
+            _ = cancel.cancelled() => break false,
+            _ = crate::session::stop_disconnect_requested() => {
+                shutdown
+                    .request_disconnect(device_id.as_ref(), salt.as_ref())
+                    .await;
+                crate::session::stop_disconnect_finished();
+            }
         }
-        _ = cancel.cancelled() => false,
     };
     cancel.cancel();
     if let Ok(mut slot) = ENGINE_PAUSE.lock() {

@@ -72,6 +72,15 @@ static PACKET_WINDOW_COUNT: AtomicU64 = AtomicU64::new(0);
 static SYN_WINDOW_START_MS: AtomicU64 = AtomicU64::new(0);
 static SYN_WINDOW_COUNT: AtomicU64 = AtomicU64::new(0);
 static CLOCK: LazyLock<Instant> = LazyLock::new(Instant::now);
+/// `GEN_OFFSET + 1` of the epoch this worker last put on the server. 0 = never joined.
+/// Index is the 1-based worker id. Server accepts at most 126.
+const JOINED_SLOTS: usize = 127;
+static JOINED: [AtomicU64; JOINED_SLOTS] = [const { AtomicU64::new(0) }; JOINED_SLOTS];
+/// Per-poll uplink below this, but above the idle threshold, counts as light traffic.
+const LIGHT_BYTES_PER_POLL: i64 = 48 * 1024;
+/// Per-poll uplink that should bring the full worker set back.
+const BUSY_BYTES_PER_POLL: i64 = 256 * 1024;
+const LIGHT_AFTER: Duration = Duration::from_secs(60);
 
 fn notify() -> &'static Notify {
     static NOTIFY: OnceLock<Notify> = OnceLock::new();
@@ -90,7 +99,104 @@ pub fn reset(total_workers: usize) {
     ACTIVE.store(false, Ordering::Release);
     GEN_OFFSET.store(0, Ordering::Release);
     ANNOUNCE.store(0, Ordering::Release);
+    for slot in &JOINED {
+        slot.store(0, Ordering::Release);
+    }
     notify().notify_waiters();
+}
+
+/// Remember the epoch this worker just advertised. `offset` is the `GEN_OFFSET` baked into
+/// that GETCONF, not a later read: a bump between send and ack must not look like a join.
+pub fn note_path_joined(worker_id: usize, offset: u64) {
+    let Some(slot) = JOINED.get(worker_id) else {
+        return;
+    };
+    if worker_id == 0 {
+        return;
+    }
+    slot.store(offset.saturating_add(1), Ordering::Release);
+}
+
+/// A live worker died outside idle-park / rebind / repair. Bump generation once per epoch,
+/// and only if this worker had actually joined it. A burst on the same epoch is one bump:
+/// the first CAS wins, the rest already point at a stale route the new GETCONF drops.
+/// A worker that re-GETCONFs onto the new epoch and then dies opens the next epoch, so the
+/// server does not stripe that fresh route until STREAM_REPAIR.
+pub fn note_path_lost(worker_id: usize) {
+    if !allows(worker_id) {
+        return;
+    }
+    let Some(slot) = JOINED.get(worker_id) else {
+        return;
+    };
+    let joined = slot.load(Ordering::Acquire);
+    if joined == 0 {
+        return;
+    }
+    let current = GEN_OFFSET.load(Ordering::Acquire);
+    if joined - 1 != current {
+        return;
+    }
+    if GEN_OFFSET
+        .compare_exchange(
+            current,
+            current.saturating_add(1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return;
+    }
+    slot.store(0, Ordering::Release);
+    ANNOUNCE.fetch_add(1, Ordering::AcqRel);
+    notify().notify_waiters();
+    crate::log_error!(
+        "[ПУТЬ] Воркер {worker_id} упал — новая эпоха, живые пути перерегистрируются вместе"
+    );
+}
+
+/// Half the configured set, never below `keep` and never above `total`.
+pub(crate) fn light_target(total: usize, keep: usize) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    (total / 2).max(keep.min(total)).min(total)
+}
+
+/// Shrink or restore the advertised worker set. Shrinking bumps generation so the server
+/// drops ids above the new desired_count. Growing only re-announces; new workers join the
+/// current epoch. Idle mode owns the set while it is active.
+pub fn scale_to(count: usize) {
+    if is_active() {
+        return;
+    }
+    let total = TOTAL_WORKERS.load(Ordering::Acquire);
+    if total == 0 {
+        return;
+    }
+    let count = count.clamp(1, total);
+    let current = declared_count();
+    if count >= total {
+        if current >= total && LIMIT.load(Ordering::Acquire) == usize::MAX {
+            return;
+        }
+        LIMIT.store(usize::MAX, Ordering::Release);
+        DECLARED.store(total, Ordering::Release);
+        ANNOUNCE.fetch_add(1, Ordering::AcqRel);
+        notify().notify_waiters();
+        crate::log_error!("[НАГРУЗКА] Трафик вырос — воркеры снова {total}");
+        return;
+    }
+    if count >= current {
+        return;
+    }
+    LIMIT.store(count, Ordering::Release);
+    DECLARED.store(count, Ordering::Release);
+    GEN_OFFSET.fetch_add(1, Ordering::AcqRel);
+    ANNOUNCE.fetch_add(1, Ordering::AcqRel);
+    notify().notify_waiters();
+    crate::log_error!("[НАГРУЗКА] Трафик тихий — оставляю {count} из {total} воркеров");
 }
 
 pub fn declared_count() -> usize {
@@ -101,7 +207,11 @@ pub fn declared_count() -> usize {
 }
 
 pub fn generation(base: u64) -> u64 {
-    base.saturating_add(GEN_OFFSET.load(Ordering::Acquire))
+    base.saturating_add(generation_offset())
+}
+
+pub fn generation_offset() -> u64 {
+    GEN_OFFSET.load(Ordering::Acquire)
 }
 
 pub fn announce_epoch() -> u64 {
@@ -245,6 +355,7 @@ pub async fn monitor(config: IdleConfig, stats: Arc<Stats>, cancel: Cancellation
     }
     let mut last_bytes = stats.total_bytes_up.load(Ordering::Relaxed);
     let mut quiet_since = Instant::now();
+    let mut light_since: Option<Instant> = None;
     loop {
         tokio::select! {
             biased;
@@ -256,8 +367,32 @@ pub async fn monitor(config: IdleConfig, stats: Arc<Stats>, cancel: Cancellation
         last_bytes = bytes;
         if delta > ACTIVE_BYTES_PER_POLL {
             quiet_since = Instant::now();
+            if is_active() {
+                light_since = None;
+                continue;
+            }
+            let total = TOTAL_WORKERS.load(Ordering::Acquire);
+            if delta >= BUSY_BYTES_PER_POLL {
+                light_since = None;
+                if declared_count() < total {
+                    scale_to(total);
+                }
+                continue;
+            }
+            if delta < LIGHT_BYTES_PER_POLL {
+                let since = *light_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= LIGHT_AFTER {
+                    let target = light_target(total, config.keep);
+                    if target < total && declared_count() > target {
+                        scale_to(target);
+                    }
+                }
+            } else {
+                light_since = None;
+            }
             continue;
         }
+        light_since = None;
         if should_enter(quiet_since.elapsed(), config.after, is_active()) {
             enter(config.keep);
         }
@@ -299,6 +434,14 @@ mod tests {
     }
 
     #[test]
+    fn light_target_stays_between_keep_and_total() {
+        assert_eq!(light_target(9, 2), 4);
+        assert_eq!(light_target(3, 2), 2);
+        assert_eq!(light_target(2, 2), 2);
+        assert_eq!(light_target(0, 2), 0);
+    }
+
+    #[test]
     fn enter_requires_quiet_period_and_not_already_idle() {
         let after = Duration::from_secs(180);
         assert!(!should_enter(Duration::from_secs(179), after, false));
@@ -333,6 +476,23 @@ mod tests {
         assert!(!is_active());
         assert!(allows(2));
         assert_eq!(declared_count(), 2);
+
+        // Same epoch: one death bumps, the other is already stale. A re-join then a death
+        // opens the next epoch. A worker that never got GETCONF through does not.
+        reset(4);
+        assert_eq!(generation(7), 7);
+        note_path_joined(1, 0);
+        note_path_joined(2, 0);
+        note_path_lost(1);
+        assert_eq!(generation(7), 8);
+        note_path_lost(2);
+        assert_eq!(generation(7), 8);
+        note_path_joined(2, 1);
+        note_path_lost(2);
+        assert_eq!(generation(7), 9);
+        note_path_lost(2);
+        note_path_lost(9);
+        assert_eq!(generation(7), 9);
         reset(0);
     }
 }

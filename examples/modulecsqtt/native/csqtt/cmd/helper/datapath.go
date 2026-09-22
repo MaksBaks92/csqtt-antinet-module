@@ -72,6 +72,7 @@ type dataPathGuard struct {
 	graceUntil            time.Time // after wake: stale dial-timeouts are not evidence
 	lastRebind            time.Time // soft handover dedupe (host event + own detector)
 	rebindGen             uint64
+	rebindInFlight        bool // watchdog has not yet judged this rebind
 	pendingHandover       bool
 	pendingHandoverSource string
 	exiting               bool
@@ -85,6 +86,7 @@ type dataPathGuard struct {
 	activeFn     func() int  // engine READY TURN paths (-1 = unknown); optional
 	nudgeFn      func()      // engine re-validate paths now; optional
 	rebindFn     func() bool // engine soft handover; false → not supported, recycle instead
+	disconnectFn func()      // DISCONNECT on host stop; optional in tests
 	probeFn      func() bool // "is the network usable?" while paused; optional
 	rebuildTunFn func(newIP string) error // swap gVisor when engine TUN IP changes on recycle
 	exitFn       func(code int)
@@ -107,7 +109,8 @@ func newDataPathGuard(cfgJSON string, readyWait time.Duration, pktPort int, tunI
 		pauseFn:     engineSetPaused,
 		activeFn:    engineActivePaths,
 		nudgeFn:     engineNudge,
-		rebindFn:    engineRebind,
+		rebindFn:     engineRebind,
+		disconnectFn: engineDisconnect,
 		exitFn:      os.Exit,
 		nowFn:       time.Now,
 		sleepFn:     time.Sleep,
@@ -206,7 +209,7 @@ func (g *dataPathGuard) noteDialResult(err error) {
 	n := g.dialFails
 	g.mu.Unlock()
 	if n >= dataPathDialFailThreshold {
-		go g.requestRecycle("dial-timeouts")
+		go g.heal("dial-timeouts")
 	}
 }
 
@@ -234,7 +237,61 @@ func (g *dataPathGuard) onHostEvent(event string) {
 		g.onHandover("stall")
 	case "handover":
 		g.onHandover("handover")
+	case "stop":
+		// Host is about to kill the process. DISCONNECT drops server routes inside the
+		// desktop ~1s window. Do not exit here — the host owns process lifetime.
+		g.logFn("CSQTT: stop — отправляю DISCONNECT")
+		if g.disconnectFn != nil {
+			g.disconnectFn()
+		}
 	}
+}
+
+// heal — try a soft rebind before a full engine restart. Rebind closes the old TURN
+// sockets and opens new protected ones, then GETCONF runs again. Full recycle stays
+// for a rebind that already failed, and for a new path failure that arrives while the
+// 3s dedupe window still blocks another rebind. An in-flight rebind whose paths are
+// still down keeps its watchdog. SOCKS on 127.0.0.1 is not rebound.
+func (g *dataPathGuard) heal(reason string) {
+	if g == nil {
+		return
+	}
+	if strings.HasSuffix(reason, "-rebind-timeout") || strings.HasSuffix(reason, "-rebind-gap") {
+		g.requestRecycle(reason)
+		return
+	}
+	g.mu.Lock()
+	if g.exiting {
+		g.mu.Unlock()
+		return
+	}
+	if g.paused {
+		g.mu.Unlock()
+		g.requestRecycle(reason)
+		return
+	}
+	rebind := g.rebindFn
+	withinGap := !g.lastRebind.IsZero() && g.nowFn().Sub(g.lastRebind) < dataPathRebindMinGap
+	inFlight := g.rebindInFlight
+	g.mu.Unlock()
+	if rebind == nil {
+		g.requestRecycle(reason)
+		return
+	}
+	if withinGap {
+		paths := -1
+		if g.activeFn != nil {
+			paths = g.activeFn()
+		}
+		// Watchdog is still waiting and nothing is READY yet. It recycles on its own
+		// deadline. A new failure after paths are already back must not disappear.
+		if inFlight && paths <= 0 {
+			return
+		}
+		g.requestRecycle(reason + "-rebind-gap")
+		return
+	}
+	g.onHandover(reason)
 }
 
 // onHandover — the network under the TURN sockets changed (host event, own detector or a
@@ -271,12 +328,14 @@ func (g *dataPathGuard) onHandover(source string) {
 	g.lastRebind = now
 	g.rebindGen++
 	gen := g.rebindGen
+	g.rebindInFlight = true
 	g.dialFails = 0
 	// Dial timeouts while the paths re-allocate are not evidence of a dead data path.
 	g.graceUntil = now.Add(dataPathWakeGrace)
 	rebind := g.rebindFn
 	g.mu.Unlock()
 	if rebind == nil || !rebind() {
+		g.finishRebind(gen)
 		g.logFn("CSQTT: %s — движок без rebind, перезапускаю data path", source)
 		go g.requestRecycle(source)
 		return
@@ -285,11 +344,21 @@ func (g *dataPathGuard) onHandover(source string) {
 	go g.rebindWatchdog(gen, source)
 }
 
+// finishRebind — the watchdog for `gen` is done. A newer rebind owns the flag.
+func (g *dataPathGuard) finishRebind(gen uint64) {
+	g.mu.Lock()
+	if g.rebindGen == gen {
+		g.rebindInFlight = false
+	}
+	g.mu.Unlock()
+}
+
 // rebindWatchdog — after a soft rebind the READY path count drops to zero and must come back.
 // If it does not within dataPathRebindWait (relay unreachable, credentials dead on the new
 // network, ...) escalate to the full recycle, which also fetches fresh credentials.
 func (g *dataPathGuard) rebindWatchdog(gen uint64, source string) {
 	if g.activeFn == nil {
+		g.finishRebind(gen)
 		return
 	}
 	// Let the old sessions actually tear down before counting; otherwise a stale non-zero
@@ -301,9 +370,11 @@ func (g *dataPathGuard) rebindWatchdog(gen uint64, source string) {
 		stale := g.rebindGen != gen || g.exiting || g.paused || g.recycling
 		g.mu.Unlock()
 		if stale {
+			g.finishRebind(gen)
 			return
 		}
 		if g.activeFn() != 0 { // -1 (unknown) counts as "cannot judge" → trust the engine
+			g.finishRebind(gen)
 			return
 		}
 		g.sleepFn(dataPathRebindPoll)
@@ -312,8 +383,10 @@ func (g *dataPathGuard) rebindWatchdog(gen uint64, source string) {
 	stale := g.rebindGen != gen || g.exiting || g.paused
 	g.mu.Unlock()
 	if stale {
+		g.finishRebind(gen)
 		return
 	}
+	g.finishRebind(gen)
 	g.logFn("CSQTT: после %s пути не поднялись за %s — перезапускаю data path", source, dataPathRebindWait)
 	g.requestRecycle(source + "-rebind-timeout")
 }
@@ -345,8 +418,8 @@ func (g *dataPathGuard) resumeFromPause(source string) {
 		return
 	}
 	if need {
-		g.logFn("CSQTT: сеть вернулась — отложенный перезапуск data path (%s)", reason)
-		go g.requestRecycle(reason)
+		g.logFn("CSQTT: сеть вернулась — лечу data path (%s)", reason)
+		go g.heal(reason)
 		return
 	}
 	// Prefer soft resume: workers reconnect without VK re-auth storm.
@@ -395,7 +468,7 @@ func (g *dataPathGuard) probeSucceeded(gen uint64, source string) {
 	g.mu.Unlock()
 	g.resumeFromPause(source)
 	if need {
-		go g.requestRecycle(reason)
+		go g.heal(reason)
 	} else if g.nudgeFn != nil {
 		g.nudgeFn()
 	}
@@ -459,7 +532,7 @@ func (g *dataPathGuard) waitForPath(ctx context.Context) {
 	}
 	// Cap elapsed with still-zero READY paths: do not wait for 3×dialTimeout — recycle now.
 	if !g.rejecting() && g.activeFn != nil && g.activeFn() == 0 {
-		go g.requestRecycle("zero-paths")
+		go g.heal("zero-paths")
 	}
 }
 

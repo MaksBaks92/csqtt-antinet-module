@@ -4,8 +4,10 @@
 use std::time::{Duration, Instant};
 
 const MAX_SMALL_UDP_PAYLOAD: usize = 256;
-const DUPLICATES_PER_SECOND: u32 = 50;
-const DUPLICATE_BURST: u32 = 10;
+// Same packets as the official client (DNS, SYN, small UDP). The budget is local:
+// 80/s with a burst of 16, so a lossy mobile TURN still covers the first packets.
+const DUPLICATES_PER_SECOND: u32 = 80;
+const DUPLICATE_BURST: u32 = 16;
 const REFILL_INTERVAL: Duration = Duration::from_millis(1_000 / DUPLICATES_PER_SECOND as u64);
 
 pub struct Budget {

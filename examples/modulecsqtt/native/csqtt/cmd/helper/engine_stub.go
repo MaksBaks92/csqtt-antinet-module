@@ -10,11 +10,15 @@ func engineLoad(searchDirs ...string) error {
 }
 
 func engineSetProtect(fn func(int64) bool) { _ = fn }
-func engineSetPacketOut(fn func([]byte))   { _ = fn }
+func engineSetPacketOut(fn func([][]byte)) { _ = fn }
 func engineInjectPacket(pkt []byte) error {
-	_ = pkt
+	return engineInjectPackets([][]byte{pkt})
+}
+func engineInjectPackets(pkts [][]byte) error {
+	_ = pkts
 	return fmt.Errorf("CSQTT engine on this OS requires cgo")
 }
+func engineDisconnect() {}
 func engineStart(configJSON string) error {
 	_ = configJSON
 	return fmt.Errorf("CSQTT engine on this OS requires cgo")

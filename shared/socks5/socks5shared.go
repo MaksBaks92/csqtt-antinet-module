@@ -200,8 +200,17 @@ func serveSocksListener(ln net.Listener, handle func(net.Conn)) {
 // ошибку ЗАПИСИ в dst (клиент). `io.Copy` их не различает (одна error на обе стороны), а именно
 // это различие определяет, чем закрывать клиентское соединение. io.EOF — не ошибка: это
 // корректный конец потока.
+var relayCopyPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 32*1024)
+		return &b
+	},
+}
+
 func relayCopy(dst io.Writer, src io.Reader) (n int64, readErr, writeErr error) {
-	buf := make([]byte, 32*1024)
+	slot := relayCopyPool.Get().(*[]byte)
+	defer relayCopyPool.Put(slot)
+	buf := *slot
 	for {
 		nr, er := src.Read(buf)
 		if nr > 0 {

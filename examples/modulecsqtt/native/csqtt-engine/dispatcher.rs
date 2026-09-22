@@ -265,7 +265,11 @@ impl PacketSender {
 
     fn is_congested(&self) -> bool {
         let cap = self.shared.queue.capacity();
-        cap > 0 && self.shared.queue.len() * 2 >= cap
+        cap > 0 && self.queued() * 2 >= cap
+    }
+
+    fn queued(&self) -> usize {
+        self.shared.queue.len()
     }
 }
 
@@ -1427,9 +1431,9 @@ fn replace_oldest_in_selected_queue(
         return Err(packet);
     }
     let worker = workers
-        .get(ticket.start_slot)
+        .iter()
         .filter(|worker| worker.is_healthy())
-        .or_else(|| workers.iter().find(|worker| worker.is_healthy()));
+        .min_by_key(|worker| queue_for_class(worker, ticket.class).queued());
     let Some(worker) = worker else {
         return Err(packet);
     };
