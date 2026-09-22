@@ -25,6 +25,7 @@ var (
 	procSetPaused     *windows.LazyProc
 	procActivePaths   *windows.LazyProc
 	procNudge         *windows.LazyProc
+	procRebind        *windows.LazyProc
 	procSetPacketOut  *windows.LazyProc
 	procInjectPacket  *windows.LazyProc
 	protectImpl       func(int64) bool
@@ -54,6 +55,7 @@ func engineLoad(searchDirs ...string) error {
 	procSetPaused = engineDLL.NewProc("csqtt_engine_set_paused")
 	procActivePaths = engineDLL.NewProc("csqtt_engine_active_paths")
 	procNudge = engineDLL.NewProc("csqtt_engine_nudge")
+	procRebind = engineDLL.NewProc("csqtt_engine_rebind")
 	procSetPacketOut = engineDLL.NewProc("csqtt_engine_set_packet_out")
 	procInjectPacket = engineDLL.NewProc("csqtt_engine_inject_packet")
 	return nil
@@ -177,6 +179,14 @@ func engineNudge() {
 		return
 	}
 	_, _, _ = procNudge.Call()
+}
+
+func engineRebind() bool {
+	if procRebind == nil || procRebind.Find() != nil {
+		return false
+	}
+	_, _, _ = procRebind.Call()
+	return true
 }
 
 func findEngineLib(name string, extra ...string) (string, error) {

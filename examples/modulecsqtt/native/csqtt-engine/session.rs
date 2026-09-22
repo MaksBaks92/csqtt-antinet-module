@@ -666,6 +666,7 @@ pub async fn run_session(
         config.peer,
         runtime.pool.clone(),
     ));
+    let rebind_epoch = crate::rebind::epoch();
     let allocation = tokio::select! {
         biased;
         result = &mut connect => result.map_err(TurnAllocateError)?,
@@ -675,6 +676,9 @@ pub async fn run_session(
             }
             return Ok(false);
         },
+        // Network changed under a half-built allocation: its socket is pinned to the old
+        // network, waiting for the RTO ladder (~8 s) gains nothing — start over right away.
+        _ = crate::rebind::requested(rebind_epoch) => bail!("NET_REBIND"),
     };
     drop(connect);
     if let Some(ready) = runtime.allocation_ready.take() {
@@ -700,7 +704,16 @@ pub async fn run_session(
         turn_path,
     ));
     let result = await_session_task(&cancel, session).await;
-    let _ = tokio::time::timeout(DEALLOCATE_TIMEOUT, allocation.deallocate()).await;
+    let rebinding = result
+        .as_ref()
+        .is_err_and(|error| error.to_string().contains("NET_REBIND"));
+    if rebinding {
+        // Old network is gone: the Refresh(0) can not reach the relay, do not spend the
+        // deallocate timeout on it — the allocation expires server-side on its own.
+        drop(allocation);
+    } else {
+        let _ = tokio::time::timeout(DEALLOCATE_TIMEOUT, allocation.deallocate()).await;
+    }
     result
 }
 
@@ -830,6 +843,7 @@ async fn run_allocated_session(
         session_cancel.clone(),
     ));
     let repair_generation = config.repair.restart_generation(config.id);
+    let rebind_epoch = crate::rebind::epoch();
     let (session_result, completed): (Result<()>, u8) = tokio::select! {
         biased;
         _ = runtime.cancel.cancelled() => {
@@ -838,6 +852,9 @@ async fn run_allocated_session(
                 .request_disconnect(&config.device_id, &config.salt)
                 .await;
             (Ok(()), 0)
+        }
+        _ = crate::rebind::requested(rebind_epoch) => {
+            (Err(anyhow!("NET_REBIND")), 0)
         }
         _ = crate::idle::parked(config.id) => {
             (Err(anyhow!("IDLE_PARK")), 0)

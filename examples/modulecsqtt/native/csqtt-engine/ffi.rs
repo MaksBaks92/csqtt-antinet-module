@@ -287,6 +287,14 @@ pub extern "C" fn csqtt_engine_nudge() {
     crate::wake::signal(std::time::Duration::ZERO, "host");
 }
 
+/// Soft handover: the network changed (Wi-Fi ↔ cellular). Every session is torn down and
+/// re-allocated on the current network with the cached credentials; the engine, the VK
+/// credentials and the dispatcher flow table stay. Much cheaper than stop/start.
+#[unsafe(no_mangle)]
+pub extern "C" fn csqtt_engine_rebind() {
+    crate::rebind::request("host");
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn csqtt_engine_set_packet_out(cb: Option<packet_bridge::PacketOutCb>) {
     packet_bridge::set_packet_out(cb);

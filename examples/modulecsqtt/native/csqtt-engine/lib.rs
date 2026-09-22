@@ -23,6 +23,7 @@ mod packet_bridge;
 mod profiles;
 mod protect;
 mod protocol;
+mod rebind;
 mod repair;
 #[path = "shared/selective_fec.rs"]
 mod selective_fec;
@@ -353,6 +354,8 @@ pub async fn run(arguments: Arguments) -> Result<()> {
         );
     }
     let idle_task = tokio::spawn(idle::monitor(idle_config, stats.clone(), cancel.clone()));
+    // Black-hole detector: uplink without downlink for a few seconds → probe every path now.
+    let stall_task = tokio::spawn(rebind::stall_monitor(stats.clone(), cancel.clone()));
     let (config_tx, mut config_rx) = tokio::sync::mpsc::channel::<String>(32);
     let config_events = events.clone();
     let config_task = tokio::spawn(async move {
@@ -441,12 +444,14 @@ pub async fn run(arguments: Arguments) -> Result<()> {
     stats_task.abort();
     wake_task.abort();
     idle_task.abort();
+    stall_task.abort();
     config_task.abort();
     control_task.abort();
     parent_task.abort();
     let _ = stats_task.await;
     let _ = wake_task.await;
     let _ = idle_task.await;
+    let _ = stall_task.await;
     let _ = config_task.await;
     let _ = control_task.await;
     let _ = parent_task.await;

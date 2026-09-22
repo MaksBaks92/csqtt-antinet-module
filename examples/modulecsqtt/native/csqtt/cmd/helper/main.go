@@ -662,6 +662,11 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	probeHost := networkProbeHost(link.peerAddr())
 	guard.probeFn = func() bool { return probeNetwork(resolver, probeHost) }
 	startWakeMonitor(context.Background(), guard.onWake)
+	// Own Wi-Fi ↔ cellular detector (netwatch.go): does not depend on the host's `handover`.
+	startNetChangeMonitor(context.Background(), protectPath, link.peerAddr(), resolver, func(from, to string) {
+		emitLog("CSQTT: сменился адрес сети %s → %s", from, to)
+		guard.onHandover("netchange")
+	})
 
 	setHostEventHandler(func(event string) {
 		// dns=<…> забирает канон hostproto→rememberHostDNSServers (подписка newProtectedResolver).

@@ -22,6 +22,7 @@ static void (*fn_stop)(void);
 static void (*fn_set_paused)(int32_t);
 static int32_t (*fn_active_paths)(void);
 static void (*fn_nudge)(void);
+static void (*fn_rebind)(void);
 static void (*fn_set_packet_out)(void *);
 static int32_t (*fn_inject_packet)(const uint8_t *, int32_t);
 
@@ -43,6 +44,7 @@ static int csqtt_load(const char *path) {
 	fn_set_paused = (void (*)(int32_t))dlsym(eng, "csqtt_engine_set_paused");
 	fn_active_paths = (int32_t (*)(void))dlsym(eng, "csqtt_engine_active_paths");
 	fn_nudge = (void (*)(void))dlsym(eng, "csqtt_engine_nudge");
+	fn_rebind = (void (*)(void))dlsym(eng, "csqtt_engine_rebind");
 	fn_set_packet_out = (void (*)(void *))dlsym(eng, "csqtt_engine_set_packet_out");
 	fn_inject_packet = (int32_t (*)(const uint8_t *, int32_t))dlsym(eng, "csqtt_engine_inject_packet");
 	if (!fn_start || !fn_wait_ready || !fn_packet_port || !fn_tun_ip || !fn_stop) {
@@ -74,6 +76,7 @@ static void csqtt_stop(void) { if (fn_stop) fn_stop(); }
 static void csqtt_set_paused(int32_t v) { if (fn_set_paused) fn_set_paused(v); }
 static int32_t csqtt_active_paths(void) { return fn_active_paths ? fn_active_paths() : -1; }
 static void csqtt_nudge(void) { if (fn_nudge) fn_nudge(); }
+static int32_t csqtt_rebind(void) { if (!fn_rebind) return -1; fn_rebind(); return 0; }
 static int32_t csqtt_inject(const uint8_t *d, int32_t n) {
 	return fn_inject_packet ? fn_inject_packet((uint8_t *)d, n) : -1;
 }
@@ -223,6 +226,11 @@ func engineActivePaths() int { return int(C.csqtt_active_paths()) }
 
 // engineNudge — re-validate every TURN path now (wake / stall).
 func engineNudge() { C.csqtt_nudge() }
+
+// engineRebind — soft handover: re-allocate every TURN path on the current network with the
+// cached credentials, engine stays up. false → the loaded engine predates the symbol; caller
+// falls back to a full recycle.
+func engineRebind() bool { return C.csqtt_rebind() == 0 }
 
 func findEngineLib(name string, extra ...string) (string, error) {
 	var dirs []string

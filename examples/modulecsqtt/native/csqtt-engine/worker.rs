@@ -782,13 +782,28 @@ async fn worker_loop(
             let lower = message.to_ascii_lowercase();
             let tcp_stream_reset = context.params.turn_transport == TurnTransportMode::TcpTls
                 && is_remote_tcp_stream_reset(error, &lower);
-            if context.params.turn_transport == TurnTransportMode::TcpTls && !tcp_stream_reset {
+            if context.params.turn_transport == TurnTransportMode::TcpTls
+                && !tcp_stream_reset
+                && !lower.contains("net_rebind")
+            {
                 let phase = if was_ready {
                     "активная аллокация завершилась"
                 } else {
                     "создание аллокации завершилось"
                 };
                 crate::log_error!("[TURN][TCP] {phase}: {error:#}");
+            }
+            if lower.contains("net_rebind") {
+                // Soft handover (rebind.rs): credentials are fine, only the network moved.
+                // Re-allocate right away over a fresh socket; the start pacer spreads the
+                // group so this is not an Allocate storm. One global log in rebind::request.
+                attempt = 0;
+                delay = Duration::from_millis(20 + rand::random::<u64>() % 80);
+                tokio::select! {
+                    _ = context.cancel.cancelled() => return,
+                    _ = tokio::time::sleep(delay) => {}
+                }
+                continue;
             }
             if lower.contains("target_repair") {
                 attempt = 0;

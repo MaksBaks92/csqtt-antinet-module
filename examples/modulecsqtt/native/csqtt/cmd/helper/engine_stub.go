@@ -27,3 +27,4 @@ func engineStop()                         {}
 func engineSetPaused(paused bool)         { _ = paused }
 func engineActivePaths() int              { return -1 }
 func engineNudge()                        {}
+func engineRebind() bool                  { return false }
