@@ -25,3 +25,5 @@ func engineTunIP() string                 { return "" }
 func engineTunDNS() string                { return "" }
 func engineStop()                         {}
 func engineSetPaused(paused bool)         { _ = paused }
+func engineActivePaths() int              { return -1 }
+func engineNudge()                        {}

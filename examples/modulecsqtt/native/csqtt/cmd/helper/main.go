@@ -648,6 +648,11 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	log.Printf("csqtt helper: SOCKS5 on 127.0.0.1:%d tun=%s dns=%s bridge=in-process", actualPort, tunIP, engineTunDNS())
 
 	guard := newDataPathGuard(string(engineCfg), readyWaitBudget, 0, tunIP.String())
+	// Offline self-probe (paused watchdog / wake while paused): one protected DNS round trip
+	// to a name we need anyway. Fails fast without a route, proves reachability with one.
+	probeHost := networkProbeHost(link.peerAddr())
+	guard.probeFn = func() bool { return probeNetwork(resolver, probeHost) }
+	startWakeMonitor(context.Background(), guard.onWake)
 
 	setHostEventHandler(func(event string) {
 		// dns=<…> забирает канон hostproto→rememberHostDNSServers (подписка newProtectedResolver).
@@ -665,6 +670,35 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 		handleConn(c, user, pass, tun, resolver, udpT, dialTimeout, guard)
 	})
 	return 0
+}
+
+// networkProbeHost — a hostname whose resolution proves "network usable": the peer host from the
+// link, or a VK API name (needed by the engine anyway) when the peer is an IP literal.
+func networkProbeHost(peerAddr string) string {
+	host := strings.TrimSpace(peerAddr)
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	if host == "" || net.ParseIP(host) != nil {
+		return "api.vk.com"
+	}
+	return host
+}
+
+// probeNetwork — one UNCACHED protected DNS round trip. LookupHost's cache expiry is a
+// monotonic deadline that does not advance while the phone sleeps, so a cached answer right
+// after a wake proves nothing about the network; queryAll always goes to the wire.
+func probeNetwork(r *protectedResolver, host string) bool {
+	if r == nil {
+		return false
+	}
+	if len(r.currentServers()) == 0 {
+		// System-resolver path is uncached already.
+		_, err := r.LookupHost(host)
+		return err == nil
+	}
+	ips, err := r.queryAll(host)
+	return err == nil && len(ips) > 0
 }
 
 type csqttUDPTransport struct {
@@ -743,6 +777,9 @@ func handleConn(c net.Conn, user, pass string, tun *tunnel.IPTunnel, resolver *p
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	// After a wake / handover the workers may still be reconnecting: hold the CONNECT for a
+	// few seconds instead of sending the SYN into a tunnel with zero TURN paths.
+	guard.waitForPath(ctx)
 	up, err := tun.DialTCP(ctx, ip, req.Port)
 	cancel()
 	if guard != nil {

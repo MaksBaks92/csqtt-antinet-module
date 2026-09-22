@@ -496,12 +496,14 @@ impl Drop for WorkerRegistration {
 impl ActiveConnection {
     fn new(stats: Arc<Stats>, events: Events) -> Self {
         stats.active_connections.fetch_add(1, Ordering::Relaxed);
+        crate::stats::ACTIVE_PATHS.fetch_add(1, Ordering::Relaxed);
         Self { stats, events }
     }
 }
 
 impl Drop for ActiveConnection {
     fn drop(&mut self) {
+        crate::stats::ACTIVE_PATHS.fetch_sub(1, Ordering::AcqRel);
         if self.stats.active_connections.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.events.active_zero();
         }

@@ -265,6 +265,19 @@ pub extern "C" fn csqtt_engine_set_paused(paused: i32) {
     }
 }
 
+/// Number of READY TURN worker sessions right now (0 while reconnecting after sleep).
+#[unsafe(no_mangle)]
+pub extern "C" fn csqtt_engine_active_paths() -> i32 {
+    crate::stats::ACTIVE_PATHS.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Ask every TURN session to re-validate its path immediately (host detected a wake / stall).
+/// The engine also detects suspend on its own (`wake.rs`); this is the explicit trigger.
+#[unsafe(no_mangle)]
+pub extern "C" fn csqtt_engine_nudge() {
+    crate::wake::signal(std::time::Duration::ZERO, "host");
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn csqtt_engine_set_packet_out(cb: Option<packet_bridge::PacketOutCb>) {
     packet_bridge::set_packet_out(cb);

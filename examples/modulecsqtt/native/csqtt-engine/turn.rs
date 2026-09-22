@@ -20,7 +20,7 @@ use crate::{
     turn_stream::{
         self, TurnStreamFrame, TurnStreamReader, TurnStreamWriteFailure, TurnStreamWriter,
     },
-    udp_batch,
+    udp_batch, wake,
 };
 use anyhow::{Context, Result, bail};
 use socket2::SockRef;
@@ -747,7 +747,11 @@ async fn driver_loop_udp(common: DriverCommon, socket: Arc<UdpSocket>) {
     // It is always cleared before an idle readiness wait.
     let mut receive_batch = Vec::with_capacity(udp_batch::MAX_DATAGRAMS);
     let mut receive_batch_limit = udp_batch::MIN_DATAGRAMS;
+    let mut wake_epoch = wake::epoch();
     loop {
+        if observe_wake(&core, &mut wake_epoch) {
+            pump_needed = true;
+        }
         if shared.closing.load(Ordering::Acquire) {
             if !shared.control_sent.load(Ordering::Acquire) {
                 break;
@@ -811,6 +815,7 @@ async fn driver_loop_udp(common: DriverCommon, socket: Arc<UdpSocket>) {
             let event = tokio::select! {
                 biased;
                 _ = shared.wake.notified() => DriverEvent::Wake,
+                _ = wake::notified() => DriverEvent::Wake,
                 _ = tokio::time::sleep(wait) => DriverEvent::Timer,
                 result = socket.recv(&mut deficit_buffer) => DriverEvent::Packet(result),
             };
@@ -947,6 +952,7 @@ async fn driver_loop_udp(common: DriverCommon, socket: Arc<UdpSocket>) {
             let event = tokio::select! {
                 biased;
                 _ = shared.wake.notified() => DriverEvent::Wake,
+                _ = wake::notified() => DriverEvent::Wake,
                 _ = tokio::time::sleep(wait) => DriverEvent::Timer,
                 _ = incoming.closed() => DriverEvent::OwnerClosed,
                 result = socket.readable() => DriverEvent::Readable(result),
@@ -990,7 +996,11 @@ async fn driver_loop_stream(
     let mut shutdown_requested = false;
     let mut native_deadline = Instant::now();
     let mut pump_needed = true;
+    let mut wake_epoch = wake::epoch();
     loop {
+        if observe_wake(&core, &mut wake_epoch) {
+            pump_needed = true;
+        }
         if shared.closing.load(Ordering::Acquire) {
             if !shared.control_sent.load(Ordering::Acquire) {
                 break;
@@ -1045,6 +1055,7 @@ async fn driver_loop_stream(
         let event = tokio::select! {
             biased;
             _ = shared.wake.notified() => StreamDriverEvent::Wake,
+            _ = wake::notified() => StreamDriverEvent::Wake,
             _ = tokio::time::sleep(wait) => StreamDriverEvent::Timer,
             _ = incoming.closed() => StreamDriverEvent::OwnerClosed,
             changed = write_failure.changed() => StreamDriverEvent::WriteFailure(changed),
@@ -1103,6 +1114,18 @@ enum DriverEvent {
     OwnerClosed,
     Packet(std::io::Result<usize>),
     Readable(std::io::Result<()>),
+}
+
+/// Suspend/resume hook (see `wake.rs`): when the global wake epoch moved since this driver last
+/// looked, re-validate the allocation now. Returns true if native state needs a pump.
+fn observe_wake(core: &NativeCore, seen_epoch: &mut u64) -> bool {
+    let current = wake::epoch();
+    if current == *seen_epoch {
+        return false;
+    }
+    *seen_epoch = current;
+    core.resync_after_suspend(wake::last_gap());
+    true
 }
 
 enum StreamDriverEvent {

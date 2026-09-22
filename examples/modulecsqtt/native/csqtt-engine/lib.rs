@@ -37,6 +37,7 @@ mod turn_endpoint;
 mod turn_stream;
 mod udp_batch;
 mod vk_js_calls;
+mod wake;
 #[path = "shared/wire_protocol.rs"]
 mod wire_protocol;
 mod worker;
@@ -265,6 +266,7 @@ pub async fn run(arguments: Arguments) -> Result<()> {
         js_credential_broker,
     ));
     let stats = Arc::new(Stats::default());
+    crate::stats::ACTIVE_PATHS.store(0, std::sync::atomic::Ordering::Release);
     let paused = Arc::new(PauseGate::new());
     *ENGINE_PAUSE.lock().unwrap_or_else(|p| p.into_inner()) = Some(paused.clone());
     let finish_js_calls = Arc::new(AtomicBool::new(false));
@@ -328,6 +330,8 @@ pub async fn run(arguments: Arguments) -> Result<()> {
     );
     let repair = RepairState::new(workers);
     let stats_task = tokio::spawn(stats.clone().run(events.clone(), cancel.clone()));
+    // Suspend detector: monotonic clocks stop in deep sleep, TURN state does not (wake.rs).
+    let wake_task = tokio::spawn(wake::monitor(cancel.clone()));
     let (config_tx, mut config_rx) = tokio::sync::mpsc::channel::<String>(32);
     let config_events = events.clone();
     let config_task = tokio::spawn(async move {
@@ -414,10 +418,12 @@ pub async fn run(arguments: Arguments) -> Result<()> {
     }
     dispatcher.shutdown().await;
     stats_task.abort();
+    wake_task.abort();
     config_task.abort();
     control_task.abort();
     parent_task.abort();
     let _ = stats_task.await;
+    let _ = wake_task.await;
     let _ = config_task.await;
     let _ = control_task.await;
     let _ = parent_task.await;

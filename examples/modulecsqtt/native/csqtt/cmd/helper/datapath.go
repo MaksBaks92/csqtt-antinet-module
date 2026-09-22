@@ -19,13 +19,31 @@ import (
 //
 // Doze / netlost: pause TURN workers + reject SOCKS (battery). Never recycle or fatal while
 // offline — defer heal until netback (energy-efficient hold).
+//
+// Sleep / wake: on Android the monotonic clock stops in deep sleep, so after a wake the engine
+// believes nothing happened while its TURN paths died. wake.go detects the suspend; onWake()
+// (a) asks the engine to re-validate every path now (engine does it on its own too, wake.rs),
+// (b) opens a grace window so dial-timeouts that started before the wake do not count towards a
+// recycle while the workers are already reconnecting, (c) if we were paused (netlost without a
+// netback yet) probes the network ourselves instead of waiting for the host forever.
+// waitForPath() holds a SOCKS CONNECT for a few seconds while active TURN paths == 0 so the
+// first requests after a wake succeed instead of burning the 20 s dial timeout.
 
 const (
 	dataPathDialFailThreshold = 3
 	dataPathRecycleMinGap     = 45 * time.Second
 	dataPathMaxRecycles       = 4
 	dataPathEngineSettle      = 800 * time.Millisecond
+	dataPathWakeGrace         = 30 * time.Second
+	dataPathPathWaitMax       = 8 * time.Second
+	dataPathPathWaitPoll      = 200 * time.Millisecond
 )
+
+// Offline self-probe schedule while paused (host may never deliver netback, e.g. after a
+// cold relaunch or when the module was not alive to receive it): cheap, sparse, capped.
+var dataPathPausedProbeDelays = []time.Duration{
+	30 * time.Second, time.Minute, 2 * time.Minute, 5 * time.Minute, 10 * time.Minute, 15 * time.Minute,
+}
 
 type dataPathGuard struct {
 	mu sync.Mutex
@@ -41,8 +59,10 @@ type dataPathGuard struct {
 	lastRecycle    time.Time
 	recycling      bool
 	paused         bool // netlost: do not burn dial budget / recycle
+	pauseGen       uint64
 	pendingRecycle bool // heal requested while paused → apply on netback
 	pendingReason  string
+	graceUntil     time.Time // after wake: stale dial-timeouts are not evidence
 	exiting        bool
 
 	stopFn   func()
@@ -51,8 +71,12 @@ type dataPathGuard struct {
 	portFn   func() int
 	ipFn     func() string
 	pauseFn  func(bool) // engine PauseGate; optional in tests
+	activeFn func() int // engine READY TURN paths (-1 = unknown); optional
+	nudgeFn  func()     // engine re-validate paths now; optional
+	probeFn  func() bool // "is the network usable?" while paused; optional
 	exitFn   func(code int)
 	nowFn    func() time.Time
+	sleepFn  func(time.Duration)
 	logFn    func(format string, args ...any)
 	statusFn func(kind, detail string)
 }
@@ -68,8 +92,11 @@ func newDataPathGuard(cfgJSON string, readyWait time.Duration, pktPort int, tunI
 		portFn:      enginePacketPort,
 		ipFn:        engineTunIP,
 		pauseFn:     engineSetPaused,
+		activeFn:    engineActivePaths,
+		nudgeFn:     engineNudge,
 		exitFn:      os.Exit,
 		nowFn:       time.Now,
+		sleepFn:     time.Sleep,
 		logFn:       emitLog,
 		statusFn:    emitStatus,
 	}
@@ -150,6 +177,12 @@ func (g *dataPathGuard) noteDialResult(err error) {
 		g.mu.Unlock()
 		return
 	}
+	if !g.graceUntil.IsZero() && g.nowFn().Before(g.graceUntil) {
+		// Just woke up: this dial started while the phone was asleep. Workers are already
+		// re-validating / reconnecting — a recycle now would only race them.
+		g.mu.Unlock()
+		return
+	}
 	g.dialFails++
 	n := g.dialFails
 	g.mu.Unlock()
@@ -166,36 +199,157 @@ func (g *dataPathGuard) onHostEvent(event string) {
 	case "netlost":
 		g.mu.Lock()
 		g.paused = true
+		g.pauseGen++
+		gen := g.pauseGen
 		g.dialFails = 0
 		g.mu.Unlock()
 		g.applyEnginePause(true)
 		g.logFn("CSQTT: сеть пропала — пауза TURN/SOCKS (энергосбережение)")
+		go g.pausedWatchdog(gen)
 	case "netback":
-		g.mu.Lock()
-		g.paused = false
-		need := g.pendingRecycle
-		reason := g.pendingReason
-		if reason == "" {
-			reason = "netback"
-		}
-		g.pendingRecycle = false
-		g.pendingReason = ""
-		g.dialFails = 0
-		g.mu.Unlock()
-		g.applyEnginePause(false)
-		if need {
-			g.logFn("CSQTT: сеть вернулась — отложенный перезапуск data path (%s)", reason)
-			go g.requestRecycle(reason)
-		} else {
-			// Prefer soft resume: workers reconnect without VK re-auth storm.
-			g.logFn("CSQTT: сеть вернулась — RESUME воркеров (без recycle)")
-		}
+		g.resumeFromPause("netback")
 	case "stall":
+		// The host only probes connectivity when it has a network: if we are still paused
+		// the netback was lost — resume first, then heal.
+		g.resumeFromPause("stall")
 		g.logFn("CSQTT: stall от хоста — перезапускаю data path")
 		go g.requestRecycle("stall")
 	case "handover":
+		g.resumeFromPause("handover")
 		g.logFn("CSQTT: handover — перезапускаю data path (не ждём самовосстановления воркеров)")
 		go g.requestRecycle("handover")
+	}
+}
+
+// resumeFromPause — leave the netlost hold: RESUME workers, apply a deferred heal if one was
+// requested while offline. No-op when not paused. `source` names who proved the network is back;
+// for anything but "netback" the caller performs its own heal afterwards.
+func (g *dataPathGuard) resumeFromPause(source string) {
+	g.mu.Lock()
+	if !g.paused {
+		g.mu.Unlock()
+		return
+	}
+	g.paused = false
+	g.pauseGen++
+	need := g.pendingRecycle
+	reason := g.pendingReason
+	if reason == "" {
+		reason = source
+	}
+	g.pendingRecycle = false
+	g.pendingReason = ""
+	g.dialFails = 0
+	g.graceUntil = g.nowFn().Add(dataPathWakeGrace)
+	g.mu.Unlock()
+	g.applyEnginePause(false)
+	if source != "netback" {
+		g.logFn("CSQTT: сеть есть (%s), хотя netback не приходил — снимаю паузу", source)
+		return
+	}
+	if need {
+		g.logFn("CSQTT: сеть вернулась — отложенный перезапуск data path (%s)", reason)
+		go g.requestRecycle(reason)
+		return
+	}
+	// Prefer soft resume: workers reconnect without VK re-auth storm.
+	g.logFn("CSQTT: сеть вернулась — RESUME воркеров (без recycle)")
+	if g.nudgeFn != nil {
+		g.nudgeFn()
+	}
+}
+
+// pausedWatchdog — while paused, probe the network ourselves on a sparse backoff. The host is
+// supposed to send netback, but the module must not depend on it. Exits as soon as the pause
+// generation changes.
+func (g *dataPathGuard) pausedWatchdog(gen uint64) {
+	if g.probeFn == nil {
+		return
+	}
+	for i := 0; ; i++ {
+		delay := dataPathPausedProbeDelays[min(i, len(dataPathPausedProbeDelays)-1)]
+		g.sleepFn(delay)
+		g.mu.Lock()
+		stale := !g.paused || g.pauseGen != gen || g.exiting
+		g.mu.Unlock()
+		if stale {
+			return
+		}
+		if g.probeFn() {
+			g.probeSucceeded(gen, "probe")
+			return
+		}
+	}
+}
+
+// probeSucceeded — a self-probe proved the network is back while we are still paused:
+// resume and heal (deferred recycle if one was requested offline, otherwise a soft nudge).
+func (g *dataPathGuard) probeSucceeded(gen uint64, source string) {
+	g.mu.Lock()
+	if !g.paused || g.pauseGen != gen {
+		g.mu.Unlock()
+		return
+	}
+	need := g.pendingRecycle
+	reason := g.pendingReason
+	if reason == "" {
+		reason = source
+	}
+	g.mu.Unlock()
+	g.resumeFromPause(source)
+	if need {
+		go g.requestRecycle(reason)
+	} else if g.nudgeFn != nil {
+		g.nudgeFn()
+	}
+}
+
+// onWake — the process was suspended for `gap` (wake.go). Called from the monitor goroutine.
+func (g *dataPathGuard) onWake(gap time.Duration) {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	if g.exiting {
+		g.mu.Unlock()
+		return
+	}
+	g.graceUntil = g.nowFn().Add(dataPathWakeGrace)
+	g.dialFails = 0
+	paused := g.paused
+	gen := g.pauseGen
+	g.mu.Unlock()
+	if paused {
+		g.logFn("CSQTT: пробуждение после %s сна (пауза netlost) — проверяю сеть", gap.Round(time.Second))
+		if g.probeFn != nil && g.probeFn() {
+			g.probeSucceeded(gen, "wake")
+		}
+		return
+	}
+	g.logFn("CSQTT: пробуждение после %s сна — проверяю TURN-пути", gap.Round(time.Second))
+	if g.nudgeFn != nil {
+		g.nudgeFn()
+	}
+}
+
+// waitForPath — hold a CONNECT while the engine has zero READY TURN paths (reconnecting after
+// sleep / handover). Returns as soon as a path exists, ctx ends, or the cap elapses; the dial
+// itself is still bounded by ctx. Zero cost on the hot path: one atomic read via FFI.
+func (g *dataPathGuard) waitForPath(ctx context.Context) {
+	if g == nil || g.activeFn == nil || g.activeFn() != 0 {
+		return
+	}
+	deadline := g.nowFn().Add(dataPathPathWaitMax)
+	for g.nowFn().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		g.sleepFn(dataPathPathWaitPoll)
+		if g.activeFn() != 0 {
+			return
+		}
 	}
 }
 

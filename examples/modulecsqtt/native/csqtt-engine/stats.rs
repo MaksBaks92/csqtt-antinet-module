@@ -11,6 +11,11 @@ use std::sync::{
 };
 use tokio_util::sync::CancellationToken;
 
+/// Process-wide mirror of `Stats::active_connections` for the FFI (`csqtt_engine_active_paths`):
+/// the helper reads it before every SOCKS dial so it can hold a CONNECT for a few seconds while
+/// workers reconnect after sleep instead of burning the 20 s dial timeout.
+pub static ACTIVE_PATHS: AtomicI32 = AtomicI32::new(0);
+
 #[derive(Default)]
 pub struct Stats {
     pub total_bytes_up: AtomicI64,

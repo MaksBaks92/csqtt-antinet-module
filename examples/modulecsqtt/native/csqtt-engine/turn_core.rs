@@ -534,6 +534,35 @@ impl NativeCore {
         }))
     }
 
+    /// After a CPU suspend the monotonic deadlines above did not advance while the relay, the
+    /// NAT mapping and the server aged by `gap` (see `wake.rs`). Re-validate the path *now*:
+    /// an immediate Refresh is a request/response through the NAT, so a dead mapping shows up
+    /// as RTO exhaustion (~8 s) instead of waiting for the next 300 s refresh; if the gap already
+    /// exceeds the allocation lifetime the server has certainly dropped it — fail fast and let
+    /// the worker reconnect. `gap == 0` (explicit host nudge) just triggers the probe.
+    /// Returns true if the allocation was torn down.
+    pub(crate) fn resync_after_suspend(&self, gap: Duration) -> bool {
+        let now = Instant::now();
+        let mut inner = self.lock();
+        if inner.destroyed || inner.shutting_down || inner.state != STATE_READY {
+            return false;
+        }
+        if let Some(expires) = inner.allocation_expires_at {
+            let adjusted = expires.checked_sub(gap);
+            match adjusted {
+                Some(deadline) if deadline > now => inner.allocation_expires_at = Some(deadline),
+                _ => {
+                    inner.destroy_allocation(Operation::Refresh, RESULT_TIMEOUT, 0);
+                    return true;
+                }
+            }
+        }
+        inner.allocation_refresh = Some(now);
+        inner.maintenance_refresh = Some(now);
+        inner.keepalive = Some(now);
+        false
+    }
+
     pub(crate) fn pull_control(
         &self,
         buffer: &mut [u8; 1024],
@@ -1586,6 +1615,60 @@ mod tests {
         let mut wire = [0u8; 1024];
         let (length, _) = core.pull_control(&mut wire).unwrap().unwrap();
         assert_eq!(&wire[..length], &[0x40, 0, 0, 1, 0xff, 0, 0, 0]);
+    }
+
+    #[test]
+    fn resync_after_short_suspend_probes_with_immediate_refresh() {
+        let (core, key) = ready_core_with_lifetime(600);
+        bind_ready_channel(&core, &key);
+        while core.pull_event().unwrap().is_some() {}
+
+        assert!(!core.resync_after_suspend(Duration::from_secs(90)));
+        {
+            let inner = core.lock();
+            assert_eq!(inner.state, STATE_READY);
+            let now = Instant::now();
+            assert!(inner.allocation_refresh.unwrap() <= now);
+            assert!(inner.maintenance_refresh.unwrap() <= now);
+            assert!(inner.keepalive.unwrap() <= now);
+            // Server-side expiry is rebased by the slept duration.
+            let remaining = inner.allocation_expires_at.unwrap() - now;
+            assert!(remaining <= Duration::from_secs(510));
+            assert!(remaining >= Duration::from_secs(505));
+        }
+        // The very next poll must put a Refresh request on the wire (request/response probe).
+        core.poll().unwrap();
+        let mut wire = [0u8; 1024];
+        let (length, _) = core.pull_control(&mut wire).unwrap().unwrap();
+        let message = Message::decode(&wire[..length]).unwrap();
+        assert_eq!(message.method(), METHOD_REFRESH as u16);
+        assert_eq!(message.class(), Class::Request);
+    }
+
+    #[test]
+    fn resync_after_suspend_longer_than_lifetime_fails_fast() {
+        let (core, key) = ready_core_with_lifetime(600);
+        bind_ready_channel(&core, &key);
+        while core.pull_event().unwrap().is_some() {}
+
+        assert!(core.resync_after_suspend(Duration::from_secs(700)));
+        let inner = core.lock();
+        assert_eq!(inner.state, STATE_DESTROYING);
+        assert!(inner.allocation_expires_at.is_none());
+        assert!(inner.allocation_refresh.is_none());
+    }
+
+    #[test]
+    fn resync_is_a_no_op_before_ready() {
+        let core = NativeCore::create(
+            "127.0.0.1:3478".parse().unwrap(),
+            "user",
+            "pass",
+            "127.0.0.1:9000".parse().unwrap(),
+        )
+        .unwrap();
+        assert!(!core.resync_after_suspend(Duration::from_secs(900)));
+        assert!(core.lock().allocation_refresh.is_none());
     }
 
     #[test]

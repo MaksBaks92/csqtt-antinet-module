@@ -4,12 +4,13 @@
 use anyhow::{Context, Result, bail};
 use primp::dns::{Addrs, Name, Resolve, Resolving};
 use std::{
+    collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{net::UdpSocket, time::timeout};
 
@@ -20,11 +21,45 @@ const YANDEX_DNS_SERVERS: [SocketAddr; 2] = [
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const DNS_A_RECORD: u16 = 1;
 const DNS_AAAA_RECORD: u16 = 28;
+/// Fresh answers are reused without a query; older ones only as a fallback when the query
+/// fails — right after a wake the resolvers are often unreachable for a few seconds while the
+/// TURN relay IP has not changed. Relay/peer records are stable for hours.
+const DNS_CACHE_FRESH: Duration = Duration::from_secs(60);
+const DNS_CACHE_STALE_MAX: Duration = Duration::from_secs(6 * 60 * 60);
 static TUNNEL_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 enum YandexDnsError {
     TimedOut,
     Failed(anyhow::Error),
+}
+
+struct CacheEntry {
+    addresses: Vec<IpAddr>,
+    resolved_at: Instant,
+}
+
+fn cache() -> &'static Mutex<HashMap<String, CacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached(host: &str, max_age: Duration) -> Option<Vec<IpAddr>> {
+    let guard = cache().lock().unwrap_or_else(|p| p.into_inner());
+    guard
+        .get(host)
+        .filter(|entry| entry.resolved_at.elapsed() <= max_age)
+        .map(|entry| entry.addresses.clone())
+}
+
+fn remember(host: &str, addresses: &[IpAddr]) {
+    let mut guard = cache().lock().unwrap_or_else(|p| p.into_inner());
+    guard.insert(
+        host.to_string(),
+        CacheEntry {
+            addresses: addresses.to_vec(),
+            resolved_at: Instant::now(),
+        },
+    );
 }
 
 pub struct DnsResolver;
@@ -34,7 +69,27 @@ impl DnsResolver {
         if let Ok(address) = host.parse::<IpAddr>() {
             return Ok(vec![address]);
         }
+        if let Some(addresses) = cached(host, DNS_CACHE_FRESH) {
+            return Ok(addresses);
+        }
+        match self.lookup_uncached(host).await {
+            Ok(addresses) => {
+                remember(host, &addresses);
+                Ok(addresses)
+            }
+            Err(error) => match cached(host, DNS_CACHE_STALE_MAX) {
+                Some(addresses) => {
+                    crate::log_error!(
+                        "[DNS] {host}: резолв не удался ({error:#}) — использую прошлый ответ {addresses:?}"
+                    );
+                    Ok(addresses)
+                }
+                None => Err(error),
+            },
+        }
+    }
 
+    async fn lookup_uncached(&self, host: &str) -> Result<Vec<IpAddr>> {
         match yandex_lookup(host).await {
             Ok(addresses) if !addresses.is_empty() => Ok(addresses),
             Ok(_) => bail!("пустой DNS-ответ Yandex для {host}"),
@@ -338,6 +393,23 @@ mod tests {
     fn query_rejects_invalid_dns_name() {
         assert!(build_query("", 1, DNS_A_RECORD).is_err());
         assert!(build_query("a..vk.ru", 1, DNS_A_RECORD).is_err());
+    }
+
+    #[test]
+    fn cache_serves_fresh_and_stale_but_not_expired() {
+        let host = "cache-test.example.invalid";
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3));
+        assert!(cached(host, DNS_CACHE_FRESH).is_none());
+        remember(host, &[ip]);
+        assert_eq!(cached(host, DNS_CACHE_FRESH), Some(vec![ip]));
+        // Age the entry past "fresh": it must still be available as a stale fallback.
+        {
+            let mut guard = cache().lock().unwrap();
+            guard.get_mut(host).unwrap().resolved_at =
+                Instant::now() - DNS_CACHE_FRESH - Duration::from_secs(1);
+        }
+        assert!(cached(host, DNS_CACHE_FRESH).is_none());
+        assert_eq!(cached(host, DNS_CACHE_STALE_MAX), Some(vec![ip]));
     }
 
     #[tokio::test]
