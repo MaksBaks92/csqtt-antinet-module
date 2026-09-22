@@ -216,16 +216,34 @@ func engineInjectPackets(pkts [][]byte) error {
 		}
 		return nil
 	}
-	ptrs := make([]*C.uint8_t, len(pkts))
-	lens := make([]C.int32_t, len(pkts))
-	for i, pkt := range pkts {
+	n := 0
+	for _, pkt := range pkts {
+		if len(pkt) > 0 {
+			n++
+		}
+	}
+	if n == 0 {
+		return nil
+	}
+	ptrs := make([]*C.uint8_t, n)
+	lens := make([]C.int32_t, n)
+	// cgo rejects a Go pointer to an unpinned Go pointer. The batch table
+	// holds pointers into packet bytes, so both the table and each buffer
+	// stay pinned until Rust has copied them.
+	var pin runtime.Pinner
+	defer pin.Unpin()
+	i := 0
+	for _, pkt := range pkts {
 		if len(pkt) == 0 {
 			continue
 		}
+		pin.Pin(&pkt[0])
 		ptrs[i] = (*C.uint8_t)(unsafe.Pointer(&pkt[0]))
 		lens[i] = C.int32_t(len(pkt))
+		i++
 	}
-	rc := C.csqtt_inject_batch((**C.uint8_t)(unsafe.Pointer(&ptrs[0])), &lens[0], C.int32_t(len(pkts)))
+	pin.Pin(&ptrs[0])
+	rc := C.csqtt_inject_batch((**C.uint8_t)(unsafe.Pointer(&ptrs[0])), &lens[0], C.int32_t(n))
 	if rc != 0 {
 		return fmt.Errorf("inject_batch: %d", int32(rc))
 	}
