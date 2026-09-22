@@ -159,6 +159,28 @@ impl PauseGate {
             }
         }
     }
+
+    /// Pause (netlost) *and* idle parking (`crate::idle`) both hold a worker back.
+    fn allows(&self, worker_id: usize) -> bool {
+        !self.is_paused() && crate::idle::allows(worker_id)
+    }
+
+    /// Like `wait_until_resumed`, additionally waits while `worker_id` is parked by idle mode.
+    async fn wait_until_allowed(&self, worker_id: usize, cancel: &CancellationToken) -> bool {
+        loop {
+            let resumed = self.changed.notified();
+            let unparked = crate::idle::notified();
+            if self.allows(worker_id) {
+                return true;
+            }
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return false,
+                _ = resumed => {},
+                _ = unparked => {},
+            }
+        }
+    }
 }
 
 pub struct WorkerStartPacer {
@@ -619,7 +641,7 @@ async fn worker_loop(
 ) {
     let mut attempt = 0usize;
     loop {
-        if !context.paused.wait_until_resumed(&context.cancel).await {
+        if !context.paused.wait_until_allowed(id, &context.cancel).await {
             return;
         }
         let credential_lease = loop {
@@ -637,7 +659,7 @@ async fn worker_loop(
             group_creds.release_allocation(&credential_lease).await;
             return;
         }
-        if !context.paused.wait_until_resumed(&context.cancel).await {
+        if !context.paused.wait_until_allowed(id, &context.cancel).await {
             group_creds.release_allocation(&credential_lease).await;
             return;
         }
@@ -738,7 +760,20 @@ async fn worker_loop(
         if context.cancel.is_cancelled() || group_creds.is_unavailable() {
             return;
         }
-        if context.paused.is_paused() {
+        if result
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("IDLE_PARK"))
+        {
+            // Parked by idle mode: not a failure. Hand the credential slot back so the
+            // cohort counter does not drift towards a needless VK re-fetch on unpark,
+            // then block at the top of the loop until traffic brings this id back.
+            if allocation_started {
+                group_creds.release_allocation(&credential_lease).await;
+            }
+            attempt = 0;
+            continue;
+        }
+        if !context.paused.allows(id) {
             continue;
         }
         let mut delay = worker_retry_delay(attempt.max(1));

@@ -839,6 +839,9 @@ async fn run_allocated_session(
                 .await;
             (Ok(()), 0)
         }
+        _ = crate::idle::parked(config.id) => {
+            (Err(anyhow!("IDLE_PARK")), 0)
+        }
         _ = config.repair.changed(config.id, repair_generation) => {
             (Err(anyhow!("TARGET_REPAIR")), 0)
         }
@@ -1138,7 +1141,13 @@ async fn reader_loop(
             events.panel_restart();
             continue;
         }
-        if let Some(command) = parse_stream_repair(packet.as_slice()) {
+        if let Some(mut command) = parse_stream_repair(packet.as_slice()) {
+            // Workers parked by idle mode are missing on purpose; restarting them here
+            // would defeat the scale-down and escalate credentials for nothing. They
+            // reconnect (with a fresh sequence) as soon as traffic unparks them.
+            command
+                .worker_ids
+                .retain(|id| crate::idle::allows(usize::from(*id)));
             let result = repair.apply_repair(&command);
             if result.restarts != 0 {
                 crate::log_error!(

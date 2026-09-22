@@ -78,6 +78,8 @@ pub fn inject_packet(data: &[u8]) -> i32 {
     if bridge.cancel.is_cancelled() {
         return -1;
     }
+    // Idle scale-down exit trigger; a single atomic load unless we are actually idle.
+    crate::idle::note_uplink(data);
     let Some(mut packet) = bridge.pool.try_acquire() else {
         return -2;
     };

@@ -7,7 +7,7 @@
   "description": "L3-туннель CSQTT (TURN/RTP поверх VK Calls): SOCKS5 → gVisor → rust-движок. Режим кредов (TURN): Авто / Авто ВК / Капча. Режим хешей: Ручной / Авто API / Авто ВК. Вход в VK — webview AntiNet.",
   "homepage": "https://github.com/MaxPain99/csqtt-antinet-module",
   "updateUrl": "https://raw.githubusercontent.com/MaxPain99/csqtt-antinet-module/main/antinet-module.json",
-  "version": "1.2.51",
+  "version": "1.2.52",
   "license": "PolyForm-Noncommercial-1.0.0",
   "handoverMode": "signal",
   "hostEvents": ["handover", "netlost", "netback", "stall", "dns"],
@@ -34,6 +34,24 @@
       "min": 3,
       "max": 126,
       "description": "Сколько параллельных TURN-путей держать. Больше — запас по обрывам, выше нагрузка на VK/TURN."
+    },
+    {
+      "key": "idleWorkers",
+      "type": "int",
+      "label": "Воркеров в простое",
+      "default": 2,
+      "min": 0,
+      "max": 126,
+      "description": "Сколько TURN-путей оставить, когда телефон ничего не отправляет (сон, экран выключен). Остальные паркуются и поднимаются мгновенно при всплеске трафика. Дежурные держат туннель служебными пакетами TURN (keepalive каждые 10 с) — трафик не нужен. 0 — выключить режим простоя."
+    },
+    {
+      "key": "idleAfterSec",
+      "type": "int",
+      "label": "Простой через (сек)",
+      "default": 180,
+      "min": 30,
+      "max": 3600,
+      "description": "Сколько секунд без исходящего трафика ждать, прежде чем оставить только дежурные воркеры."
     },
     {
       "key": "vkAuthMode",

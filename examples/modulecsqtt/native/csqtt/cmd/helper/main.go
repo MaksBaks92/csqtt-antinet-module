@@ -542,6 +542,9 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	default:
 		turnTransport = "udp"
 	}
+	// Idle scale-down (engine idle.rs): keepers held while uplink is quiet, rest parked.
+	// Missing setting → engine default (2 / 180 s); explicit 0 workers → off.
+	idleWorkers, idleAfterSec := idleSettings(cfg, workers)
 
 	search := []string{profileDir}
 	if profileDir != "" {
@@ -575,6 +578,12 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 		"turn_transport": turnTransport,
 		"fingerprint":    "firefox",
 		"packet_bridge":  true,
+	}
+	if idleWorkers >= 0 {
+		engineJSON["idle_workers"] = idleWorkers
+	}
+	if idleAfterSec > 0 {
+		engineJSON["idle_after_secs"] = idleAfterSec
 	}
 	if proxyURL != "" {
 		engineJSON["http_proxy"] = proxyURL
@@ -735,6 +744,26 @@ func (t csqttUDPTransport) DialUDPTarget(dst netip.AddrPort) (net.Conn, error) {
 		return &dnsAAAAFilterConn{Conn: c}, nil
 	}
 	return c, nil
+}
+
+// idleSettings maps SETTING_idleWorkers / SETTING_idleAfterSec to engine values.
+// workers = -1 means "not set, let the engine decide"; afterSec = 0 likewise.
+// The keeper count is clamped to the configured worker total so a stale setting
+// can never ask to keep more paths than exist.
+func idleSettings(cfg map[string]string, workers int) (idleWorkers, afterSec int) {
+	idleWorkers = -1
+	if raw := strings.TrimSpace(cfg["SETTING_idleWorkers"]); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v >= 0 {
+			idleWorkers = v
+			if workers > 0 && idleWorkers > workers {
+				idleWorkers = workers
+			}
+		}
+	}
+	if v, err := strconv.Atoi(strings.TrimSpace(cfg["SETTING_idleAfterSec"])); err == nil && v > 0 {
+		afterSec = v
+	}
+	return idleWorkers, afterSec
 }
 
 func settingDuration(cfg map[string]string, key string, defSec int) time.Duration {

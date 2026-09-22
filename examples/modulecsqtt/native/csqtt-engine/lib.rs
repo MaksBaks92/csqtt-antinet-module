@@ -14,6 +14,7 @@ mod events;
 mod ffi;
 #[path = "shared/flow_frame.rs"]
 mod flow_frame;
+mod idle;
 mod logging;
 mod namegen;
 mod obfs;
@@ -142,6 +143,12 @@ pub struct Arguments {
     validate_vk_hashes: bool,
     #[arg(long, default_value = "")]
     http_proxy: String,
+    /// Idle scale-down: keep this many TURN workers while there is no uplink (0 = off).
+    #[arg(long, default_value_t = idle::DEFAULT_KEEP)]
+    idle_workers: usize,
+    /// Seconds without uplink before parking the rest of the workers.
+    #[arg(long, default_value_t = idle::DEFAULT_AFTER.as_secs())]
+    idle_after_secs: u64,
 }
 
 pub fn cli_main() {
@@ -332,6 +339,20 @@ pub async fn run(arguments: Arguments) -> Result<()> {
     let stats_task = tokio::spawn(stats.clone().run(events.clone(), cancel.clone()));
     // Suspend detector: monotonic clocks stop in deep sleep, TURN state does not (wake.rs).
     let wake_task = tokio::spawn(wake::monitor(cancel.clone()));
+    // Idle scale-down: park all but `idle_workers` paths when uplink goes quiet (idle.rs).
+    idle::reset(workers);
+    let idle_config = idle::IdleConfig {
+        keep: arguments.idle_workers,
+        after: Duration::from_secs(arguments.idle_after_secs.max(30)),
+    };
+    if idle_config.keep > 0 && idle_config.keep < workers {
+        crate::log_error!(
+            "[IDLE] Режим простоя: без трафика {}с оставляю {} из {workers} воркеров",
+            idle_config.after.as_secs(),
+            idle_config.keep
+        );
+    }
+    let idle_task = tokio::spawn(idle::monitor(idle_config, stats.clone(), cancel.clone()));
     let (config_tx, mut config_rx) = tokio::sync::mpsc::channel::<String>(32);
     let config_events = events.clone();
     let config_task = tokio::spawn(async move {
@@ -419,11 +440,13 @@ pub async fn run(arguments: Arguments) -> Result<()> {
     dispatcher.shutdown().await;
     stats_task.abort();
     wake_task.abort();
+    idle_task.abort();
     config_task.abort();
     control_task.abort();
     parent_task.abort();
     let _ = stats_task.await;
     let _ = wake_task.await;
+    let _ = idle_task.await;
     let _ = config_task.await;
     let _ = control_task.await;
     let _ = parent_task.await;

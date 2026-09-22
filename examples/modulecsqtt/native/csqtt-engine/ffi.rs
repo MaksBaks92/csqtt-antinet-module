@@ -50,6 +50,11 @@ struct EngineJson {
     http_proxy: String,
     #[serde(default)]
     packet_bridge: bool,
+    /// Idle scale-down (idle.rs). Absent → engine defaults; 0 workers → off.
+    #[serde(default)]
+    idle_workers: Option<usize>,
+    #[serde(default)]
+    idle_after_secs: Option<u64>,
 }
 
 fn arguments_from_json(raw: &str) -> Result<Arguments, String> {
@@ -121,6 +126,10 @@ fn arguments_from_json(raw: &str) -> Result<Arguments, String> {
         packet_bridge: cfg.packet_bridge,
         validate_vk_hashes: false,
         http_proxy: cfg.http_proxy,
+        idle_workers: cfg.idle_workers.unwrap_or(crate::idle::DEFAULT_KEEP),
+        idle_after_secs: cfg
+            .idle_after_secs
+            .unwrap_or(crate::idle::DEFAULT_AFTER.as_secs()),
     })
 }
 

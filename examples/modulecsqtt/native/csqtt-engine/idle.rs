@@ -1,0 +1,289 @@
+// SPDX-FileCopyrightText: 2026 amurcanov
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+//! Idle scale-down: keep a couple of "keeper" TURN paths while the phone is not sending
+//! anything, bring the full worker set back the moment real traffic appears.
+//!
+//! Why: every READY worker emits a ChannelData keepalive each 10 s plus Refresh / permission /
+//! channel maintenance; 27 unsynchronised workers wake the radio every ~0.4 s and keep it out of
+//! its idle state — that is the main battery cost of an otherwise silent tunnel. On wake-up from
+//! sleep all 27 paths are dead and reconnect at once. With two keepers both problems shrink to
+//! 2/27, and the keepers' control plane (keepalive 10 s, Refresh 300 s, maintenance 175 s) is
+//! **independent of user traffic**: it keeps the NAT mapping, the relay allocation and the server
+//! session alive even when nothing is sent through the tunnel. The keepers also carry whatever
+//! light traffic does happen (push ACKs, DNS) while the rest is parked.
+//!
+//! Enter: uplink stays below one packet-sized delta per poll for `after`. Small chatter (TCP
+//! ACKs, DNS, push heartbeats) does not postpone it.
+//! Exit: a real burst — several new TCP connections within a few seconds or a dozen uplink
+//! packets within a second. One background sync opening a single connection runs over the
+//! keepers instead of waking 25 workers for nothing.
+//!
+//! State is process-global (one engine per process) so that sessions and the packet bridge hot
+//! path can consult it without plumbing through every constructor. `netlost` pause is a separate
+//! axis (`PauseGate`): parking never tears down paths on pause, only on idle.
+
+use crate::stats::Stats;
+use std::{
+    sync::{
+        Arc, LazyLock, OnceLock,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
+use tokio::sync::{Notify, futures::Notified};
+use tokio_util::sync::CancellationToken;
+
+pub const DEFAULT_KEEP: usize = 2;
+pub const DEFAULT_AFTER: Duration = Duration::from_secs(180);
+const POLL: Duration = Duration::from_secs(5);
+/// Uplink delta per poll above which the phone is "doing something" (one MTU-sized packet).
+const ACTIVE_BYTES_PER_POLL: i64 = 1400;
+/// Exit thresholds.
+const EXIT_PACKETS: u64 = 12;
+const EXIT_PACKETS_WINDOW_MS: u64 = 1_000;
+const EXIT_SYNS: u64 = 3;
+const EXIT_SYNS_WINDOW_MS: u64 = 3_000;
+
+#[derive(Clone, Copy, Debug)]
+pub struct IdleConfig {
+    /// Workers kept alive while idle; 0 disables the feature.
+    pub keep: usize,
+    pub after: Duration,
+}
+
+static LIMIT: AtomicUsize = AtomicUsize::new(usize::MAX);
+static ACTIVE: AtomicBool = AtomicBool::new(false);
+static TOTAL_WORKERS: AtomicUsize = AtomicUsize::new(0);
+static PACKET_WINDOW_START_MS: AtomicU64 = AtomicU64::new(0);
+static PACKET_WINDOW_COUNT: AtomicU64 = AtomicU64::new(0);
+static SYN_WINDOW_START_MS: AtomicU64 = AtomicU64::new(0);
+static SYN_WINDOW_COUNT: AtomicU64 = AtomicU64::new(0);
+static CLOCK: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+fn notify() -> &'static Notify {
+    static NOTIFY: OnceLock<Notify> = OnceLock::new();
+    NOTIFY.get_or_init(Notify::new)
+}
+
+fn clock_ms() -> u64 {
+    CLOCK.elapsed().as_millis() as u64
+}
+
+/// Engine (re)start: everything unparked.
+pub fn reset(total_workers: usize) {
+    TOTAL_WORKERS.store(total_workers, Ordering::Release);
+    LIMIT.store(usize::MAX, Ordering::Release);
+    ACTIVE.store(false, Ordering::Release);
+    notify().notify_waiters();
+}
+
+pub fn is_active() -> bool {
+    ACTIVE.load(Ordering::Acquire)
+}
+
+/// Worker ids are 1-based; keepers are the lowest ids.
+pub fn allows(worker_id: usize) -> bool {
+    worker_id <= LIMIT.load(Ordering::Acquire)
+}
+
+pub fn notified() -> Notified<'static> {
+    notify().notified()
+}
+
+/// Resolves once `worker_id` is parked. Register-then-check idiom (see `PauseGate`).
+pub async fn parked(worker_id: usize) {
+    loop {
+        let changed = notified();
+        if !allows(worker_id) {
+            return;
+        }
+        changed.await;
+    }
+}
+
+pub fn enter(keep: usize) {
+    let total = TOTAL_WORKERS.load(Ordering::Acquire);
+    if keep == 0 || total == 0 || keep >= total {
+        return;
+    }
+    if ACTIVE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    LIMIT.store(keep, Ordering::Release);
+    PACKET_WINDOW_COUNT.store(0, Ordering::Relaxed);
+    SYN_WINDOW_COUNT.store(0, Ordering::Relaxed);
+    notify().notify_waiters();
+    crate::log_error!(
+        "[IDLE] Нет трафика — оставляю {keep} из {total} воркеров (их TURN keepalive держит путь), остальные паркую"
+    );
+}
+
+pub fn exit(reason: &str) {
+    if !ACTIVE.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    LIMIT.store(usize::MAX, Ordering::Release);
+    notify().notify_waiters();
+    crate::log_error!(
+        "[IDLE] {reason} — поднимаю воркеры до {}",
+        TOTAL_WORKERS.load(Ordering::Acquire)
+    );
+}
+
+/// IPv4 TCP segment with SYN set and ACK clear = a new outbound connection.
+pub(crate) fn is_tcp_syn(packet: &[u8]) -> bool {
+    if packet.len() < 20 || packet[0] >> 4 != 4 || packet[9] != 6 {
+        return false;
+    }
+    let ihl = usize::from(packet[0] & 0x0f) * 4;
+    if ihl < 20 || packet.len() < ihl + 14 {
+        return false;
+    }
+    let flags = packet[ihl + 13];
+    flags & 0x02 != 0 && flags & 0x10 == 0
+}
+
+/// Sliding-window counter on atomics: returns true when `limit` events landed within `window_ms`.
+fn window_hit(
+    start: &AtomicU64,
+    count: &AtomicU64,
+    now_ms: u64,
+    window_ms: u64,
+    limit: u64,
+) -> bool {
+    let started = start.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(started) > window_ms {
+        start.store(now_ms, Ordering::Relaxed);
+        count.store(1, Ordering::Relaxed);
+        return limit <= 1;
+    }
+    count.fetch_add(1, Ordering::Relaxed) + 1 >= limit
+}
+
+/// Hot path (`packet_bridge::inject_packet`). One atomic load when not idle.
+pub fn note_uplink(packet: &[u8]) {
+    if !is_active() {
+        return;
+    }
+    let now_ms = clock_ms();
+    if is_tcp_syn(packet)
+        && window_hit(
+            &SYN_WINDOW_START_MS,
+            &SYN_WINDOW_COUNT,
+            now_ms,
+            EXIT_SYNS_WINDOW_MS,
+            EXIT_SYNS,
+        )
+    {
+        exit("новые соединения");
+        return;
+    }
+    if window_hit(
+        &PACKET_WINDOW_START_MS,
+        &PACKET_WINDOW_COUNT,
+        now_ms,
+        EXIT_PACKETS_WINDOW_MS,
+        EXIT_PACKETS,
+    ) {
+        exit("всплеск трафика");
+    }
+}
+
+/// Pure decision helper (unit-tested): quiet for long enough → enter idle.
+pub(crate) fn should_enter(quiet_for: Duration, after: Duration, active: bool) -> bool {
+    !active && quiet_for >= after
+}
+
+pub async fn monitor(config: IdleConfig, stats: Arc<Stats>, cancel: CancellationToken) {
+    if config.keep == 0 {
+        return;
+    }
+    let mut last_bytes = stats.total_bytes_up.load(Ordering::Relaxed);
+    let mut quiet_since = Instant::now();
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(POLL) => {}
+        }
+        let bytes = stats.total_bytes_up.load(Ordering::Relaxed);
+        let delta = bytes - last_bytes;
+        last_bytes = bytes;
+        if delta > ACTIVE_BYTES_PER_POLL {
+            quiet_since = Instant::now();
+            continue;
+        }
+        if should_enter(quiet_since.elapsed(), config.after, is_active()) {
+            enter(config.keep);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn syn_packet(ack: bool) -> Vec<u8> {
+        let mut p = vec![0u8; 40];
+        p[0] = 0x45; // IPv4, IHL=5
+        p[9] = 6; // TCP
+        p[20 + 13] = if ack { 0x12 } else { 0x02 };
+        p
+    }
+
+    #[test]
+    fn detects_outbound_syn_only() {
+        assert!(is_tcp_syn(&syn_packet(false)));
+        assert!(!is_tcp_syn(&syn_packet(true))); // SYN-ACK is not a new connection
+        let mut udp = syn_packet(false);
+        udp[9] = 17;
+        assert!(!is_tcp_syn(&udp));
+        assert!(!is_tcp_syn(&[0x45; 10]));
+    }
+
+    #[test]
+    fn window_counts_events_inside_window_and_resets_outside() {
+        let start = AtomicU64::new(0);
+        let count = AtomicU64::new(0);
+        assert!(!window_hit(&start, &count, 10_000, 1_000, 3));
+        assert!(!window_hit(&start, &count, 10_200, 1_000, 3));
+        assert!(window_hit(&start, &count, 10_400, 1_000, 3));
+        // A late event restarts the window instead of accumulating forever.
+        assert!(!window_hit(&start, &count, 20_000, 1_000, 3));
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn enter_requires_quiet_period_and_not_already_idle() {
+        let after = Duration::from_secs(180);
+        assert!(!should_enter(Duration::from_secs(179), after, false));
+        assert!(should_enter(Duration::from_secs(180), after, false));
+        assert!(!should_enter(Duration::from_secs(600), after, true));
+    }
+
+    // Single test for the global state machine: parallel tests would race on the statics.
+    #[tokio::test]
+    async fn park_lifecycle() {
+        reset(27);
+        assert!(allows(27));
+        enter(2);
+        assert!(is_active());
+        assert!(allows(1) && allows(2));
+        assert!(!allows(3) && !allows(27));
+        // parked() resolves promptly for a parked id.
+        tokio::time::timeout(Duration::from_millis(200), parked(9))
+            .await
+            .expect("parked id must resolve");
+        exit("test");
+        assert!(!is_active());
+        assert!(allows(27));
+
+        // keep >= total: nothing to park, stays inactive.
+        reset(2);
+        enter(2);
+        assert!(!is_active());
+        assert!(allows(2));
+        reset(0);
+    }
+}
