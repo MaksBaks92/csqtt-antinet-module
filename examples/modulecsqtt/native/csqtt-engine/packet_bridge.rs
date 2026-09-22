@@ -18,8 +18,11 @@ use tokio_util::sync::CancellationToken;
 pub const UPLINK_CAPACITY: usize = 1024;
 
 pub type PacketOutCb = extern "C" fn(*const u8, i32);
+/// Batch downlink: `ptrs[i]` is `lens[i]` bytes. Valid only for the duration of the call.
+pub type PacketOutBatchCb = extern "C" fn(*const *const u8, *const i32, i32);
 
 static PACKET_OUT: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+static PACKET_OUT_BATCH: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 static BRIDGE_READY: AtomicBool = AtomicBool::new(false);
 
 fn uplink_slot() -> &'static ArcSwapOption<UplinkBridge> {
@@ -39,12 +42,26 @@ pub fn set_packet_out(cb: Option<PacketOutCb>) {
     PACKET_OUT.store(ptr, Ordering::Release);
 }
 
+pub fn set_packet_out_batch(cb: Option<PacketOutBatchCb>) {
+    let ptr = cb.map(|f| f as *mut ()).unwrap_or(std::ptr::null_mut());
+    PACKET_OUT_BATCH.store(ptr, Ordering::Release);
+}
+
 pub fn packet_out() -> Option<PacketOutCb> {
     let ptr = PACKET_OUT.load(Ordering::Acquire);
     if ptr.is_null() {
         None
     } else {
         Some(unsafe { std::mem::transmute::<*mut (), PacketOutCb>(ptr) })
+    }
+}
+
+fn packet_out_batch() -> Option<PacketOutBatchCb> {
+    let ptr = PACKET_OUT_BATCH.load(Ordering::Acquire);
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { std::mem::transmute::<*mut (), PacketOutBatchCb>(ptr) })
     }
 }
 
@@ -99,9 +116,51 @@ pub fn inject_packet(data: &[u8]) -> i32 {
 }
 
 pub fn deliver_downlink(packet: &[u8]) {
+    if packet.is_empty() {
+        return;
+    }
+    if let Some(batch) = packet_out_batch() {
+        let ptr = packet.as_ptr();
+        let len = packet.len() as i32;
+        batch(&ptr, &len, 1);
+        return;
+    }
     if let Some(cb) = packet_out() {
-        if !packet.is_empty() {
-            cb(packet.as_ptr(), packet.len() as i32);
+        cb(packet.as_ptr(), packet.len() as i32);
+    }
+}
+
+/// One FFI call for a drained write_bridge batch; falls back to per-packet if only the
+/// legacy single-packet callback is registered.
+pub fn deliver_downlink_batch(packets: &[PacketBuf]) {
+    if packets.is_empty() {
+        return;
+    }
+    if let Some(batch) = packet_out_batch() {
+        const MAX: usize = 128;
+        let mut ptrs = [std::ptr::null(); MAX];
+        let mut lens = [0i32; MAX];
+        let mut count = 0usize;
+        for packet in packets.iter().take(MAX) {
+            let slice = packet.as_slice();
+            if slice.is_empty() {
+                continue;
+            }
+            ptrs[count] = slice.as_ptr();
+            lens[count] = slice.len() as i32;
+            count += 1;
+        }
+        if count > 0 {
+            batch(ptrs.as_ptr(), lens.as_ptr(), count as i32);
+        }
+        return;
+    }
+    if let Some(cb) = packet_out() {
+        for packet in packets {
+            let slice = packet.as_slice();
+            if !slice.is_empty() {
+                cb(slice.as_ptr(), slice.len() as i32);
+            }
         }
     }
 }

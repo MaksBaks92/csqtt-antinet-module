@@ -26,12 +26,13 @@ var (
 	procActivePaths   *windows.LazyProc
 	procNudge         *windows.LazyProc
 	procRebind        *windows.LazyProc
-	procSetPacketOut  *windows.LazyProc
-	procInjectPacket  *windows.LazyProc
-	protectImpl       func(int64) bool
-	protectCallback   uintptr
-	packetOutSink     atomic.Pointer[func([]byte)]
-	packetOutCallback uintptr
+	procSetPacketOut      *windows.LazyProc
+	procSetPacketOutBatch *windows.LazyProc
+	procInjectPacket      *windows.LazyProc
+	protectImpl           func(int64) bool
+	protectCallback       uintptr
+	packetOutSink         atomic.Pointer[func([]byte)]
+	packetOutCallback     uintptr
 )
 
 func engineLibName() string { return "csqtt_engine.dll" }
@@ -57,6 +58,7 @@ func engineLoad(searchDirs ...string) error {
 	procNudge = engineDLL.NewProc("csqtt_engine_nudge")
 	procRebind = engineDLL.NewProc("csqtt_engine_rebind")
 	procSetPacketOut = engineDLL.NewProc("csqtt_engine_set_packet_out")
+	procSetPacketOutBatch = engineDLL.NewProc("csqtt_engine_set_packet_out_batch")
 	procInjectPacket = engineDLL.NewProc("csqtt_engine_inject_packet")
 	return nil
 }
@@ -81,12 +83,33 @@ func engineSetPacketOut(fn func([]byte)) {
 		return
 	}
 	packetOutSink.Store(&fn)
+	packetOutCallback = syscall.NewCallback(func(ptrs, lens, count uintptr) uintptr {
+		sink := packetOutSink.Load()
+		if sink == nil || *sink == nil || ptrs == 0 || lens == 0 || count == 0 {
+			return 0
+		}
+		n := int(count)
+		ptrSlice := unsafe.Slice((**byte)(unsafe.Pointer(ptrs)), n)
+		lenSlice := unsafe.Slice((*int32)(unsafe.Pointer(lens)), n)
+		for i := 0; i < n; i++ {
+			if ptrSlice[i] == nil || lenSlice[i] <= 0 {
+				continue
+			}
+			buf := unsafe.Slice(ptrSlice[i], int(lenSlice[i]))
+			(*sink)(buf)
+		}
+		return 0
+	})
+	if procSetPacketOutBatch.Find() == nil {
+		_, _, _ = procSetPacketOutBatch.Call(packetOutCallback)
+		return
+	}
+	// Legacy single-packet fallback for older engine DLLs.
 	packetOutCallback = syscall.NewCallback(func(data uintptr, n uintptr) uintptr {
 		sink := packetOutSink.Load()
 		if sink == nil || *sink == nil || data == 0 || n == 0 {
 			return 0
 		}
-		// Borrowed slice: InjectInbound → MakeWithData copies before return.
 		buf := unsafe.Slice((*byte)(unsafe.Pointer(data)), int(n))
 		(*sink)(buf)
 		return 0

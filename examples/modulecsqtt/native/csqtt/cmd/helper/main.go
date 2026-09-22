@@ -408,6 +408,7 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	user := cfg["SOCKS_USER"]
 	pass := cfg["SOCKS_PASS"]
 	debug := cfg["SETTING_debugLog"] == "true"
+	SetSocksUDPVerboseLog(debug)
 
 	link, err := parseCsqttLink(cfg["LINK"])
 	if err != nil {

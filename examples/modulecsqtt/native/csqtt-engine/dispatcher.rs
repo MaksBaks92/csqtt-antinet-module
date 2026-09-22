@@ -262,6 +262,11 @@ impl PacketSender {
         }
         packets
     }
+
+    fn is_congested(&self) -> bool {
+        let cap = self.shared.queue.capacity();
+        cap > 0 && self.shared.queue.len() * 2 >= cap
+    }
 }
 
 impl PacketReceiver {
@@ -966,12 +971,9 @@ impl Dispatcher {
                 send_batch.push(next);
             }
 
-            for packet in &send_batch {
-                packet_bridge::deliver_downlink(packet.as_slice());
-                stats
-                    .total_bytes_down
-                    .fetch_add(packet.len() as i64, Ordering::Relaxed);
-            }
+            let bytes = send_batch.iter().map(|p| p.len() as i64).sum::<i64>();
+            packet_bridge::deliver_downlink_batch(&send_batch);
+            stats.total_bytes_down.fetch_add(bytes, Ordering::Relaxed);
         }
     }
 
@@ -1395,14 +1397,21 @@ fn enqueue_selected_worker(
         n
     };
     let mut packet = packet;
-    for offset in 0..search {
-        let worker = &workers[(ticket.start_slot + offset) % n];
-        if !worker.is_healthy() {
-            continue;
-        }
-        match queue_for_class(worker, ticket.class).try_send(packet) {
-            Ok(()) => return Ok(()),
-            Err(returned) => packet = returned,
+    // Prefer non-congested healthy paths (slow/full stripe slot loses to a shallow neighbour).
+    for prefer_clear in [true, false] {
+        for offset in 0..search {
+            let worker = &workers[(ticket.start_slot + offset) % n];
+            if !worker.is_healthy() {
+                continue;
+            }
+            let queue = queue_for_class(worker, ticket.class);
+            if prefer_clear && queue.is_congested() {
+                continue;
+            }
+            match queue.try_send(packet) {
+                Ok(()) => return Ok(()),
+                Err(returned) => packet = returned,
+            }
         }
     }
     Err(packet)

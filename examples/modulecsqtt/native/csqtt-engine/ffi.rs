@@ -300,6 +300,11 @@ pub extern "C" fn csqtt_engine_set_packet_out(cb: Option<packet_bridge::PacketOu
     packet_bridge::set_packet_out(cb);
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn csqtt_engine_set_packet_out_batch(cb: Option<packet_bridge::PacketOutBatchCb>) {
+    packet_bridge::set_packet_out_batch(cb);
+}
+
 /// Inject one raw IPv4 packet from the AntiNet helper into the engine data path.
 #[unsafe(no_mangle)]
 pub extern "C" fn csqtt_engine_inject_packet(data: *const u8, n: i32) -> i32 {

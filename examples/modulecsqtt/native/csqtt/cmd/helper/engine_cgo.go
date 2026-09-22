@@ -24,10 +24,12 @@ static int32_t (*fn_active_paths)(void);
 static void (*fn_nudge)(void);
 static void (*fn_rebind)(void);
 static void (*fn_set_packet_out)(void *);
+static void (*fn_set_packet_out_batch)(void *);
 static int32_t (*fn_inject_packet)(const uint8_t *, int32_t);
 
 extern int32_t goProtectFd(int64_t fd);
 extern void goPacketOut(uint8_t *data, int32_t n);
+extern void goPacketOutBatch(uint8_t **ptrs, int32_t *lens, int32_t count);
 
 static int csqtt_load(const char *path) {
 	eng = dlopen(path, RTLD_NOW);
@@ -46,6 +48,7 @@ static int csqtt_load(const char *path) {
 	fn_nudge = (void (*)(void))dlsym(eng, "csqtt_engine_nudge");
 	fn_rebind = (void (*)(void))dlsym(eng, "csqtt_engine_rebind");
 	fn_set_packet_out = (void (*)(void *))dlsym(eng, "csqtt_engine_set_packet_out");
+	fn_set_packet_out_batch = (void (*)(void *))dlsym(eng, "csqtt_engine_set_packet_out_batch");
 	fn_inject_packet = (int32_t (*)(const uint8_t *, int32_t))dlsym(eng, "csqtt_engine_inject_packet");
 	if (!fn_start || !fn_wait_ready || !fn_packet_port || !fn_tun_ip || !fn_stop) {
 		return -2;
@@ -62,7 +65,9 @@ static void csqtt_bind_protect(void) {
 }
 
 static void csqtt_bind_packet_out(void) {
-	if (fn_set_packet_out) {
+	if (fn_set_packet_out_batch) {
+		fn_set_packet_out_batch((void *)goPacketOutBatch);
+	} else if (fn_set_packet_out) {
 		fn_set_packet_out((void *)goPacketOut);
 	}
 }
@@ -121,6 +126,27 @@ func goPacketOut(data *C.uint8_t, n C.int32_t) {
 	// Do not retain past this call.
 	buf := unsafe.Slice((*byte)(unsafe.Pointer(data)), int(n))
 	(*sink)(buf)
+}
+
+//export goPacketOutBatch
+func goPacketOutBatch(ptrs **C.uint8_t, lens *C.int32_t, count C.int32_t) {
+	if ptrs == nil || lens == nil || count <= 0 {
+		return
+	}
+	sink := packetOutSink.Load()
+	if sink == nil || *sink == nil {
+		return
+	}
+	n := int(count)
+	ptrSlice := unsafe.Slice(ptrs, n)
+	lenSlice := unsafe.Slice(lens, n)
+	for i := 0; i < n; i++ {
+		if ptrSlice[i] == nil || lenSlice[i] <= 0 {
+			continue
+		}
+		buf := unsafe.Slice((*byte)(unsafe.Pointer(ptrSlice[i])), int(lenSlice[i]))
+		(*sink)(buf)
+	}
 }
 
 func engineLibName() string {

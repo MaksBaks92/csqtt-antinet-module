@@ -360,6 +360,17 @@ var udpAssocSeq int64
 
 const socksUDPIdleTTL = 60 * time.Second
 
+var udpAssocVerboseLog atomic.Bool
+
+// SetSocksUDPVerboseLog gates per-datagram UDPASSOC chatter (dial OK / write fails stay on).
+func SetSocksUDPVerboseLog(v bool) { udpAssocVerboseLog.Store(v) }
+
+func udpAssocLog(format string, args ...any) {
+	if udpAssocVerboseLog.Load() {
+		log.Printf(format, args...)
+	}
+}
+
 type udpNatEntry struct {
 	conn net.Conn
 	last time.Time
@@ -396,7 +407,7 @@ func serveSocksUDPAssociate(ctrl net.Conn, br *bufio.Reader, t socksUDPTransport
 	}
 	defer relay.Close()
 	rp := relay.LocalAddr().(*net.UDPAddr).Port
-	log.Printf("UDPASSOC #%d OPEN relayPort=%d ctrlRemote=%v ctrlLocal=%v", assocID, rp, ctrl.RemoteAddr(), ctrl.LocalAddr())
+	udpAssocLog("UDPASSOC #%d OPEN relayPort=%d ctrlRemote=%v ctrlLocal=%v", assocID, rp, ctrl.RemoteAddr(), ctrl.LocalAddr())
 	// reply: VER REP RSV ATYP(ipv4) BND.ADDR(127.0.0.1) BND.PORT(relayPort)
 	if _, err := ctrl.Write([]byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, byte(rp >> 8), byte(rp)}); err != nil {
 		log.Printf("UDPASSOC #%d reply write FAILED err=%v lifetime=%v", assocID, err, time.Since(assocStart))
@@ -447,7 +458,7 @@ func serveSocksUDPAssociate(ctrl net.Conn, br *bufio.Reader, t socksUDPTransport
 	// Закрытие control-conn'а (хост завершил ассоциацию) → рвём relay (разблокирует ReadFromUDP).
 	go func() {
 		n, cerr := io.Copy(io.Discard, br)
-		log.Printf("UDPASSOC #%d ctrl-conn EOF (closing relay) drainedBytes=%d err=%v lifetime=%v", assocID, n, cerr, time.Since(assocStart))
+		udpAssocLog("UDPASSOC #%d ctrl-conn EOF (closing relay) drainedBytes=%d err=%v lifetime=%v", assocID, n, cerr, time.Since(assocStart))
 		_ = relay.Close()
 	}()
 
@@ -455,7 +466,7 @@ func serveSocksUDPAssociate(ctrl net.Conn, br *bufio.Reader, t socksUDPTransport
 	for {
 		n, src, err := relay.ReadFromUDP(buf)
 		if err != nil {
-			log.Printf("UDPASSOC #%d ReadFromUDP FAILED (loop exit) err=%v lifetime=%v", assocID, err, time.Since(assocStart))
+			udpAssocLog("UDPASSOC #%d ReadFromUDP FAILED (loop exit) err=%v lifetime=%v", assocID, err, time.Since(assocStart))
 			return
 		}
 		atomic.AddInt64(&pktsIn, 1)
@@ -463,7 +474,7 @@ func serveSocksUDPAssociate(ctrl net.Conn, br *bufio.Reader, t socksUDPTransport
 		mu.Lock()
 		if clientAddr == nil {
 			clientAddr = src
-			log.Printf("UDPASSOC #%d first client datagram from=%v n=%d elapsed=%v", assocID, src, n, time.Since(assocStart))
+			udpAssocLog("UDPASSOC #%d first client datagram from=%v n=%d elapsed=%v", assocID, src, n, time.Since(assocStart))
 		}
 		mu.Unlock()
 		dst, data, ok := parseSocksUDP(buf[:n], dns)
@@ -492,7 +503,7 @@ func serveSocksUDPAssociate(ctrl net.Conn, br *bufio.Reader, t socksUDPTransport
 				}
 				continue
 			}
-			log.Printf("UDPASSOC #%d target dial OK dst=%v dialElapsed=%v", assocID, dst, time.Since(dialStart))
+			udpAssocLog("UDPASSOC #%d target dial OK dst=%v dialElapsed=%v", assocID, dst, time.Since(dialStart))
 			uc = nc
 			mu.Lock()
 			targets[dst] = &udpNatEntry{conn: uc, last: time.Now()}
@@ -510,7 +521,7 @@ func serveSocksUDPAssociate(ctrl net.Conn, br *bufio.Reader, t socksUDPTransport
 				for {
 					m, rerr := u.Read(rb)
 					if rerr != nil {
-						log.Printf("UDPASSOC #%d target READ ended dst=%v err=%v afterPkts=%d elapsed=%v", assocID, tgt, rerr, outSeq, time.Since(assocStart))
+						udpAssocLog("UDPASSOC #%d target READ ended dst=%v err=%v afterPkts=%d elapsed=%v", assocID, tgt, rerr, outSeq, time.Since(assocStart))
 						return
 					}
 					outSeq++

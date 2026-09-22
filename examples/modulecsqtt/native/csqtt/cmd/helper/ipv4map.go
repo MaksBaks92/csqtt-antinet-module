@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
@@ -27,6 +28,7 @@ type ipv4MapEntry struct {
 }
 
 var ipv4Mapped sync.Map // netip.Addr → ipv4MapEntry
+var ipv4MapOps atomic.Uint64
 
 func mapIPv6To4(ip netip.Addr, resolver *protectedResolver) (netip.Addr, error) {
 	ip = ip.Unmap()
@@ -41,6 +43,7 @@ func mapIPv6To4(ip netip.Addr, resolver *protectedResolver) (netip.Addr, error) 
 		if time.Now().Before(e.exp) {
 			return e.v4, e.err
 		}
+		ipv4Mapped.Delete(ip)
 	}
 	v4, err := deriveIPv4(ip, resolver)
 	ttl := 10 * time.Minute
@@ -48,11 +51,24 @@ func mapIPv6To4(ip netip.Addr, resolver *protectedResolver) (netip.Addr, error) 
 		ttl = 30 * time.Second
 	}
 	ipv4Mapped.Store(ip, ipv4MapEntry{v4: v4, err: err, exp: time.Now().Add(ttl)})
+	if ipv4MapOps.Add(1)%64 == 0 {
+		pruneIPv4Mapped(time.Now())
+	}
 	if err != nil {
 		return netip.Addr{}, err
 	}
 	log.Printf("[SOCKS] IPv6 %s → IPv4 %s", ip, v4)
 	return v4, nil
+}
+
+func pruneIPv4Mapped(now time.Time) {
+	ipv4Mapped.Range(func(key, value any) bool {
+		e := value.(ipv4MapEntry)
+		if now.After(e.exp) {
+			ipv4Mapped.Delete(key)
+		}
+		return true
+	})
 }
 
 func deriveIPv4(ip netip.Addr, resolver *protectedResolver) (netip.Addr, error) {
