@@ -143,18 +143,21 @@ impl PauseGate {
     }
 
     /// Blocks without polling — woken only by set_paused / cancel (doze-friendly).
+    /// Register the Notify future BEFORE reading the flag: this is the canonical
+    /// wait-then-check idiom and keeps us correct even if a `set_paused` lands
+    /// between registering and reading.
     async fn wait_until_resumed(&self, cancel: &CancellationToken) -> bool {
-        while self.is_paused() {
+        loop {
             let notified = self.changed.notified();
             if !self.is_paused() {
-                break;
+                return true;
             }
             tokio::select! {
+                biased;
                 _ = cancel.cancelled() => return false,
                 _ = notified => {},
             }
         }
-        true
     }
 }
 
@@ -1125,6 +1128,41 @@ mod tests {
         assert!(!wait.is_finished());
         gate.set_paused(false);
         assert!(wait.await.unwrap());
+    }
+
+    /// Resume racing the waiter's flag read must not be lost.
+    #[tokio::test]
+    async fn pause_gate_does_not_lose_resume_racing_the_register() {
+        let gate = Arc::new(PauseGate::new());
+        gate.set_paused(true);
+        let waiter = tokio::spawn({
+            let gate = gate.clone();
+            async move { gate.wait_until_resumed(&CancellationToken::new()).await }
+        });
+        // Waiter has registered its Notify future but not yet read the flag.
+        tokio::task::yield_now().await;
+        gate.set_paused(false);
+        // The register-before-read order returns promptly regardless of where
+        // the resume lands relative to the flag load.
+        let resumed = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("resume was lost");
+        assert!(resumed.unwrap());
+    }
+
+    #[tokio::test]
+    async fn pause_gate_returns_on_cancel_while_paused() {
+        let gate = Arc::new(PauseGate::new());
+        let cancel = CancellationToken::new();
+        gate.set_paused(true);
+        let waiter = {
+            let gate = gate.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move { gate.wait_until_resumed(&cancel).await })
+        };
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        assert!(!waiter.await.unwrap());
     }
 
     #[test]
