@@ -948,14 +948,11 @@ async fn run_allocated_session(
             }
         }
     };
-    let unexpected = session_result.as_ref().is_err_and(|error| {
-        let text = error.to_string();
-        !text.contains("IDLE_PARK")
-            && !text.contains("NET_REBIND")
-            && !text.contains("TARGET_REPAIR")
-    });
-    if unexpected {
+    if session_result.as_ref().is_err_and(should_note_path_lost) {
         // One epoch for every live worker. Park / rebind / repair already have their own GETCONF.
+        // TURN 437 / ChannelBind 400 stay on this epoch: the worker allocates again and
+        // GETCONFs the new relay. A bump here drops every route and the next stale Refresh
+        // opens yet another epoch.
         crate::idle::note_path_lost(config.id);
     }
     worker_channels.mark_unhealthy();
@@ -1294,6 +1291,14 @@ fn deliver_inbound_packet(dispatcher: &Dispatcher, packet: PacketBuf) {
     dispatcher.return_packet(packet);
 }
 
+fn should_note_path_lost(error: &anyhow::Error) -> bool {
+    let text = error.to_string();
+    if text.contains("IDLE_PARK") || text.contains("NET_REBIND") || text.contains("TARGET_REPAIR") {
+        return false;
+    }
+    !crate::turn::error_is_allocation_mismatch(error)
+}
+
 fn turn_endpoint_index(id: usize, cursor: usize, endpoint_count: usize) -> usize {
     debug_assert!(endpoint_count > 0);
     (id % endpoint_count + cursor % endpoint_count) % endpoint_count
@@ -1339,6 +1344,23 @@ mod tests {
     use proptest::prelude::*;
     use std::collections::HashSet;
     use std::future::pending;
+
+    #[test]
+    fn turn_allocation_mismatch_does_not_open_an_epoch() {
+        use anyhow::Context;
+        let refresh = anyhow::anyhow!("TURN Refresh failed: ok; STUN error 437")
+            .context("TURN allocation receive");
+        assert!(!should_note_path_lost(&refresh));
+        let channel = anyhow::anyhow!("TURN ChannelBind failed: ok; STUN error 400")
+            .context("TURN allocation receive");
+        assert!(!should_note_path_lost(&channel));
+        let destroyed = anyhow::anyhow!("TURN allocation entered DESTROYING unexpectedly")
+            .context("TURN allocation receive");
+        assert!(should_note_path_lost(&destroyed));
+        assert!(!should_note_path_lost(&anyhow::anyhow!("IDLE_PARK")));
+        assert!(!should_note_path_lost(&anyhow::anyhow!("NET_REBIND")));
+        assert!(!should_note_path_lost(&anyhow::anyhow!("TARGET_REPAIR")));
+    }
 
     #[test]
     fn transport_selection_skips_incompatible_turn_endpoints() {

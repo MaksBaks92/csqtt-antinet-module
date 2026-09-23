@@ -62,6 +62,36 @@ fn is_retryable_maintenance(method: u32) -> bool {
     )
 }
 
+/// RFC 5766 allocation mismatch: Refresh 437, or ChannelBind 400. The worker
+/// recreates the allocation on the same CSQTT epoch. A generation bump here
+/// would drop every live route and chain a new epoch on each stale Refresh.
+#[inline]
+fn is_allocation_mismatch_stun(method: u32, stun_code: i32) -> bool {
+    stun_code == 437 || (method == METHOD_CHANNEL_BIND && stun_code == 400)
+}
+
+fn fail_turn_request(shared: &DriverShared, method: u32, status: i32, stun_code: i32) {
+    shared.fail(Arc::from(format!(
+        "TURN {} failed: {}{}",
+        method_name(method),
+        native_status_text(status),
+        stun_suffix(stun_code)
+    )));
+}
+
+/// True when the error chain is a TURN allocation mismatch (Refresh 437 or
+/// ChannelBind 400). The outermost context is often only "TURN allocation receive".
+pub(crate) fn error_is_allocation_mismatch(error: &anyhow::Error) -> bool {
+    let chain = error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_ascii_lowercase();
+    chain.contains("stun error 437")
+        || (chain.contains("stun error 400") && chain.contains("channelbind"))
+}
+
 #[inline]
 fn is_silent_native_status(status: i32) -> bool {
     matches!(
@@ -1247,16 +1277,15 @@ async fn pump_native(
                         native_status_text(event.status)
                     );
                 }
+                let mismatch = is_allocation_mismatch_stun(event.method, event.stun_code);
                 if (event.status != 0 || event.stun_code != 0)
                     && !shared.closing.load(Ordering::Acquire)
-                    && !is_retryable_maintenance(event.method)
+                    && (!is_retryable_maintenance(event.method) || mismatch)
                 {
-                    shared.fail(Arc::from(format!(
-                        "TURN {} failed: {}{}",
-                        method_name(event.method),
-                        native_status_text(event.status),
-                        stun_suffix(event.stun_code)
-                    )));
+                    // Name the mismatch before DESTROYING overwrites the terminal
+                    // reason. The session keeps the CSQTT epoch and the worker
+                    // allocates again.
+                    fail_turn_request(shared, event.method, event.status, event.stun_code);
                 }
             }
             EVENT_STUN_RESPONSE_ERROR => {
@@ -1284,6 +1313,11 @@ async fn pump_native(
                             native_status_text(event.status),
                         );
                     }
+                }
+                if !shared.closing.load(Ordering::Acquire)
+                    && is_allocation_mismatch_stun(event.method, event.stun_code)
+                {
+                    fail_turn_request(shared, event.method, event.status, event.stun_code);
                 }
             }
             EVENT_CHANNEL_BOUND => {
@@ -1507,6 +1541,27 @@ fn stun_suffix(stun_code: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
+
+    #[test]
+    fn allocation_mismatch_survives_the_receive_context() {
+        let refresh = anyhow::anyhow!("TURN Refresh failed: ok; STUN error 437")
+            .context("TURN allocation receive");
+        assert!(error_is_allocation_mismatch(&refresh));
+        let channel = anyhow::anyhow!("TURN ChannelBind failed: ok; STUN error 400")
+            .context("TURN allocation receive");
+        assert!(error_is_allocation_mismatch(&channel));
+        let allocate = anyhow::anyhow!("TURN Allocate failed: ok; STUN error 400")
+            .context("TURN allocation receive");
+        assert!(!error_is_allocation_mismatch(&allocate));
+        let destroyed = anyhow::anyhow!("TURN allocation entered DESTROYING unexpectedly")
+            .context("TURN allocation receive");
+        assert!(!error_is_allocation_mismatch(&destroyed));
+        assert!(is_allocation_mismatch_stun(METHOD_REFRESH, 437));
+        assert!(is_allocation_mismatch_stun(METHOD_CHANNEL_BIND, 400));
+        assert!(!is_allocation_mismatch_stun(METHOD_ALLOCATE, 400));
+        assert!(!is_allocation_mismatch_stun(METHOD_REFRESH, 438));
+    }
 
     #[test]
     fn turn_socket_buffer_budget_is_bounded_per_worker() {

@@ -76,11 +76,6 @@ static CLOCK: LazyLock<Instant> = LazyLock::new(Instant::now);
 /// Index is the 1-based worker id. Server accepts at most 126.
 const JOINED_SLOTS: usize = 127;
 static JOINED: [AtomicU64; JOINED_SLOTS] = [const { AtomicU64::new(0) }; JOINED_SLOTS];
-/// Per-poll uplink below this, but above the idle threshold, counts as light traffic.
-const LIGHT_BYTES_PER_POLL: i64 = 48 * 1024;
-/// Per-poll uplink that should bring the full worker set back.
-const BUSY_BYTES_PER_POLL: i64 = 256 * 1024;
-const LIGHT_AFTER: Duration = Duration::from_secs(60);
 
 fn notify() -> &'static Notify {
     static NOTIFY: OnceLock<Notify> = OnceLock::new();
@@ -154,49 +149,6 @@ pub fn note_path_lost(worker_id: usize) {
     crate::log_error!(
         "[ПУТЬ] Воркер {worker_id} упал — новая эпоха, живые пути перерегистрируются вместе"
     );
-}
-
-/// Half the configured set, never below `keep` and never above `total`.
-pub(crate) fn light_target(total: usize, keep: usize) -> usize {
-    if total == 0 {
-        return 0;
-    }
-    (total / 2).max(keep.min(total)).min(total)
-}
-
-/// Shrink or restore the advertised worker set. Shrinking bumps generation so the server
-/// drops ids above the new desired_count. Growing only re-announces; new workers join the
-/// current epoch. Idle mode owns the set while it is active.
-pub fn scale_to(count: usize) {
-    if is_active() {
-        return;
-    }
-    let total = TOTAL_WORKERS.load(Ordering::Acquire);
-    if total == 0 {
-        return;
-    }
-    let count = count.clamp(1, total);
-    let current = declared_count();
-    if count >= total {
-        if current >= total && LIMIT.load(Ordering::Acquire) == usize::MAX {
-            return;
-        }
-        LIMIT.store(usize::MAX, Ordering::Release);
-        DECLARED.store(total, Ordering::Release);
-        ANNOUNCE.fetch_add(1, Ordering::AcqRel);
-        notify().notify_waiters();
-        crate::log_error!("[НАГРУЗКА] Трафик вырос — воркеры снова {total}");
-        return;
-    }
-    if count >= current {
-        return;
-    }
-    LIMIT.store(count, Ordering::Release);
-    DECLARED.store(count, Ordering::Release);
-    GEN_OFFSET.fetch_add(1, Ordering::AcqRel);
-    ANNOUNCE.fetch_add(1, Ordering::AcqRel);
-    notify().notify_waiters();
-    crate::log_error!("[НАГРУЗКА] Трафик тихий — оставляю {count} из {total} воркеров");
 }
 
 pub fn declared_count() -> usize {
@@ -355,7 +307,6 @@ pub async fn monitor(config: IdleConfig, stats: Arc<Stats>, cancel: Cancellation
     }
     let mut last_bytes = stats.total_bytes_up.load(Ordering::Relaxed);
     let mut quiet_since = Instant::now();
-    let mut light_since: Option<Instant> = None;
     loop {
         tokio::select! {
             biased;
@@ -365,34 +316,13 @@ pub async fn monitor(config: IdleConfig, stats: Arc<Stats>, cancel: Cancellation
         let bytes = stats.total_bytes_up.load(Ordering::Relaxed);
         let delta = bytes - last_bytes;
         last_bytes = bytes;
+        // Quiet traffic still uses every worker. The server stripes downlink across
+        // the whole route table, so parking half the set cuts upload and download.
+        // Only a long silence (idle keepers) shrinks the set.
         if delta > ACTIVE_BYTES_PER_POLL {
             quiet_since = Instant::now();
-            if is_active() {
-                light_since = None;
-                continue;
-            }
-            let total = TOTAL_WORKERS.load(Ordering::Acquire);
-            if delta >= BUSY_BYTES_PER_POLL {
-                light_since = None;
-                if declared_count() < total {
-                    scale_to(total);
-                }
-                continue;
-            }
-            if delta < LIGHT_BYTES_PER_POLL {
-                let since = *light_since.get_or_insert_with(Instant::now);
-                if since.elapsed() >= LIGHT_AFTER {
-                    let target = light_target(total, config.keep);
-                    if target < total && declared_count() > target {
-                        scale_to(target);
-                    }
-                }
-            } else {
-                light_since = None;
-            }
             continue;
         }
-        light_since = None;
         if should_enter(quiet_since.elapsed(), config.after, is_active()) {
             enter(config.keep);
         }
@@ -431,14 +361,6 @@ mod tests {
         // A late event restarts the window instead of accumulating forever.
         assert!(!window_hit(&start, &count, 20_000, 1_000, 3));
         assert_eq!(count.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn light_target_stays_between_keep_and_total() {
-        assert_eq!(light_target(9, 2), 4);
-        assert_eq!(light_target(3, 2), 2);
-        assert_eq!(light_target(2, 2), 2);
-        assert_eq!(light_target(0, 2), 0);
     }
 
     #[test]

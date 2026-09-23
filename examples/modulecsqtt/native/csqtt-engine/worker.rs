@@ -1016,10 +1016,11 @@ fn is_turn_allocation_quota(error: &anyhow::Error, message: &str) -> bool {
 fn is_turn_allocation_mismatch(error: &anyhow::Error, message: &str) -> bool {
     match turn_stun_code(error) {
         Some(437) => true,
-        Some(400) => message.contains("channelbind"),
+        Some(400) if message.contains("channelbind") => true,
         _ => {
             message.contains("stun error 437")
                 || (message.contains("stun error 400") && message.contains("channelbind"))
+                || crate::turn::error_is_allocation_mismatch(error)
         }
     }
 }
@@ -1719,6 +1720,13 @@ mod tests {
         assert!(!is_turn_allocation_mismatch(
             &error,
             "turn allocate failed: stun error 400"
+        ));
+        use anyhow::Context;
+        let wrapped = anyhow::anyhow!("TURN Refresh failed: ok; STUN error 437")
+            .context("TURN allocation receive");
+        assert!(is_turn_allocation_mismatch(
+            &wrapped,
+            "turn allocation receive"
         ));
     }
 
