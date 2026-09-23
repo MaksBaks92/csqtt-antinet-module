@@ -25,6 +25,7 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use socket2::SockRef;
 use std::{
+    collections::VecDeque,
     net::SocketAddr,
     sync::{
         Arc, Mutex, OnceLock,
@@ -47,6 +48,8 @@ const _: () = assert!(UDP_RECEIVE_BUFFER_BYTES + UDP_SEND_BUFFER_BYTES <= 2 * 10
 // downlink bursts while a stalled consumer catches up, shallow enough that a
 // single stream cannot starve the other workers of pool buffers.
 const INCOMING_QUEUE_CAPACITY: usize = PACKET_POOL_PER_WORKER;
+/// UDP and handshake packets kept when the bulk ingress queue is already full.
+const PROTECTED_INCOMING: usize = 32;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(12);
 const ALLOCATION_TIMEOUT: Duration = Duration::from_secs(25);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(35);
@@ -185,6 +188,8 @@ struct DriverShared {
     channel: AtomicU16,
     queue_full_drops: AtomicU64,
     pool_deficit_drops: AtomicU64,
+    protected: Mutex<VecDeque<PacketBuf>>,
+    protected_notify: Notify,
     #[cfg(test)]
     native_pumps: AtomicU64,
 }
@@ -213,6 +218,25 @@ impl DriverShared {
             .load(Ordering::Acquire)
             .then(|| self.snapshot.borrow().terminal.clone())
             .flatten()
+    }
+
+    fn stash_protected(&self, packet: PacketBuf) {
+        let mut queue = self
+            .protected
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if queue.len() >= PROTECTED_INCOMING {
+            let _ = queue.pop_front();
+        }
+        queue.push_back(packet);
+        self.protected_notify.notify_one();
+    }
+
+    fn pop_protected(&self) -> Option<PacketBuf> {
+        self.protected
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop_front()
     }
 
     fn request_cleanup(&self) {
@@ -263,8 +287,16 @@ impl TurnReceiver {
             if let Some(reason) = self.shared.terminal() {
                 bail!("{reason}");
             }
+            if let Some(packet) = self.shared.pop_protected() {
+                return Ok(packet);
+            }
+            let protected = self.shared.protected_notify.notified();
+            if let Some(packet) = self.shared.pop_protected() {
+                return Ok(packet);
+            }
             tokio::select! {
                 biased;
+                _ = protected => continue,
                 changed = self.state.changed() => {
                     if changed.is_err() {
                         bail!("TURN allocation state closed");
@@ -329,6 +361,8 @@ impl TurnAllocation {
             channel: AtomicU16::new(0),
             queue_full_drops: AtomicU64::new(0),
             pool_deficit_drops: AtomicU64::new(0),
+            protected: Mutex::new(VecDeque::with_capacity(PROTECTED_INCOMING)),
+            protected_notify: Notify::new(),
             #[cfg(test)]
             native_pumps: AtomicU64::new(0),
         });
@@ -1413,8 +1447,12 @@ fn process_packet_measured(
         }
         match incoming.try_send(packet) {
             Ok(()) => PacketAction::Wait,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                shared.queue_full_drops.fetch_add(1, Ordering::Relaxed);
+            Err(mpsc::error::TrySendError::Full(packet)) => {
+                if crate::striped_scheduler::keep_under_pressure(packet.as_slice()) {
+                    shared.stash_protected(packet);
+                } else {
+                    shared.queue_full_drops.fetch_add(1, Ordering::Relaxed);
+                }
                 PacketAction::Wait
             }
             Err(mpsc::error::TrySendError::Closed(_)) => PacketAction::OwnerClosed,

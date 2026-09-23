@@ -65,7 +65,26 @@ pub fn packet_class(packet: &[u8]) -> PacketClass {
     if transport == 6 && is_tcp_control(packet, offset) {
         return PacketClass::Small;
     }
+    // UDP stays off the TCP bulk class. A QUIC datagram sharing that queue is
+    // the first thing a full upload evicts, and it cannot be retransmitted.
+    if transport == 17 {
+        return match size_class(packet.len()) {
+            PacketClass::Bulk => PacketClass::Medium,
+            class => class,
+        };
+    }
     size_class(packet.len())
+}
+
+/// DNS, NTP, ICMP, TCP handshake and any UDP datagram. These must still be
+/// delivered when the bulk TCP queue is full.
+#[inline(always)]
+pub fn keep_under_pressure(packet: &[u8]) -> bool {
+    let packet = crate::flow_frame::payload(packet);
+    if packet_class(packet) == PacketClass::Small {
+        return true;
+    }
+    internet_transport(packet).is_some_and(|(protocol, _)| protocol == 17)
 }
 
 #[inline(always)]
@@ -187,7 +206,10 @@ mod tests {
         assert_eq!(packet_class(&ipv4(17, 164)), PacketClass::Small);
         assert_eq!(packet_class(&ipv4(17, 165)), PacketClass::Medium);
         assert_eq!(packet_class(&ipv4(17, 999)), PacketClass::Medium);
-        assert_eq!(packet_class(&ipv4(17, 1_000)), PacketClass::Bulk);
+        assert_eq!(packet_class(&ipv4(17, 1_000)), PacketClass::Medium);
+        assert_eq!(packet_class(&ipv4(6, 1_000)), PacketClass::Bulk);
+        assert!(keep_under_pressure(&ipv4(17, 1_200)));
+        assert!(!keep_under_pressure(&ipv4(6, 1_200)));
     }
 
     #[test]

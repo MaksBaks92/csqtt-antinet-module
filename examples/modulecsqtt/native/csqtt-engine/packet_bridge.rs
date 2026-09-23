@@ -5,7 +5,10 @@
 //! localhost UDP. Uplink is a lock-free queue drained by the dispatcher; downlink
 //! is an optional C callback into the helper.
 
-use crate::packet::{PacketBuf, PacketPool};
+use crate::{
+    packet::{PacketBuf, PacketPool},
+    striped_scheduler::keep_under_pressure,
+};
 use arc_swap::ArcSwapOption;
 use crossbeam_queue::ArrayQueue;
 use std::sync::{
@@ -16,6 +19,8 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 pub const UPLINK_CAPACITY: usize = 1024;
+/// DNS, NTP and other UDP stay here, so a full TCP upload cannot drop them.
+pub const UPLINK_LATENCY_CAPACITY: usize = 256;
 
 pub type PacketOutCb = extern "C" fn(*const u8, i32);
 /// Batch downlink: `ptrs[i]` is `lens[i]` bytes. Valid only for the duration of the call.
@@ -33,8 +38,24 @@ fn uplink_slot() -> &'static ArcSwapOption<UplinkBridge> {
 pub struct UplinkBridge {
     pub pool: Arc<PacketPool>,
     pub queue: ArrayQueue<PacketBuf>,
+    pub latency: ArrayQueue<PacketBuf>,
     pub notify: Arc<Notify>,
     pub cancel: CancellationToken,
+}
+
+fn enqueue_uplink(bridge: &UplinkBridge, packet: PacketBuf) -> bool {
+    if keep_under_pressure(packet.as_slice()) {
+        match bridge.latency.push(packet) {
+            Ok(()) => true,
+            Err(packet) => {
+                // Keep the newest query. A stale NTP/DNS datagram will not be retried by us.
+                let _ = bridge.latency.pop();
+                bridge.latency.push(packet).is_ok()
+            }
+        }
+    } else {
+        bridge.queue.push(packet).is_ok()
+    }
 }
 
 pub fn set_packet_out(cb: Option<PacketOutCb>) {
@@ -105,11 +126,11 @@ pub fn inject_packet(data: &[u8]) -> i32 {
     if packet.set_read_len(data.len()).is_err() {
         return -3;
     }
-    if bridge.queue.push(packet).is_err() {
+    if !enqueue_uplink(&bridge, packet) {
         return -2;
     }
-    // Wake the reader only on empty → nonempty; it drains the whole queue per wake.
-    if bridge.queue.len() == 1 {
+    // Wake only on empty → nonempty. The reader drains both queues per wake.
+    if bridge.latency.len() + bridge.queue.len() == 1 {
         bridge.notify.notify_one();
     }
     0
@@ -147,7 +168,7 @@ pub fn inject_packets(packets: &[&[u8]]) -> i32 {
             failed += 1;
             continue;
         }
-        if bridge.queue.push(packet).is_err() {
+        if !enqueue_uplink(&bridge, packet) {
             failed += 1;
             continue;
         }

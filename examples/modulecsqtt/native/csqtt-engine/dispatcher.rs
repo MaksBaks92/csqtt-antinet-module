@@ -7,6 +7,7 @@ use crate::{
     packet::{PacketBuf, PacketPool},
     packet_bridge::{self, UplinkBridge},
     stats::Stats,
+    selective_fec,
     striped_scheduler::{DispatchTicket, PacketClass, packet_class},
     tun, udp_batch,
 };
@@ -569,6 +570,7 @@ impl Dispatcher {
             let uplink = Arc::new(UplinkBridge {
                 pool: pool.clone(),
                 queue: ArrayQueue::new(packet_bridge::UPLINK_CAPACITY),
+                latency: ArrayQueue::new(packet_bridge::UPLINK_LATENCY_CAPACITY),
                 notify: Arc::new(Notify::new()),
                 cancel: dispatcher.cancel.clone(),
             });
@@ -908,7 +910,7 @@ impl Dispatcher {
         let mut scheduler = FastPathScheduler::new();
         let mut flow_sequences = FlowSequencer::new();
         loop {
-            while let Some(mut packet) = uplink.queue.pop() {
+            while let Some(mut packet) = uplink.latency.pop().or_else(|| uplink.queue.pop()) {
                 if !frame_outbound_packet(&mut flow_sequences, &mut packet) {
                     continue;
                 }
@@ -991,9 +993,23 @@ impl Dispatcher {
         }) else {
             return;
         };
+        // Short UDP (DNS, NTP, small probes) is also handed to a second worker.
+        // The same-socket duplicate dies together with a lossy TURN path.
+        let spare = udp_spare(&packet);
         let workers = scheduler.workers();
+        let worker_count = workers.len();
         if let Err(packet) = enqueue_selected_worker(workers, ticket, packet) {
             let _ = replace_oldest_in_selected_queue(workers, ticket, packet);
+        }
+        if let Some(spare) = spare
+            && worker_count > 1
+        {
+            let alt = DispatchTicket {
+                start_slot: (ticket.start_slot + worker_count / 2) % worker_count,
+                class: ticket.class,
+            };
+            // Best-effort. A full neighbour is not worth evicting a real packet.
+            let _ = enqueue_selected_worker(workers, alt, spare);
         }
     }
 
@@ -1374,6 +1390,17 @@ fn is_retryable_tun_error(error: &std::io::Error) -> bool {
         )
 }
 
+fn udp_spare(packet: &PacketBuf) -> Option<PacketBuf> {
+    let bytes = packet.as_slice();
+    if bytes.len() < 20 || bytes[0] >> 4 != 4 || bytes[9] != 17 {
+        return None;
+    }
+    if !selective_fec::should_duplicate(bytes) {
+        return None;
+    }
+    packet.try_duplicate()
+}
+
 fn queue_for_class(worker: &WorkerChannels, class: PacketClass) -> &PacketSender {
     match class {
         PacketClass::Small => &worker.latency,
@@ -1736,7 +1763,9 @@ mod tests {
     fn bulk_packet_bytes() -> [u8; 1_200] {
         let mut packet = [0u8; 1_200];
         packet[0] = 0x45;
-        packet[9] = 17;
+        packet[9] = 6;
+        packet[32] = 0x50;
+        packet[33] = 0x18;
         packet
     }
 

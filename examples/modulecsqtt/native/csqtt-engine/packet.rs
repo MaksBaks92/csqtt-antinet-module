@@ -193,6 +193,20 @@ impl PacketBuf {
         &mut self.storage
     }
 
+    /// Second copy for a short UDP datagram sent on another worker.
+    /// The original is left unchanged. Fails closed when the pool is empty.
+    pub fn try_duplicate(&self) -> Option<PacketBuf> {
+        let src = self.as_slice();
+        let mut copy = self.pool.try_acquire()?;
+        let area = copy.read_area();
+        if src.len() > area.len() {
+            return None;
+        }
+        area[..src.len()].copy_from_slice(src);
+        copy.set_read_len(src.len()).ok()?;
+        Some(copy)
+    }
+
     pub fn set_range(&mut self, range: Range<usize>) -> Result<()> {
         if range.start > range.end || range.end > PACKET_CAPACITY {
             bail!("packet range is invalid");
@@ -217,6 +231,18 @@ impl Drop for PacketBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_is_an_independent_copy() {
+        let pool = PacketPool::new(2);
+        let mut packet = pool.acquire();
+        packet.read_area()[..4].copy_from_slice(b"ntp!");
+        packet.set_read_len(4).unwrap();
+        let copy = packet.try_duplicate().unwrap();
+        assert_eq!(copy.as_slice(), b"ntp!");
+        assert_eq!(packet.as_slice(), b"ntp!");
+        assert!(pool.try_acquire().is_none());
+    }
 
     #[test]
     fn headroom_and_pool_reuse() {

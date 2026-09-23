@@ -18,7 +18,6 @@ use crate::{
 use hmac::{Hmac, Mac};
 use md5::{Digest, Md5};
 use sha1::Sha1;
-#[cfg(unix)]
 use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
@@ -953,6 +952,8 @@ async fn cancelled_before_first_control_send_never_creates_allocation() {
         channel: AtomicU16::new(0),
         queue_full_drops: AtomicU64::new(0),
         pool_deficit_drops: AtomicU64::new(0),
+        protected: Mutex::new(VecDeque::new()),
+        protected_notify: Notify::new(),
         native_pumps: AtomicU64::new(0),
     });
     let (incoming, _receiver) = mpsc::channel(1);
