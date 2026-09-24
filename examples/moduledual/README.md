@@ -9,13 +9,16 @@
 | `csqtt://…` | gVisor + rust CSQTT engine (`csqtt_*.go` + `rustDir`) | CSQTT WIRE-3 |
 | `qwdtt://…` / `wdtt://…` | vendored client (`internal/qwdtt`, GPL) | VPS SpaceNeuroX `server/` |
 
-## Статус `0.2.0-dual`
+## Статус `0.2.1-dual`
 
 - Роутер по `LINK` в `cmd/helper/main.go`
-- CSQTT-ветка: полный helper (как modulecsqtt), общие AntiNet-каноны
-- qWDTT-ветка: клиент из antinet qwdtt-module + shims на hostproto/protect
-- `go build ./cmd/helper` (с inject canons) — OK при `CGO_ENABLED=0` (движок CSQTT на устройстве с cgo)
-- Сервер qWDTT **не** в бандле — только клиент
+- CSQTT-ветка: полный helper (`csqtt_*.go`) + rust engine
+- qWDTT-ветка: клиент `internal/qwdtt` (GPL)
+- **Общий VK-слой** `internal/vk`: режимы hash/auth (политика CSQTT) + сбор хешей из settings/link для обеих веток
+- TURN-креды по-прежнему раздельно (rust CSQTT / GetCreds qWDTT)
+- `go build ./cmd/helper` с inject — OK
+
+Сервер qWDTT **не** в бандле.
 
 См. [ARCHITECTURE.md](ARCHITECTURE.md), [VENDOR.md](VENDOR.md), [NOTICE](NOTICE).
 

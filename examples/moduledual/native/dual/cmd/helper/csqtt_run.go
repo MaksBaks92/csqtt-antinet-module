@@ -26,6 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"dual-antinet/internal/vk"
 	"dual-antinet/tunnel"
 
 	_ "golang.org/x/net/dns/dnsmessage" // канон shared/dns, инжектируется build.py
@@ -291,25 +292,11 @@ func stripVkCallURL(raw string) string {
 }
 
 // Manual hashes only. Auto API / Auto VK create their own and ignore these.
+// Shared policy: dual-antinet/internal/vk (CSQTT hash collection).
 func collectManualHashes(cfg map[string]string, linkHashes []string) []string {
-	raw := append([]string{}, linkHashes...)
-	for i := 1; i <= maxVkHashes; i++ {
-		raw = append(raw, cfg[fmt.Sprintf("SETTING_vkHash%d", i)])
-	}
-	raw = append(raw, cfg["SETTING_vkHashes"])
-	seen := make(map[string]struct{}, maxVkHashes)
-	out := make([]string, 0, maxVkHashes)
-	for _, chunk := range raw {
-		for _, h := range splitHashes(chunk) {
-			if _, ok := seen[h]; ok {
-				continue
-			}
-			seen[h] = struct{}{}
-			out = append(out, h)
-			if len(out) >= maxVkHashes {
-				return out
-			}
-		}
+	out := vk.CollectHashes(linkHashes, cfg)
+	if len(out) > maxVkHashes {
+		return out[:maxVkHashes]
 	}
 	return out
 }
@@ -1020,49 +1007,22 @@ func randomHex(n int) string {
 }
 
 func normalizeHashMode(raw string) string {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "auto", "auto_api":
-		return "auto_api"
-	case "auto_js":
-		return "auto_js"
-	default:
-		return "manual"
-	}
+	return vk.NormalizeHashMode(raw)
 }
 
-// normalizeVkAuthMode — как CsqttConstants.VkAuth в родном клиенте.
+// normalizeVkAuthMode — как CsqttConstants.VkAuth в родном клиенте (+ qWDTT aliases).
 func normalizeVkAuthMode(raw string) string {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "legacy", "captcha", "капча":
-		return "legacy"
-	case "auto_js":
-		return "auto_js"
-	default:
-		return "vkcalls"
-	}
+	return vk.NormalizeAuthMode(raw)
 }
 
-// normalizeVkModes — связка «режим хешей» ↔ «режим кредов» как VkModePolicy.kt,
-// но с приоритетом явного «Ручной»: движок (lib.rs) запрещает vk_auth_mode=auto_js
-// без vk_hash_mode=auto_js, поэтому «Ручной»+«Авто ВК» нельзя молча превратить в
-// Авто ВК по хешам (после 1.2.17 это ломало ручной режим). Креды тогда → vkcalls.
+// normalizeVkModes — связка «режим хешей» ↔ «режим кредов» (CSQTT VkModePolicy via internal/vk).
 func normalizeVkModes(hashRaw, authRaw string) (hashMode, authMode string) {
-	hashMode = normalizeHashMode(hashRaw)
-	authMode = normalizeVkAuthMode(authRaw)
-	if hashMode == "manual" {
-		if authMode == "auto_js" {
-			authMode = "vkcalls"
-		}
-		return "manual", authMode
-	}
-	if authMode == "auto_js" || hashMode == "auto_js" {
-		return "auto_js", "auto_js"
-	}
-	return hashMode, authMode
+	m := vk.NormalizeModes(hashRaw, authRaw)
+	return m.Hash, m.Auth
 }
 
 func needsVkOAuth(hashMode, authMode string) bool {
-	return hashMode == "auto_api" || hashMode == "auto_js" || authMode == "auto_js"
+	return vk.NeedsOAuth(vk.Mode{Hash: hashMode, Auth: authMode})
 }
 
 func authModeLabel(mode string) string {

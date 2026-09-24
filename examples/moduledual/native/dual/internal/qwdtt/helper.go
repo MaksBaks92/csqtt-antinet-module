@@ -24,6 +24,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"dual-antinet/internal/vk"
 )
 
 // Платформенного кода в дереве модуля НЕТ: точки входа даёт канон shared/entry, разговор с хостом —
@@ -294,6 +296,7 @@ func parseBoolSetting(v string) bool {
 func parseHelperConfig(raw string) (helperConfig, error) {
 	var cfg helperConfig
 	var link string
+	var settingHashRaw []string
 	for _, line := range strings.Split(raw, "\n") {
 		line = strings.TrimSpace(line)
 		eq := strings.IndexByte(line, '=')
@@ -331,6 +334,8 @@ func parseHelperConfig(raw string) (helperConfig, error) {
 		case "SETTING_dialTimeoutSec":
 			// antinet: потолок дозвона SOCKS5 до цели (socks5.go). 0/пусто → дефолт 10с.
 			cfg.DialTimeoutSec, _ = strconv.Atoi(v)
+		case "SETTING_vkHash1", "SETTING_vkHash2", "SETTING_vkHash3", "SETTING_vkHash4", "SETTING_vkHashes":
+			settingHashRaw = append(settingHashRaw, v)
 		case "START_REASON":
 			// antinet §4.1 п.3 — cold | resume | handover. Хост лишь называет повод; годность
 			// восстановленного состояния решаем мы сами (§4.1 п.4), см. credstate.go.
@@ -363,9 +368,16 @@ func parseHelperConfig(raw string) (helperConfig, error) {
 	}
 	peer := qget("peer")
 	hashes := qget("hashes", "vkHashes")
-	if peer == "" || hashes == "" {
-		return cfg, fmt.Errorf("LINK missing peer/hashes")
+	if peer == "" {
+		return cfg, fmt.Errorf("LINK missing peer")
 	}
+	// Shared VK layer (CSQTT policy): settings hashes + link hashes.
+	settingsMap := map[string]string{"SETTING_vkHashes": strings.Join(settingHashRaw, ",")}
+	merged := vk.CollectHashes(vk.ParseHashList(hashes), settingsMap)
+	if len(merged) == 0 {
+		return cfg, fmt.Errorf("no VK hashes (LINK hashes= or SETTING_vkHash1..4)")
+	}
+	hashes = strings.Join(merged, ",")
 	cfg.Workers = defaultWorkers
 	if w, e := strconv.Atoi(qget("workers", "workersPerHash")); e == nil && w > 0 {
 		cfg.Workers = w
