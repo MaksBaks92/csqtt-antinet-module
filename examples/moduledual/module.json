@@ -1,0 +1,72 @@
+{
+  "apiVersion": 1,
+  "schemes": ["csqtt", "qwdtt"],
+  "names": ["CSQTT", "qWDTT"],
+  "name": "CSQTT / qWDTT",
+  "description": "Каркас dual-модуля: csqtt:// → сервер CSQTT (WIRE-3 + rust), qwdtt:// → сервер qWDTT (WG/raw + DTLS). Серверы разные; общий слой — VK hashes/TURN. Ветка dual/csqtt-qwdtt — не main.",
+  "homepage": "https://github.com/MaksBaks92/csqtt-antinet-module",
+  "updateUrl": "",
+  "version": "0.1.0-dual-skeleton",
+  "license": "SEE LICENSE NOTES (CSQTT PolyForm-NC + qWDTT GPL-3.0 — решить до релиза)",
+  "handoverMode": "signal",
+  "hostEvents": ["handover", "netlost", "netback", "stall", "dns"],
+  "parallelPing": false,
+  "pingNeedsConsent": true,
+  "pingTimeoutSec": 90,
+  "socks5": true,
+  "dnsResolver": true,
+  "settings": [
+    {
+      "key": "dialTimeoutSec",
+      "type": "int",
+      "label": "Таймаут дозвона (сек)",
+      "default": 20,
+      "min": 1,
+      "max": 120,
+      "description": "Общий потолок dial для обеих схем (ветки уточнят дефолты позже)."
+    },
+    {
+      "key": "hashMode",
+      "type": "enum",
+      "label": "Режим хешей VK (общий)",
+      "default": "manual",
+      "description": "Общий VK-слой (база — наработки CSQTT). Ручной / Авто API / Авто ВК.",
+      "options": [
+        { "value": "manual", "label": "Ручной" },
+        { "value": "auto_api", "label": "Авто API" },
+        { "value": "auto_js", "label": "Авто ВК" }
+      ]
+    },
+    {
+      "key": "vkHash1",
+      "type": "string",
+      "label": "VK-хеш 1",
+      "default": "",
+      "description": "Общий для обеих схем при hashMode=manual."
+    },
+    {
+      "key": "vkHash2",
+      "type": "string",
+      "label": "VK-хеш 2",
+      "default": "",
+      "description": "Необязательно."
+    },
+    {
+      "key": "debugLog",
+      "type": "bool",
+      "label": "Подробный лог",
+      "default": false,
+      "description": "Диагностика роутера схем и datapath."
+    }
+  ],
+  "helperBinary": {
+    "android": "libdualhelper.so",
+    "desktop": "dual-helper"
+  },
+  "build": {
+    "goDir": "native/dual",
+    "goPkg": "./cmd/helper",
+    "ldflags": "-checklinkname=0",
+    "rustDir": "../modulecsqtt/native/csqtt-engine"
+  }
+}
