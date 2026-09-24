@@ -543,6 +543,8 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	default:
 		turnTransport = "udp"
 	}
+	// Same-socket FEC (official default on). Off only on stable Wi‑Fi if user wants less uplink noise.
+	fecDuplicate := cfg["SETTING_fecDuplicate"] != "false"
 	// Idle scale-down (engine idle.rs): keepers held while uplink is quiet, rest parked.
 	// Missing setting → engine default (2 / 180 s); explicit 0 workers → off.
 	idleWorkers, idleAfterSec := idleSettings(cfg, workers)
@@ -577,6 +579,7 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 		"vk_auth_mode":   authMode,
 		"obfs":           obfs,
 		"turn_transport": turnTransport,
+		"fec_duplicate":  fecDuplicate,
 		"fingerprint":    "firefox",
 		"packet_bridge":  true,
 	}

@@ -16,12 +16,12 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use crossbeam_queue::ArrayQueue;
 use socket2::SockRef;
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fs::File,
     future::Future,
     net::SocketAddr,
     sync::{
-        Arc,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -993,8 +993,8 @@ impl Dispatcher {
         }) else {
             return;
         };
-        // Short UDP (DNS, NTP, small probes) is also handed to a second worker.
-        // The same-socket duplicate dies together with a lossy TURN path.
+        // Short UDP (DNS, NTP) and first QUIC Initial datagrams also go to a second worker.
+        // The same-socket FEC duplicate dies together with a lossy TURN path.
         let spare = udp_spare(&packet);
         let workers = scheduler.workers();
         let worker_count = workers.len();
@@ -1392,13 +1392,70 @@ fn is_retryable_tun_error(error: &std::io::Error) -> bool {
 
 fn udp_spare(packet: &PacketBuf) -> Option<PacketBuf> {
     let bytes = packet.as_slice();
+    // IPv4 UDP only (matches the rest of the AntiNet uplink path).
     if bytes.len() < 20 || bytes[0] >> 4 != 4 || bytes[9] != 17 {
         return None;
     }
-    if !selective_fec::should_duplicate(bytes) {
+    if selective_fec::should_duplicate(bytes) {
+        return packet.try_duplicate();
+    }
+    // First-flight QUIC Initial (padded ≥1200): second worker, max 2 spares per 4-tuple.
+    if selective_fec::is_quic_initial_sized(bytes) && quic_initial_spare_allow(bytes) {
+        return packet.try_duplicate();
+    }
+    None
+}
+
+const QUIC_SPARE_PER_FLOW: u8 = 2;
+const QUIC_SPARE_FLOW_CAP: usize = 256;
+
+fn quic_spare_tracker() -> &'static Mutex<HashMap<u64, u8>> {
+    static TRACKER: OnceLock<Mutex<HashMap<u64, u8>>> = OnceLock::new();
+    TRACKER.get_or_init(|| Mutex::new(HashMap::with_capacity(64)))
+}
+
+#[inline(always)]
+fn ipv4_udp_flow_key(packet: &[u8]) -> Option<u64> {
+    if packet.len() < 28 || packet[0] >> 4 != 4 || packet[9] != 17 {
         return None;
     }
-    packet.try_duplicate()
+    let ihl = usize::from(packet[0] & 0x0f).checked_mul(4)?;
+    if ihl < 20 || packet.len() < ihl.saturating_add(4) {
+        return None;
+    }
+    let src_ip = u32::from_be_bytes(packet[12..16].try_into().ok()?);
+    let dst_ip = u32::from_be_bytes(packet[16..20].try_into().ok()?);
+    let src_port = u16::from_be_bytes(packet[ihl..ihl + 2].try_into().ok()?);
+    let dst_port = u16::from_be_bytes(packet[ihl + 2..ihl + 4].try_into().ok()?);
+    Some(
+        (u64::from(src_ip) << 32)
+            ^ (u64::from(dst_ip) << 16)
+            ^ (u64::from(src_port) << 8)
+            ^ u64::from(dst_port),
+    )
+}
+
+fn quic_initial_spare_allow(packet: &[u8]) -> bool {
+    let Some(key) = ipv4_udp_flow_key(packet) else {
+        return false;
+    };
+    let Ok(mut map) = quic_spare_tracker().lock() else {
+        return false;
+    };
+    let count = map.entry(key).or_insert(0);
+    if *count >= QUIC_SPARE_PER_FLOW {
+        return false;
+    }
+    *count = count.saturating_add(1);
+    if map.len() > QUIC_SPARE_FLOW_CAP {
+        // Drop arbitrary entries; new flows still get a fair shot.
+        map.retain(|_, n| *n < QUIC_SPARE_PER_FLOW);
+        if map.len() > QUIC_SPARE_FLOW_CAP {
+            map.clear();
+            map.insert(key, 1);
+        }
+    }
+    true
 }
 
 fn queue_for_class(worker: &WorkerChannels, class: PacketClass) -> &PacketSender {

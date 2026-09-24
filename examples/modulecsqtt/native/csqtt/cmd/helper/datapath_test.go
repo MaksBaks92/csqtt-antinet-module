@@ -244,6 +244,8 @@ func TestDataPathGuardNetbackSoftResume(t *testing.T) {
 				resumes.Add(1)
 			}
 		},
+		activeFn: func() int { return 2 }, // paths come back → watch must not recycle
+		sleepFn:  func(time.Duration) {},  // soft-resume watch returns immediately
 		exitFn:   func(int) {},
 		nowFn:    time.Now,
 		logFn:    func(string, ...any) {},
@@ -260,6 +262,39 @@ func TestDataPathGuardNetbackSoftResume(t *testing.T) {
 	}
 	if g.rejecting() {
 		t.Fatal("must accept after netback")
+	}
+}
+
+func TestDataPathGuardSoftResumeDeadRecycles(t *testing.T) {
+	var starts, nudges atomic.Int32
+	g := &dataPathGuard{
+		cfgJSON:     `{}`,
+		readyWaitMs: 100,
+		stopFn:      func() {},
+		startFn:     func(string) error { starts.Add(1); return nil },
+		waitFn:      func(int) error { return nil },
+		portFn:      func() int { return 0 },
+		ipFn:        func() string { return "" },
+		pauseFn:     func(bool) {},
+		activeFn:    func() int { return 0 },
+		nudgeFn:     func() { nudges.Add(1) },
+		sleepFn:     func(time.Duration) {},
+		exitFn:      func(int) {},
+		nowFn:       time.Now,
+		logFn:       func(string, ...any) {},
+		statusFn:    func(string, string) {},
+	}
+	g.onHostEvent("netlost")
+	g.onHostEvent("netback")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && starts.Load() == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if nudges.Load() < 1 {
+		t.Fatalf("expected nudge on soft resume: %d", nudges.Load())
+	}
+	if starts.Load() != 1 {
+		t.Fatalf("READY=0 after soft resume should cold-recycle: starts=%d", starts.Load())
 	}
 }
 
@@ -334,6 +369,8 @@ func TestDataPathGuardWakeGraceIgnoresStaleTimeouts(t *testing.T) {
 		portFn:      func() int { return 0 },
 		ipFn:        func() string { return "" },
 		nudgeFn:     func() { nudges.Add(1) },
+		activeFn:    func() int { return 2 },
+		sleepFn:     func(time.Duration) {},
 		exitFn:      func(int) {},
 		nowFn:       func() time.Time { return now },
 		logFn:       func(string, ...any) {},
@@ -382,6 +419,7 @@ func TestDataPathGuardWakeWhilePausedProbesNetwork(t *testing.T) {
 		},
 		nudgeFn:  func() { nudges.Add(1) },
 		probeFn:  func() bool { probes.Add(1); return probes.Load() >= 2 },
+		activeFn: func() int { return 2 },
 		sleepFn:  func(time.Duration) {}, // watchdog must not be the one resuming here
 		exitFn:   func(int) {},
 		nowFn:    time.Now,
@@ -426,6 +464,7 @@ func TestDataPathGuardPausedWatchdogSelfNetback(t *testing.T) {
 			}
 		},
 		probeFn: func() bool { return probes.Add(1) >= 3 },
+		activeFn: func() int { return 2 },
 		sleepFn: func(d time.Duration) {
 			mu.Lock()
 			slept = append(slept, d)
@@ -445,7 +484,13 @@ func TestDataPathGuardPausedWatchdogSelfNetback(t *testing.T) {
 		t.Fatalf("watchdog must resume after a successful probe: resumes=%d", resumes.Load())
 	}
 	mu.Lock()
-	got := append([]time.Duration(nil), slept...)
+	got := make([]time.Duration, 0, len(slept))
+	for _, d := range slept {
+		if d == dataPathSoftResumeWatch {
+			continue // soft-resume liveness watch, not the paused probe schedule
+		}
+		got = append(got, d)
+	}
 	mu.Unlock()
 	want := dataPathPausedProbeDelays[:3]
 	if len(got) != len(want) {

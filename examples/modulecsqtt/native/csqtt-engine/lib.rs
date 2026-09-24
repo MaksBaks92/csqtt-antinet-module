@@ -150,6 +150,9 @@ pub struct Arguments {
     /// Seconds without uplink before parking the rest of the workers.
     #[arg(long, default_value_t = idle::DEFAULT_AFTER.as_secs())]
     idle_after_secs: u64,
+    /// Same-socket selective FEC for DNS/SYN/small UDP (official client default: on).
+    #[arg(long, default_value_t = true)]
+    fec_duplicate: bool,
 }
 
 pub fn cli_main() {
@@ -342,6 +345,7 @@ pub async fn run(arguments: Arguments) -> Result<()> {
     let wake_task = tokio::spawn(wake::monitor(cancel.clone()));
     // Idle scale-down: park all but `idle_workers` paths when uplink goes quiet (idle.rs).
     idle::reset(workers);
+    selective_fec::set_enabled(arguments.fec_duplicate);
     let idle_config = idle::IdleConfig {
         keep: arguments.idle_workers,
         after: Duration::from_secs(arguments.idle_after_secs.max(30)),
@@ -790,9 +794,14 @@ fn print_configuration(
         arguments.peer
     );
     crate::log_error!(
-        "[КЛИЕНТ] TURN: {} | WRAP: ON | obfs={}",
+        "[КЛИЕНТ] TURN: {} | WRAP: ON | obfs={} | FEC={}",
         turn_transport.as_str(),
         arguments.obfs,
+        if arguments.fec_duplicate {
+            "on"
+        } else {
+            "off"
+        },
     );
     crate::log_error!("[WRAP] WRAP Ключ вычислен ✓");
     crate::log_error!("[КЛИЕНТ] Device ID: {}", arguments.device_id);

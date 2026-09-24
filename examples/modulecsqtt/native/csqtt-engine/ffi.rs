@@ -55,6 +55,13 @@ struct EngineJson {
     idle_workers: Option<usize>,
     #[serde(default)]
     idle_after_secs: Option<u64>,
+    /// Same-socket selective FEC. Absent/`true` → on (official client).
+    #[serde(default = "default_true")]
+    fec_duplicate: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn arguments_from_json(raw: &str) -> Result<Arguments, String> {
@@ -130,6 +137,7 @@ fn arguments_from_json(raw: &str) -> Result<Arguments, String> {
         idle_after_secs: cfg
             .idle_after_secs
             .unwrap_or(crate::idle::DEFAULT_AFTER.as_secs()),
+        fec_duplicate: cfg.fec_duplicate,
     })
 }
 

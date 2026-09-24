@@ -44,6 +44,8 @@ const (
 	dataPathRebindSettle = 1 * time.Second
 	dataPathRebindWait   = 15 * time.Second
 	dataPathRebindPoll   = 500 * time.Millisecond
+	// Soft RESUME after sleep/netback: if READY paths stay 0 past this, cold-recycle once.
+	dataPathSoftResumeWatch = 25 * time.Second
 )
 
 // Offline self-probe schedule while paused (host may never deliver netback, e.g. after a
@@ -75,6 +77,7 @@ type dataPathGuard struct {
 	rebindInFlight        bool // watchdog has not yet judged this rebind
 	pendingHandover       bool
 	pendingHandoverSource string
+	softResumeGen         uint64 // invalidates overlapping soft-resume watches
 	exiting               bool
 
 	stopFn       func()
@@ -424,9 +427,49 @@ func (g *dataPathGuard) resumeFromPause(source string) {
 	}
 	// Prefer soft resume: workers reconnect without VK re-auth storm.
 	g.logFn("CSQTT: сеть вернулась — RESUME воркеров (без recycle)")
+	g.afterSoftResume(source)
+}
+
+// afterSoftResume — nudge paths and arm a one-shot watch: if READY stays 0, cold recycle.
+func (g *dataPathGuard) afterSoftResume(source string) {
 	if g.nudgeFn != nil {
 		g.nudgeFn()
 	}
+	go g.watchSoftResume(source)
+}
+
+// watchSoftResume — after soft RESUME/wake, paths should come back without a full engine
+// restart. If they do not, one cold recycle beats "только полный рестарт VPN".
+func (g *dataPathGuard) watchSoftResume(source string) {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	g.softResumeGen++
+	gen := g.softResumeGen
+	g.mu.Unlock()
+
+	// Production always sets sleepFn. Nil = tests that want an immediate check.
+	if g.sleepFn != nil {
+		g.sleepFn(dataPathSoftResumeWatch)
+	}
+
+	g.mu.Lock()
+	stale := g.exiting || g.paused || g.recycling || g.softResumeGen != gen
+	g.mu.Unlock()
+	if stale {
+		return
+	}
+	if g.activeFn == nil {
+		return
+	}
+	paths := g.activeFn()
+	if paths != 0 {
+		// -1 (unknown) and >0: trust the engine; dial-timeouts still catch true zombies.
+		return
+	}
+	g.logFn("CSQTT: после soft RESUME (%s) READY=0 — cold recycle", source)
+	go g.requestRecycle(source + "-soft-dead")
 }
 
 // pausedWatchdog — while paused, probe the network ourselves on a sparse backoff. The host is
@@ -469,8 +512,8 @@ func (g *dataPathGuard) probeSucceeded(gen uint64, source string) {
 	g.resumeFromPause(source)
 	if need {
 		go g.heal(reason)
-	} else if g.nudgeFn != nil {
-		g.nudgeFn()
+	} else {
+		g.afterSoftResume(source)
 	}
 }
 
@@ -497,9 +540,7 @@ func (g *dataPathGuard) onWake(gap time.Duration) {
 		return
 	}
 	g.logFn("CSQTT: пробуждение после %s сна — проверяю TURN-пути", gap.Round(time.Second))
-	if g.nudgeFn != nil {
-		g.nudgeFn()
-	}
+	g.afterSoftResume("wake")
 }
 
 // waitForPath — hold a CONNECT while the engine has zero READY TURN paths (reconnecting after

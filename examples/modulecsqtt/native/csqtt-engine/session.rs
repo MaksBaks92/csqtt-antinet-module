@@ -601,8 +601,9 @@ impl TransportWriter {
     }
 
     fn prepare_packet(&mut self, packet: &mut PacketBuf) -> Result<bool> {
-        let duplicate =
-            selective_fec::should_duplicate(packet.as_slice()) && self.fec_budget.allow();
+        let duplicate = selective_fec::enabled()
+            && selective_fec::should_duplicate(packet.as_slice())
+            && self.fec_budget.allow();
         client_perf::measure_sampled(PerfStage::CryptoObfs, 64, || {
             self.shared
                 .cipher

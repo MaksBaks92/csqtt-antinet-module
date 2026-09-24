@@ -7,7 +7,7 @@
   "description": "L3-туннель CSQTT (TURN/RTP поверх VK Calls): SOCKS5 → gVisor → rust-движок. Режим кредов (TURN): Авто / Авто ВК / Капча. Режим хешей: Ручной / Авто API / Авто ВК. Вход в VK — webview AntiNet.",
   "homepage": "https://github.com/MaksBaks92/csqtt-antinet-module",
   "updateUrl": "https://raw.githubusercontent.com/MaksBaks92/csqtt-antinet-module/main/antinet-module.json",
-  "version": "1.2.61",
+  "version": "1.2.62",
   "license": "PolyForm-Noncommercial-1.0.0",
   "handoverMode": "signal",
   "hostEvents": ["handover", "netlost", "netback", "stall", "dns"],
@@ -28,12 +28,20 @@
     },
     {
       "key": "workers",
-      "type": "int",
+      "type": "enum",
       "label": "Число TURN-воркеров",
-      "default": 18,
-      "min": 3,
-      "max": 126,
-      "description": "Сколько параллельных TURN-путей держать. Больше — запас по обрывам, выше нагрузка на VK/TURN."
+      "default": "18",
+      "description": "Сколько параллельных TURN-путей держать (кратно 9 — одна группа на хеш). Больше — запас по обрывам, выше нагрузка на VK/TURN. Нужно минимум workers/9 живых хешей.",
+      "options": [
+        { "value": "9", "label": "9 (1 хеш)" },
+        { "value": "18", "label": "18 (2 хеша)" },
+        { "value": "27", "label": "27 (3 хеша)" },
+        { "value": "36", "label": "36 (4 хеша)" },
+        { "value": "45", "label": "45 (5 хешей)" },
+        { "value": "54", "label": "54 (6 хешей)" },
+        { "value": "63", "label": "63 (7 хешей)" },
+        { "value": "72", "label": "72 (8 хешей)" }
+      ]
     },
     {
       "key": "idleWorkers",
@@ -140,6 +148,13 @@
       "label": "Подробный лог",
       "default": false,
       "description": "Диагностика gVisor и пакетного моста в журнале модуля."
+    },
+    {
+      "key": "fecDuplicate",
+      "type": "bool",
+      "label": "FEC мелкого UDP",
+      "default": true,
+      "description": "Дублировать DNS/SYN/короткий UDP на том же TURN (как официальный клиент). На стабильном Wi‑Fi можно выключить — чуть меньше uplink; на LTE лучше оставить."
     }
   ],
   "helperBinary": {

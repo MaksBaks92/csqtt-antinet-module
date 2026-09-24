@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
 use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const MAX_SMALL_UDP_PAYLOAD: usize = 256;
 // Same packets as the official client (DNS, SYN, small UDP). The budget is local:
@@ -9,6 +10,18 @@ const MAX_SMALL_UDP_PAYLOAD: usize = 256;
 const DUPLICATES_PER_SECOND: u32 = 80;
 const DUPLICATE_BURST: u32 = 16;
 const REFILL_INTERVAL: Duration = Duration::from_millis(1_000 / DUPLICATES_PER_SECOND as u64);
+
+/// Same-socket FEC. Default on (official client). Module setting `fecDuplicate=false` disables.
+static FEC_ENABLED: AtomicBool = AtomicBool::new(true);
+
+pub fn set_enabled(enabled: bool) {
+    FEC_ENABLED.store(enabled, Ordering::Release);
+}
+
+#[inline(always)]
+pub fn enabled() -> bool {
+    FEC_ENABLED.load(Ordering::Acquire)
+}
 
 pub struct Budget {
     tokens: u32,
@@ -48,6 +61,7 @@ impl Default for Budget {
     }
 }
 
+/// Same-socket FEC (official client). DNS/SYN/small UDP only.
 #[inline(always)]
 pub fn should_duplicate(packet: &[u8]) -> bool {
     let packet = crate::flow_frame::payload(packet);
@@ -59,6 +73,34 @@ pub fn should_duplicate(packet: &[u8]) -> bool {
         Some(6) => ipv6_transport(packet).is_some_and(classify_transport),
         _ => false,
     }
+}
+
+/// Client Initial QUIC is padded to ≥1200 bytes (RFC 9000). Module-only: used for
+/// cross-worker spare, not same-socket FEC (that stays aligned with the official client).
+const QUIC_INITIAL_UDP_MIN: usize = 1_200;
+const QUIC_INITIAL_UDP_MAX: usize = 1_280;
+
+#[inline(always)]
+pub fn is_quic_initial_sized(packet: &[u8]) -> bool {
+    let packet = crate::flow_frame::payload(packet);
+    match packet.first().map(|byte| byte >> 4) {
+        Some(4) => ipv4_transport(packet).is_some_and(quic_initial_transport),
+        Some(6) => ipv6_transport(packet).is_some_and(quic_initial_transport),
+        _ => false,
+    }
+}
+
+#[inline(always)]
+fn quic_initial_transport(transport: Transport<'_>) -> bool {
+    if transport.protocol != 17 || transport.bytes.len() < 8 {
+        return false;
+    }
+    let destination = u16::from_be_bytes([transport.bytes[2], transport.bytes[3]]);
+    if destination != 443 {
+        return false;
+    }
+    let payload = transport.bytes.len().saturating_sub(8);
+    (QUIC_INITIAL_UDP_MIN..=QUIC_INITIAL_UDP_MAX).contains(&payload)
 }
 
 #[inline(always)]
@@ -204,6 +246,16 @@ mod tests {
         assert!(should_duplicate(&ipv4(17, &udp(40000, 443, 256))));
         assert!(!should_duplicate(&ipv4(17, &udp(40000, 443, 257))));
         assert!(!should_duplicate(&ipv4(6, &tcp(40000, 443, 0x10))));
+    }
+
+    #[test]
+    fn detects_quic_client_initial_size() {
+        assert!(is_quic_initial_sized(&ipv4(17, &udp(40000, 443, 1_260))));
+        assert!(is_quic_initial_sized(&ipv4(17, &udp(40000, 443, 1_200))));
+        assert!(!is_quic_initial_sized(&ipv4(17, &udp(40000, 443, 1_199))));
+        assert!(!is_quic_initial_sized(&ipv4(17, &udp(40000, 443, 1_281))));
+        assert!(!is_quic_initial_sized(&ipv4(17, &udp(40000, 53, 1_260))));
+        assert!(!should_duplicate(&ipv4(17, &udp(40000, 443, 1_260))));
     }
 
     #[test]
