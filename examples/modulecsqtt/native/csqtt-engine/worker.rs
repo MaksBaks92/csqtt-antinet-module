@@ -96,7 +96,6 @@ pub struct RuntimeParams {
     pub local_port: Arc<str>,
     pub device_id: Arc<str>,
     pub password: Arc<str>,
-    pub workers: usize,
 }
 
 pub struct GroupContext {
@@ -682,7 +681,6 @@ async fn worker_loop(
             mode: context.params.mode,
             wrap_key: context.params.wrap_key,
             get_config,
-            desired_count: crate::idle::declared_count().max(1),
             server_stream_repair: context.server_stream_repair.clone(),
             repair: context.repair.clone(),
             turn_endpoint_cursor,
