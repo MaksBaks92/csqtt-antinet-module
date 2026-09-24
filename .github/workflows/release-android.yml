@@ -5,15 +5,6 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
-    inputs:
-      module:
-        description: "Module to build (csqtt or dual)"
-        required: true
-        default: "csqtt"
-        type: choice
-        options:
-          - csqtt
-          - dual
 
 permissions:
   contents: write
@@ -21,20 +12,16 @@ permissions:
 jobs:
   android:
     runs-on: ubuntu-latest
-    env:
-      MODULE: ${{ github.event.inputs.module || 'csqtt' }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22.x"
-          cache-dependency-path: |
-            examples/modulecsqtt/native/csqtt/go.sum
-            examples/moduledual/native/dual/go.sum
+          go-version-file: examples/modulecsqtt/native/csqtt/go.mod
+          cache-dependency-path: examples/modulecsqtt/native/csqtt/go.sum
 
       - name: Go helper tests
-        run: python build.py --test --module ${{ env.MODULE }} -y
+        run: python build.py --test --module csqtt -y
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -52,15 +39,15 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: |
-          python build.py --os android --module ${{ env.MODULE }} --abis all -y
-          python build.py --bundle --module ${{ env.MODULE }}
+          python build.py --os android --module csqtt --abis all -y
+          python build.py --bundle --module csqtt
 
       - name: Upload build artifacts (manual runs)
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.MODULE }}-android-dist-release
-          path: examples/module${{ env.MODULE }}/dist-release/
+          name: csqtt-android-dist-release
+          path: examples/modulecsqtt/dist-release/
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
@@ -68,11 +55,13 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
+          # Do not delete/replace assets already uploaded (avoids GitHub 500
+          # races when a release was created manually before CI finishes).
           overwrite_files: false
           fail_on_unmatched_files: true
           body: |
             Android module bundles for AntiNet (all ABIs).
             Manifest: `antinet-module.json` (also on `main` for auto-update).
           files: |
-            examples/module${{ env.MODULE }}/dist-release/*-android-*.zip
+            examples/modulecsqtt/dist-release/csqtt-android-*.zip
             antinet-module.json
