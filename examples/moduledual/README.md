@@ -1,18 +1,28 @@
-# Dual module skeleton (CSQTT + qWDTT)
+# Dual module — CSQTT + qWDTT
 
-Ветка: `dual/csqtt-qwdtt` (не трогает `main` / релизы 1.2.x).
+Ветка: `dual/csqtt-qwdtt` (не `main`).
 
-Один AntiNet-модуль, две схемы:
+Один helper, две схемы:
 
-| Схема | Сервер | Datapath (план) |
-|-------|--------|-----------------|
-| `csqtt://` | CSQTT (WIRE-3) | существующий rust-engine + gVisor |
-| `qwdtt://` | qWDTT VPS ([SpaceNeuroX](https://github.com/SpaceNeuroX/proxy-turn-vk-android) `server/`) | клиентский путь из `go_client` / antinet-qwdtt |
+| LINK | Datapath | Сервер |
+|------|----------|--------|
+| `csqtt://…` | gVisor + rust CSQTT engine (`csqtt_*.go` + `rustDir`) | CSQTT WIRE-3 |
+| `qwdtt://…` / `wdtt://…` | vendored client (`internal/qwdtt`, GPL) | VPS SpaceNeuroX `server/` |
 
-**Серверную часть qWDTT в модуль не кладём** — она остаётся на VPS пользователя.
+## Статус `0.2.0-dual`
 
-См. [ARCHITECTURE.md](ARCHITECTURE.md) и [VENDOR.md](VENDOR.md).
+- Роутер по `LINK` в `cmd/helper/main.go`
+- CSQTT-ветка: полный helper (как modulecsqtt), общие AntiNet-каноны
+- qWDTT-ветка: клиент из antinet qwdtt-module + shims на hostproto/protect
+- `go build ./cmd/helper` (с inject canons) — OK при `CGO_ENABLED=0` (движок CSQTT на устройстве с cgo)
+- Сервер qWDTT **не** в бандле — только клиент
 
-## Статус
+См. [ARCHITECTURE.md](ARCHITECTURE.md), [VENDOR.md](VENDOR.md), [NOTICE](NOTICE).
 
-`0.1.0-dual-skeleton` — только роутер по схеме + заглушки веток. Connect ещё не поднимает туннель.
+## Сборка
+
+```bash
+python build.py --os android --module dual --abis arm64-v8a -y
+```
+
+Или desktop smoke: inject + `go build` из `examples/moduledual/native/dual`.
