@@ -221,12 +221,7 @@ pub fn deliver_downlink_batch(packets: &[PacketBuf]) {
         }
         return;
     }
-    if let Some(cb) = packet_out() {
-        for packet in packets {
-            let slice = packet.as_slice();
-            if !slice.is_empty() {
-                cb(slice.as_ptr(), slice.len() as i32);
-            }
-        }
+    for packet in packets {
+        deliver_downlink(packet.as_slice());
     }
 }

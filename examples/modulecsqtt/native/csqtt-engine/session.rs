@@ -96,7 +96,6 @@ pub struct SessionConfig {
     pub mode: ObfsMode,
     pub wrap_key: [u8; 32],
     pub get_config: bool,
-    pub desired_count: usize,
     pub server_stream_repair: Arc<AtomicBool>,
     pub repair: Arc<RepairState>,
 }
@@ -116,13 +115,14 @@ pub struct SessionRuntime {
 }
 
 fn build_registration_payload(config: &SessionConfig) -> (Bytes, u64) {
+    let generation = crate::idle::generation(config.generation);
     let offset = crate::idle::generation_offset();
     (
         Bytes::from(config_request(
             &config.local_port,
             &config.device_id,
             &config.password,
-            config.generation.saturating_add(offset),
+            generation,
             &config.salt,
             config.id,
             Some(crate::idle::declared_count().max(1)),
@@ -1385,7 +1385,6 @@ mod tests {
             mode: ObfsMode::Audio,
             wrap_key: [0; 32],
             get_config: false,
-            desired_count: 18,
             server_stream_repair: Arc::new(AtomicBool::new(false)),
             repair: RepairState::new(18),
         };

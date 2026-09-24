@@ -328,7 +328,6 @@ pub async fn run(arguments: Arguments) -> Result<()> {
         local_port: local_port.clone(),
         device_id: Arc::from(arguments.device_id.as_str()),
         password: Arc::from(arguments.password.as_str()),
-        workers,
     });
     print_configuration(
         &arguments,
